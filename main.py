@@ -25,7 +25,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.5.0"
+PROXY_VERSION = "1.5.1"
 
 
 # ============================================================
@@ -654,6 +654,8 @@ def extract_nakshatra_name(result: dict[str, Any]) -> str | None:
         "swati": "Swati",
         "swathi": "Swati",
         "vishakha": "Vishakha",
+        "vishhaka": "Vishakha",
+        "vishaka": "Vishakha",
         "visakha": "Vishakha",
         "anuradha": "Anuradha",
         "jyeshtha": "Jyeshtha",
