@@ -17,23 +17,78 @@ from vedastro import (
     Time,
 )
 
-# These values will be stored securely on Render.
-VEDASTRO_API_KEY = os.environ["VEDASTRO_API_KEY"]
-PROXY_API_KEY = os.environ["PROXY_API_KEY"]
 
+# ============================================================
+# ENVIRONMENT VARIABLES
+# ============================================================
+
+VEDASTRO_API_KEY = os.getenv("VEDASTRO_API_KEY", "").strip()
+PROXY_API_KEY = os.getenv("PROXY_API_KEY", "").strip()
+
+# Premium key: 0.5
+# Free key: approximately 12.5
 MIN_INTERVAL_SECONDS = float(
-    os.getenv("VEDASTRO_MIN_INTERVAL_SECONDS", "0.75")
+    os.getenv("VEDASTRO_MIN_INTERVAL_SECONDS", "0.5")
 )
-MAX_RETRIES = int(os.getenv("VEDASTRO_MAX_RETRIES", "4"))
 
-# Use the official VedAstro Python client.
-Calculate.SetAPIKey(VEDASTRO_API_KEY)
-Calculate.SetAyanamsa(Ayanamsa.Lahiri)
+MAX_RETRIES = int(
+    os.getenv("VEDASTRO_MAX_RETRIES", "4")
+)
+
+
+# ============================================================
+# CONFIGURE VEDASTRO
+# ============================================================
+
+if VEDASTRO_API_KEY:
+    Calculate.SetAPIKey(VEDASTRO_API_KEY)
+
+
+# Some VedAstro.Python versions contain SetAyanamsa().
+# The current generated Calculate class may not contain it.
+# This supports both versions.
+if hasattr(Calculate, "SetAyanamsa"):
+
+    Calculate.SetAyanamsa(Ayanamsa.Lahiri)
+
+else:
+
+    original_make_request = Calculate._make_request.__func__
+
+    def make_request_with_lahiri(cls, endpoint, params):
+        payload = dict(params)
+
+        # Force Lahiri on every VedAstro request.
+        payload["Ayanamsa"] = "LAHIRI"
+
+        return original_make_request(
+            cls,
+            endpoint,
+            payload,
+        )
+
+    Calculate._make_request = classmethod(
+        make_request_with_lahiri
+    )
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
 
 app = FastAPI(
     title="VedAstro GPT Proxy",
-    version="1.0.0",
+    version="1.1.0",
+    description=(
+        "Private VedAstro proxy using the official "
+        "VedAstro.Python client and Lahiri ayanamsa."
+    ),
 )
+
+
+# ============================================================
+# PLANETS AND HOUSES
+# ============================================================
 
 PLANETS = {
     "Sun": PlanetName.Sun,
@@ -47,23 +102,29 @@ PLANETS = {
     "Ketu": PlanetName.Ketu,
 }
 
+
 HOUSES = {
-    f"House{i}": getattr(HouseName, f"House{i}")
+    f"House{i}": getattr(
+        HouseName,
+        f"House{i}",
+    )
     for i in range(1, 13)
 }
+
 
 DEFAULT_HOUSES = [
     "House1",
     "House3",
-    "House6",
-    "House10",
-    "House11",
     "House4",
     "House5",
+    "House6",
     "House7",
     "House9",
+    "House10",
+    "House11",
     "House12",
 ]
+
 
 DEFAULT_PLANETS = [
     "Sun",
@@ -77,36 +138,68 @@ DEFAULT_PLANETS = [
     "Ketu",
 ]
 
-_call_lock = threading.Lock()
-_last_call_time = 0.0
 
+# ============================================================
+# REQUEST MODELS
+# ============================================================
 
 class LocationInput(BaseModel):
-    name: str
-    longitude: float = Field(ge=-180, le=180)
-    latitude: float = Field(ge=-90, le=90)
+
+    name: str = Field(
+        min_length=1,
+        max_length=200,
+    )
+
+    longitude: float = Field(
+        ge=-180,
+        le=180,
+    )
+
+    latitude: float = Field(
+        ge=-90,
+        le=90,
+    )
 
 
 class EventChartInput(BaseModel):
+
     event_id: str | None = None
+
+    # Required format:
+    # HH:MM DD/MM/YYYY +HH:MM
     std_time: str = Field(
-        description="Exact local time: HH:MM DD/MM/YYYY +HH:MM"
+        examples=[
+            "19:30 22/07/2026 +10:00"
+        ]
     )
+
     location: LocationInput
 
     houses: list[str] = Field(
-        default_factory=lambda: list(DEFAULT_HOUSES)
+        default_factory=lambda: DEFAULT_HOUSES.copy()
     )
 
     planets: list[str] = Field(
-        default_factory=lambda: list(DEFAULT_PLANETS)
+        default_factory=lambda: DEFAULT_PLANETS.copy()
     )
 
 
-def serialise(value: Any) -> Any:
-    """Convert VedAstro objects into JSON-safe values."""
+# ============================================================
+# JSON SERIALISATION
+# ============================================================
 
-    if value is None or isinstance(
+def serialise(
+    value: Any,
+    depth: int = 0,
+) -> Any:
+
+    if depth > 12:
+        return str(value)
+
+    if value is None:
+        return None
+
+    if isinstance(
         value,
         (str, int, float, bool),
     ):
@@ -117,22 +210,40 @@ def serialise(value: Any) -> Any:
 
     if isinstance(value, dict):
         return {
-            str(key): serialise(item)
+            str(key): serialise(
+                item,
+                depth + 1,
+            )
             for key, item in value.items()
         }
 
-    if isinstance(value, (list, tuple, set)):
-        return [serialise(item) for item in value]
+    if isinstance(
+        value,
+        (list, tuple, set),
+    ):
+        return [
+            serialise(
+                item,
+                depth + 1,
+            )
+            for item in value
+        ]
 
     if hasattr(value, "to_json"):
         try:
-            return serialise(value.to_json())
+            return serialise(
+                value.to_json(),
+                depth + 1,
+            )
         except Exception:
             pass
 
     if hasattr(value, "__dict__"):
         return {
-            str(key): serialise(item)
+            str(key): serialise(
+                item,
+                depth + 1,
+            )
             for key, item in vars(value).items()
             if not str(key).startswith("_")
         }
@@ -140,336 +251,506 @@ def serialise(value: Any) -> Any:
     return str(value)
 
 
-IMPORTANT_KEYS = (
-    "name",
-    "sign",
-    "house",
-    "lord",
-    "constellation",
-    "nakshatra",
-    "longitude",
-    "degree",
-    "motion",
-    "retro",
-    "combust",
-    "exalt",
-    "debil",
-    "own",
-    "moola",
-    "shadbala",
-    "strength",
-    "aspect",
-    "planet",
-    "cusp",
-    "pada",
-    "tithi",
-    "yoga",
-    "karana",
-    "hora",
-    "weekday",
-    "ayanamsa",
-)
+# ============================================================
+# RATE LIMITING AND RETRIES
+# ============================================================
+
+call_lock = threading.Lock()
+last_call_time = 0.0
 
 
-def compact(value: Any, depth: int = 0) -> Any:
-    """
-    Keep the astrology fields needed by ChatGPT while preventing an
-    oversized Action response.
-    """
+def wait_before_call() -> None:
 
-    value = serialise(value)
+    global last_call_time
 
-    if depth > 8:
-        if isinstance(value, (str, int, float, bool)):
-            return value
-        return None
+    with call_lock:
 
-    if isinstance(value, dict):
-        output = {}
+        elapsed = (
+            time.monotonic()
+            - last_call_time
+        )
 
-        for key, child in value.items():
-            compacted = compact(child, depth + 1)
+        remaining = (
+            MIN_INTERVAL_SECONDS
+            - elapsed
+        )
 
-            if compacted in (None, {}, []):
-                continue
+        if remaining > 0:
+            time.sleep(remaining)
 
-            normalised_key = key.lower().replace("_", "")
-
-            if (
-                depth <= 1
-                or any(
-                    token in normalised_key
-                    for token in IMPORTANT_KEYS
-                )
-            ):
-                output[key] = compacted
-
-        return output
-
-    if isinstance(value, list):
-        output = [
-            compact(item, depth + 1)
-            for item in value[:100]
-        ]
-
-        return [
-            item
-            for item in output
-            if item not in (None, {}, [])
-        ]
-
-    return value
+        last_call_time = time.monotonic()
 
 
-def is_retryable(message: str) -> bool:
-    message = message.lower()
+def retryable_error(
+    error_message: str,
+) -> bool:
+
+    text = error_message.lower()
+
+    retryable_terms = [
+        "access denied",
+        "rate limit",
+        "too many",
+        "timeout",
+        "timed out",
+        "temporarily",
+        "connection",
+        "429",
+        "502",
+        "503",
+        "504",
+    ]
 
     return any(
-        text in message
-        for text in [
-            "access denied",
-            "rate limit",
-            "too many",
-            "timeout",
-            "timed out",
-            "429",
-            "502",
-            "503",
-            "504",
-            "temporarily",
-            "connection",
-        ]
+        term in text
+        for term in retryable_terms
     )
 
 
 def vedastro_call(
-    method_name: str,
-    *arguments: Any,
+    method_names: str | list[str],
+    *args: Any,
 ) -> dict[str, Any]:
-    """
-    Call one official VedAstro.Python method with spacing and retries.
-    """
 
-    global _last_call_time
+    if isinstance(method_names, str):
+        possible_names = [method_names]
+    else:
+        possible_names = method_names
 
-    if not hasattr(Calculate, method_name):
+    selected_method_name = None
+
+    for method_name in possible_names:
+
+        if hasattr(
+            Calculate,
+            method_name,
+        ):
+            selected_method_name = method_name
+            break
+
+    if selected_method_name is None:
+
         return {
             "status": "Fail",
-            "method": method_name,
-            "error": "Method unavailable in installed package",
+            "method": possible_names[0],
+            "error": (
+                "Method is unavailable. "
+                f"Tried: {possible_names}"
+            ),
         }
 
-    method = getattr(Calculate, method_name)
-    last_error = ""
+    method = getattr(
+        Calculate,
+        selected_method_name,
+    )
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    final_error = ""
+
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1,
+    ):
+
         try:
-            with _call_lock:
-                elapsed = time.monotonic() - _last_call_time
 
-                if elapsed < MIN_INTERVAL_SECONDS:
-                    time.sleep(
-                        MIN_INTERVAL_SECONDS - elapsed
-                    )
+            wait_before_call()
 
-                result = method(*arguments)
-                _last_call_time = time.monotonic()
+            result = method(*args)
 
             return {
                 "status": "Pass",
-                "method": method_name,
+                "method": selected_method_name,
                 "attempt": attempt,
-                "data": compact(result),
+                "data": serialise(result),
             }
 
         except Exception as error:
-            last_error = str(error)
 
-            if (
-                attempt == MAX_RETRIES
-                or not is_retryable(last_error)
+            final_error = str(error)
+
+            if attempt >= MAX_RETRIES:
+                break
+
+            if not retryable_error(
+                final_error
             ):
                 break
 
-            time.sleep(min(2**attempt, 10))
-
-    return {
-        "status": "Fail",
-        "method": method_name,
-        "attempts": MAX_RETRIES,
-        "error": last_error or "Unknown VedAstro error",
-    }
-
-
-def first_available_call(
-    method_names: list[str],
-    *arguments: Any,
-) -> dict[str, Any]:
-    for method_name in method_names:
-        if hasattr(Calculate, method_name):
-            return vedastro_call(
-                method_name,
-                *arguments,
+            wait_seconds = min(
+                2 ** attempt,
+                10,
             )
 
+            time.sleep(wait_seconds)
+
     return {
         "status": "Fail",
-        "method": method_names[0],
-        "error": f"No available method from {method_names}",
+        "method": selected_method_name,
+        "attempts": MAX_RETRIES,
+        "error": (
+            final_error
+            or "Unknown VedAstro error"
+        ),
     }
 
 
+# ============================================================
+# PROXY AUTHENTICATION
+# ============================================================
+
 def verify_proxy_key(
-    x_proxy_key: str | None,
+    supplied_key: str | None,
 ) -> None:
-    if x_proxy_key != PROXY_API_KEY:
+
+    if not PROXY_API_KEY:
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "PROXY_API_KEY is missing "
+                "from Render environment variables."
+            ),
+        )
+
+    if supplied_key != PROXY_API_KEY:
+
         raise HTTPException(
             status_code=401,
-            detail="Invalid proxy API key",
+            detail="Invalid proxy API key.",
         )
 
 
-@app.get("/health")
-def health():
+# ============================================================
+# BASIC ROUTES
+# ============================================================
+
+@app.get("/")
+def root() -> dict[str, Any]:
+
     return {
         "status": "ok",
-        "engine": "official VedAstro.Python",
-        "ayanamsa": "Lahiri",
+        "service": "VedAstro GPT Proxy",
+        "version": "1.1.0",
+        "health": "/health",
     }
 
 
-@app.post("/event-chart")
-def event_chart(
-    request: EventChartInput,
-    x_proxy_key: str | None = Header(
-        default=None,
-        alias="x-proxy-key",
-    ),
-):
-    verify_proxy_key(x_proxy_key)
+@app.get("/health")
+def health() -> dict[str, Any]:
 
-    unknown_houses = [
+    return {
+        "status": "ok",
+        "service": "VedAstro GPT Proxy",
+        "version": "1.1.0",
+        "vedastro_key_configured": bool(
+            VEDASTRO_API_KEY
+        ),
+        "proxy_key_configured": bool(
+            PROXY_API_KEY
+        ),
+        "ayanamsa": "Lahiri",
+        "engine": "VedAstro.Python",
+    }
+
+
+# ============================================================
+# EVENT CHART CALCULATION
+# ============================================================
+
+def calculate_event_chart(
+    request: EventChartInput,
+) -> dict[str, Any]:
+
+    if not VEDASTRO_API_KEY:
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "VEDASTRO_API_KEY is missing "
+                "from Render environment variables."
+            ),
+        )
+
+    invalid_houses = [
         house
         for house in request.houses
         if house not in HOUSES
     ]
 
-    unknown_planets = [
+    if invalid_houses:
+
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Invalid houses: "
+                f"{invalid_houses}"
+            ),
+        )
+
+    invalid_planets = [
         planet
         for planet in request.planets
         if planet not in PLANETS
     ]
 
-    if unknown_houses or unknown_planets:
+    if invalid_planets:
+
         raise HTTPException(
             status_code=422,
-            detail={
-                "unknown_houses": unknown_houses,
-                "unknown_planets": unknown_planets,
-            },
+            detail=(
+                f"Invalid planets: "
+                f"{invalid_planets}"
+            ),
         )
 
-    location = GeoLocation(
-        request.location.name,
-        request.location.longitude,
-        request.location.latitude,
-    )
+    try:
 
-    event_time = Time(
-        request.std_time,
-        location,
-    )
+        location = GeoLocation(
+            request.location.name,
+            request.location.longitude,
+            request.location.latitude,
+        )
+
+        event_time = Time(
+            request.std_time,
+            location,
+        )
+
+    except Exception as error:
+
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Invalid time or location: "
+                f"{error}"
+            ),
+        ) from error
+
+
+    # --------------------------------------------------------
+    # CORE EVENT DATA
+    # --------------------------------------------------------
 
     core = {
+
         "ayanamsa_degree": vedastro_call(
             "AyanamsaDegree",
             event_time,
         ),
+
         "lagna_sign": vedastro_call(
             "HouseSignName",
             HouseName.House1,
             event_time,
         ),
+
         "moon_sign": vedastro_call(
             "PlanetSignName",
             PlanetName.Moon,
             event_time,
         ),
+
         "moon_nakshatra": vedastro_call(
             "MoonConstellation",
             event_time,
         ),
+
         "tithi": vedastro_call(
             "LunarDay",
             event_time,
         ),
-        "yoga": first_available_call(
-            ["Yoga", "NithyaYoga"],
+
+        "yoga": vedastro_call(
+            [
+                "Yoga",
+                "NithyaYoga",
+            ],
             event_time,
         ),
+
         "karana": vedastro_call(
             "Karana",
             event_time,
         ),
+
         "weekday": vedastro_call(
             "DayOfWeek",
             event_time,
         ),
+
         "hora_lord": vedastro_call(
             "LordOfHoraFromTime",
             event_time,
         ),
     }
 
-    houses = {}
+
+    # --------------------------------------------------------
+    # HOUSE DATA
+    # --------------------------------------------------------
+
+    houses: dict[str, Any] = {}
 
     for house_name in request.houses:
+
         houses[house_name] = vedastro_call(
             "AllHouseData",
             HOUSES[house_name],
             event_time,
         )
 
-    planets = {}
+
+    # --------------------------------------------------------
+    # PLANET DATA
+    # --------------------------------------------------------
+
+    planets: dict[str, Any] = {}
 
     for planet_name in request.planets:
+
         planets[planet_name] = vedastro_call(
             "AllPlanetData",
             PLANETS[planet_name],
             event_time,
         )
 
-    all_results = (
-        list(core.values())
-        + list(houses.values())
-        + list(planets.values())
-    )
 
-    failures = [
+    # --------------------------------------------------------
+    # ESSENTIAL VALIDATION
+    # --------------------------------------------------------
+
+    essential_results = [
+
+        core["ayanamsa_degree"],
+
+        core["lagna_sign"],
+
+        core["moon_sign"],
+
+        core["moon_nakshatra"],
+
+        houses.get(
+            "House1",
+            {"status": "Fail"},
+        ),
+
+        houses.get(
+            "House7",
+            {"status": "Fail"},
+        ),
+
+        planets.get(
+            "Moon",
+            {"status": "Fail"},
+        ),
+    ]
+
+
+    essential_failures = [
+
         result
-        for result in all_results
+
+        for result in essential_results
+
         if result.get("status") != "Pass"
     ]
 
+
+    strict_prediction_allowed = (
+        len(essential_failures) == 0
+    )
+
+
     return {
+
         "status": (
             "Pass"
-            if not failures
+            if strict_prediction_allowed
             else "Fail"
         ),
-        "strict_prediction_allowed": not failures,
-        "essential_failures": failures,
+
+        "strict_prediction_allowed": (
+            strict_prediction_allowed
+        ),
+
+        "essential_failures": (
+            essential_failures
+        ),
+
         "event": {
+
             "event_id": request.event_id,
+
             "std_time": request.std_time,
-            "location": request.location.model_dump(),
+
+            "location": (
+                request.location.model_dump()
+            ),
+
             "ayanamsa": "Lahiri",
         },
+
         "core": core,
+
         "houses": houses,
+
         "planets": planets,
+
         "provenance": {
-            "engine": "official VedAstro.Python",
-            "vedastro_key": "stored server-side",
+
+            "engine": (
+                "official VedAstro.Python"
+            ),
+
+            "proxy_version": "1.1.0",
+
+            "vedastro_api_key": (
+                "stored only on Render"
+            ),
         },
     }
+
+
+# ============================================================
+# CUSTOM GPT ENDPOINTS
+# ============================================================
+
+@app.post("/event-chart")
+def event_chart(
+    request: EventChartInput,
+
+    x_proxy_key: str | None = Header(
+        default=None,
+        alias="x-proxy-key",
+    ),
+
+) -> dict[str, Any]:
+
+    verify_proxy_key(
+        x_proxy_key
+    )
+
+    return calculate_event_chart(
+        request
+    )
+
+
+# Also supports /v1/event-chart.
+@app.post("/v1/event-chart")
+def event_chart_v1(
+    request: EventChartInput,
+
+    x_proxy_key: str | None = Header(
+        default=None,
+        alias="x-proxy-key",
+    ),
+
+) -> dict[str, Any]:
+
+    verify_proxy_key(
+        x_proxy_key
+    )
+
+    return calculate_event_chart(
+        request
+    )
