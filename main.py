@@ -20,7 +20,7 @@ from vedastro import (
 
 
 # ============================================================
-# SETTINGS
+# ENVIRONMENT SETTINGS
 # ============================================================
 
 VEDASTRO_API_KEY = os.getenv(
@@ -50,7 +50,7 @@ VEDASTRO_MAX_RETRIES = int(
 MAX_RESULT_CHARACTERS = int(
     os.getenv(
         "MAX_RESULT_CHARACTERS",
-        "1800",
+        "700",
     )
 )
 
@@ -67,7 +67,7 @@ if not PROXY_API_KEY:
 
 
 # ============================================================
-# CONFIGURE OFFICIAL VEDASTRO CLIENT
+# CONFIGURE AND PATCH OFFICIAL VEDASTRO CLIENT
 # ============================================================
 
 Calculate.SetAPIKey(
@@ -75,42 +75,120 @@ Calculate.SetAPIKey(
 )
 
 
-# Some VedAstro.Python versions contain SetAyanamsa.
-# The current generated client may not contain it.
+PLANET_LITERAL_NAMES = {
+    "Sun",
+    "Moon",
+    "Mars",
+    "Mercury",
+    "Jupiter",
+    "Venus",
+    "Saturn",
+    "Rahu",
+    "Ketu",
+}
+
+
+_original_make_request = (
+    Calculate._make_request.__func__
+)
+
+
+def fix_api_value(
+    key: str,
+    value: Any,
+) -> Any:
+    """
+    Fixes VedAstro.Python planet values.
+
+    Generated client may send:
+
+        "planetName": "Moon"
+
+    Live VedAstro REST expects:
+
+        "planetName": {
+            "Name": "Moon"
+        }
+    """
+
+    if isinstance(value, Enum):
+        value = value.value
+
+    if isinstance(value, dict):
+        return {
+            str(child_key): fix_api_value(
+                str(child_key),
+                child_value,
+            )
+            for child_key, child_value
+            in value.items()
+        }
+
+    if isinstance(
+        value,
+        (list, tuple, set),
+    ):
+        return [
+            fix_api_value(
+                key,
+                item,
+            )
+            for item in value
+        ]
+
+    if (
+        isinstance(value, str)
+        and "planet" in key.lower()
+        and value in PLANET_LITERAL_NAMES
+    ):
+        return {
+            "Name": value
+        }
+
+    return value
+
+
+def make_request_fixed(
+    cls,
+    endpoint: str,
+    params: dict[str, Any],
+):
+    payload = {
+        str(key): fix_api_value(
+            str(key),
+            value,
+        )
+        for key, value
+        in dict(params).items()
+    }
+
+    # Force Lahiri for every request.
+    payload["Ayanamsa"] = "LAHIRI"
+
+    # Original method adds APIKey into the JSON body.
+    return _original_make_request(
+        cls,
+        endpoint,
+        payload,
+    )
+
+
+Calculate._make_request = classmethod(
+    make_request_fixed
+)
+
+
+# Support package versions that still have SetAyanamsa.
 if hasattr(
     Calculate,
     "SetAyanamsa",
 ):
-
-    Calculate.SetAyanamsa(
-        Ayanamsa.Lahiri
-    )
-
-else:
-
-    original_make_request = (
-        Calculate._make_request.__func__
-    )
-
-    def make_request_with_lahiri(
-        cls,
-        endpoint,
-        params,
-    ):
-        payload = dict(params)
-
-        # Force Lahiri for every calculation.
-        payload["Ayanamsa"] = "LAHIRI"
-
-        return original_make_request(
-            cls,
-            endpoint,
-            payload,
+    try:
+        Calculate.SetAyanamsa(
+            Ayanamsa.Lahiri
         )
-
-    Calculate._make_request = classmethod(
-        make_request_with_lahiri
-    )
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -119,10 +197,11 @@ else:
 
 app = FastAPI(
     title="VedAstro GPT Proxy",
-    version="1.3.0",
+    version="1.4.0",
     description=(
-        "Compact VedAstro event-chart proxy "
-        "using the official VedAstro.Python client."
+        "Compact Lahiri event-chart proxy using "
+        "the official VedAstro.Python client with "
+        "correct nested planet parameters."
     ),
 )
 
@@ -166,7 +245,7 @@ DEFAULT_PLANETS = [
 
 
 # ============================================================
-# INPUT MODELS
+# REQUEST MODELS
 # ============================================================
 
 class LocationInput(BaseModel):
@@ -193,11 +272,11 @@ class EventChartInput(BaseModel):
 
     std_time: str = Field(
         description=(
-            "Exact stadium-local time in "
-            "HH:MM DD/MM/YYYY +HH:MM format"
+            "Exact local event time: "
+            "HH:MM DD/MM/YYYY +HH:MM"
         ),
         examples=[
-            "12:00 22/07/2026 +10:00"
+            "20:00 22/07/2026 +10:00"
         ],
     )
 
@@ -217,7 +296,7 @@ class EventChartInput(BaseModel):
 
 
 # ============================================================
-# SERIALISE VEDASTRO RESULTS
+# JSON AND RESPONSE SIZE HELPERS
 # ============================================================
 
 def json_safe(
@@ -225,7 +304,7 @@ def json_safe(
     depth: int = 0,
 ) -> Any:
 
-    if depth > 12:
+    if depth > 10:
         return str(value)[:500]
 
     if value is None:
@@ -233,12 +312,12 @@ def json_safe(
 
     if isinstance(
         value,
-        (str, int, float, bool),
+        (int, float, bool),
     ):
-        if isinstance(value, str):
-            return value[:1000]
-
         return value
+
+    if isinstance(value, str):
+        return value[:2000]
 
     if isinstance(value, Enum):
         return value.value
@@ -249,7 +328,8 @@ def json_safe(
                 item,
                 depth + 1,
             )
-            for key, item in value.items()
+            for key, item
+            in value.items()
         }
 
     if isinstance(
@@ -261,7 +341,7 @@ def json_safe(
                 item,
                 depth + 1,
             )
-            for item in list(value)
+            for item in list(value)[:50]
         ]
 
     if hasattr(
@@ -285,188 +365,43 @@ def json_safe(
                 item,
                 depth + 1,
             )
-            for key, item in vars(value).items()
+            for key, item
+            in vars(value).items()
             if not str(key).startswith("_")
         }
 
-    return str(value)[:1000]
+    return str(value)[:2000]
 
 
-IMPORTANT_WORDS = (
-    "name",
-    "planet",
-    "house",
-    "sign",
-    "rasi",
-    "navamsha",
-    "d1",
-    "d9",
-    "lord",
-    "longitude",
-    "degree",
-    "motion",
-    "retro",
-    "combust",
-    "exalt",
-    "debil",
-    "own",
-    "moola",
-    "shadbala",
-    "strength",
-    "aspect",
-    "constellation",
-    "nakshatra",
-    "pada",
-    "tithi",
-    "yoga",
-    "karana",
-    "hora",
-    "weekday",
-    "ayanamsa",
-    "benefic",
-    "malefic",
-)
-
-
-def compact_data(
+def limit_data(
     value: Any,
-    depth: int = 0,
+    maximum_characters: int | None = None,
 ) -> Any:
 
-    value = json_safe(value)
+    limit = (
+        maximum_characters
+        or MAX_RESULT_CHARACTERS
+    )
 
-    if depth > 8:
-        return None
+    safe_value = json_safe(value)
 
-    if value is None:
-        return None
+    encoded = json.dumps(
+        safe_value,
+        ensure_ascii=False,
+        default=str,
+    )
 
-    if isinstance(
-        value,
-        (str, int, float, bool),
-    ):
-        return value
-
-    if isinstance(value, list):
-
-        compacted_list = []
-
-        for item in value[:40]:
-
-            compacted_item = compact_data(
-                item,
-                depth + 1,
-            )
-
-            if compacted_item not in (
-                None,
-                {},
-                [],
-            ):
-                compacted_list.append(
-                    compacted_item
-                )
-
-            if len(compacted_list) >= 20:
-                break
-
-        return compacted_list
-
-    if isinstance(value, dict):
-
-        result = {}
-
-        for key, child in value.items():
-
-            key_text = str(key).lower()
-
-            keep_key = (
-                depth <= 1
-                or any(
-                    word in key_text
-                    for word in IMPORTANT_WORDS
-                )
-            )
-
-            if not keep_key:
-
-                try:
-                    child_text = json.dumps(
-                        child,
-                        ensure_ascii=False,
-                        default=str,
-                    ).lower()
-
-                    keep_key = any(
-                        word in child_text
-                        for word in IMPORTANT_WORDS
-                    )
-
-                except Exception:
-                    keep_key = False
-
-            if not keep_key:
-                continue
-
-            compacted_child = compact_data(
-                child,
-                depth + 1,
-            )
-
-            if compacted_child not in (
-                None,
-                {},
-                [],
-            ):
-                result[str(key)] = (
-                    compacted_child
-                )
-
-            if len(result) >= 35:
-                result["_limited"] = True
-                break
-
-        if not result:
-
-            for key, child in list(
-                value.items()
-            )[:5]:
-
-                result[str(key)] = compact_data(
-                    child,
-                    depth + 1,
-                )
-
-        return result
-
-    return str(value)[:1000]
-
-
-def limit_result_size(
-    value: Any,
-    character_limit: int,
-) -> Any:
-
-    try:
-        encoded = json.dumps(
-            value,
-            ensure_ascii=False,
-            default=str,
-        )
-    except Exception:
-        encoded = str(value)
-
-    if len(encoded) <= character_limit:
-        return value
+    if len(encoded) <= limit:
+        return safe_value
 
     return {
         "response_compacted": True,
-        "preview": encoded[:character_limit],
+        "preview": encoded[:limit],
     }
 
 
 # ============================================================
-# API RATE LIMITING
+# RATE LIMITING AND RETRIES
 # ============================================================
 
 call_lock = threading.Lock()
@@ -497,61 +432,57 @@ def wait_for_call_slot() -> None:
         )
 
 
-def is_retryable(
+def is_retryable_error(
     message: str,
 ) -> bool:
 
-    message = message.lower()
-
-    retryable_messages = (
-        "access denied",
-        "too many",
-        "rate limit",
-        "timeout",
-        "timed out",
-        "temporarily",
-        "connection",
-        "429",
-        "502",
-        "503",
-        "504",
-    )
+    text = message.lower()
 
     return any(
-        text in message
-        for text in retryable_messages
+        marker in text
+        for marker in (
+            "access denied",
+            "rate limit",
+            "too many",
+            "timeout",
+            "timed out",
+            "temporarily",
+            "connection",
+            "429",
+            "502",
+            "503",
+            "504",
+        )
     )
 
-
-# ============================================================
-# VEDASTRO CALL HELPERS
-# ============================================================
 
 def find_method(
     method_names: str | list[str],
-) -> tuple[str | None, Callable[..., Any] | None]:
+) -> tuple[
+    str | None,
+    Callable[..., Any] | None,
+]:
 
-    if isinstance(
-        method_names,
-        str,
-    ):
-        possible_names = [
-            method_names
-        ]
-    else:
-        possible_names = method_names
+    names = (
+        [method_names]
+        if isinstance(
+            method_names,
+            str,
+        )
+        else method_names
+    )
 
-    for method_name in possible_names:
+    for name in names:
 
         if hasattr(
             Calculate,
-            method_name,
+            name,
         ):
             return (
-                method_name,
+                name,
                 getattr(
                     Calculate,
-                    method_name,
+                    name,
                 ),
             )
 
@@ -561,30 +492,31 @@ def find_method(
 def vedastro_call(
     method_names: str | list[str],
     *args: Any,
+    required: bool = False,
 ) -> dict[str, Any]:
 
-    selected_name, method = find_method(
-        method_names
+    names = (
+        [method_names]
+        if isinstance(
+            method_names,
+            str,
+        )
+        else method_names
     )
 
-    if isinstance(
-        method_names,
-        str,
-    ):
-        possible_names = [
-            method_names
-        ]
-    else:
-        possible_names = method_names
+    selected_name, method = find_method(
+        names
+    )
 
     if method is None:
 
         return {
             "status": "Fail",
-            "method": possible_names[0],
+            "required": required,
+            "method": names[0],
             "error": (
                 "Method unavailable. "
-                f"Tried: {possible_names}"
+                f"Tried: {names}"
             ),
         }
 
@@ -599,22 +531,14 @@ def vedastro_call(
 
             wait_for_call_slot()
 
-            raw_result = method(*args)
-
-            compact_result = compact_data(
-                raw_result
-            )
-
-            compact_result = limit_result_size(
-                compact_result,
-                MAX_RESULT_CHARACTERS,
-            )
+            result = method(*args)
 
             return {
                 "status": "Pass",
+                "required": required,
                 "method": selected_name,
                 "attempt": attempt,
-                "data": compact_result,
+                "data": limit_data(result),
             }
 
         except Exception as error:
@@ -627,7 +551,7 @@ def vedastro_call(
             ):
                 break
 
-            if not is_retryable(
+            if not is_retryable_error(
                 final_error
             ):
                 break
@@ -641,6 +565,7 @@ def vedastro_call(
 
     return {
         "status": "Fail",
+        "required": required,
         "method": selected_name,
         "attempts": (
             VEDASTRO_MAX_RETRIES
@@ -652,26 +577,377 @@ def vedastro_call(
     }
 
 
+# ============================================================
+# RESULT PARSING
+# ============================================================
+
+def unwrap_data(
+    result: dict[str, Any],
+) -> Any:
+
+    return result.get("data")
+
+
+def find_named_value(
+    value: Any,
+    preferred_keys: tuple[str, ...],
+) -> str | None:
+
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, dict):
+
+        for key in preferred_keys:
+
+            for actual_key, child in value.items():
+
+                if (
+                    actual_key.lower()
+                    == key.lower()
+                ):
+
+                    if isinstance(
+                        child,
+                        (str, int, float),
+                    ):
+                        return str(child)
+
+        for child in value.values():
+
+            found = find_named_value(
+                child,
+                preferred_keys,
+            )
+
+            if found:
+                return found
+
+    if isinstance(value, list):
+
+        for child in value:
+
+            found = find_named_value(
+                child,
+                preferred_keys,
+            )
+
+            if found:
+                return found
+
+    return None
+
+
+def extract_sign_name(
+    result: dict[str, Any],
+) -> str | None:
+
+    data = unwrap_data(result)
+
+    value = find_named_value(
+        data,
+        (
+            "Name",
+            "SignName",
+            "ZodiacName",
+        ),
+    )
+
+    if not value:
+        return None
+
+    for sign in (
+        "Aries",
+        "Taurus",
+        "Gemini",
+        "Cancer",
+        "Leo",
+        "Virgo",
+        "Libra",
+        "Scorpio",
+        "Sagittarius",
+        "Capricorn",
+        "Aquarius",
+        "Pisces",
+    ):
+
+        if (
+            sign.lower()
+            in value.lower()
+        ):
+            return sign
+
+    return None
+
+
+def extract_nakshatra_name(
+    result: dict[str, Any],
+) -> str | None:
+
+    data = unwrap_data(result)
+
+    if isinstance(data, str):
+        raw = data
+
+    else:
+        raw = find_named_value(
+            data,
+            (
+                "Name",
+                "ConstellationName",
+                "NakshatraName",
+            ),
+        )
+
+    if not raw:
+        return None
+
+    normalised = (
+        raw.lower()
+        .replace("-", " ")
+        .replace("_", " ")
+        .strip()
+    )
+
+    aliases = {
+        "ashwini": "Ashwini",
+        "aswini": "Ashwini",
+        "bharani": "Bharani",
+        "krittika": "Krittika",
+        "kritika": "Krittika",
+        "rohini": "Rohini",
+        "mrigashirsha": "Mrigashirsha",
+        "mrigasira": "Mrigashirsha",
+        "ardra": "Ardra",
+        "punarvasu": "Punarvasu",
+        "pushya": "Pushya",
+        "ashlesha": "Ashlesha",
+        "aslesha": "Ashlesha",
+        "magha": "Magha",
+        "purva phalguni": "Purva Phalguni",
+        "uttara phalguni": "Uttara Phalguni",
+        "hasta": "Hasta",
+        "chitra": "Chitra",
+        "swati": "Swati",
+        "swathi": "Swati",
+        "vishakha": "Vishakha",
+        "visakha": "Vishakha",
+        "anuradha": "Anuradha",
+        "jyeshtha": "Jyeshtha",
+        "jyeshta": "Jyeshtha",
+        "mula": "Mula",
+        "moola": "Mula",
+        "purva ashadha": "Purva Ashadha",
+        "purva ashada": "Purva Ashadha",
+        "uttara ashadha": "Uttara Ashadha",
+        "uttara ashada": "Uttara Ashadha",
+        "shravana": "Shravana",
+        "sravana": "Shravana",
+        "dhanishta": "Dhanishta",
+        "shatabhisha": "Shatabhisha",
+        "satabhisha": "Shatabhisha",
+        "purva bhadrapada": "Purva Bhadrapada",
+        "uttara bhadrapada": "Uttara Bhadrapada",
+        "revati": "Revati",
+    }
+
+    for alias, canonical in aliases.items():
+
+        if alias in normalised:
+            return canonical
+
+    return None
+
+
+# ============================================================
+# NAKSHATRA AND SIGN CONSISTENCY
+# ============================================================
+
+NAKSHATRA_ALLOWED_SIGNS = {
+    "Ashwini": {
+        "Aries"
+    },
+    "Bharani": {
+        "Aries"
+    },
+    "Krittika": {
+        "Aries",
+        "Taurus",
+    },
+    "Rohini": {
+        "Taurus"
+    },
+    "Mrigashirsha": {
+        "Taurus",
+        "Gemini",
+    },
+    "Ardra": {
+        "Gemini"
+    },
+    "Punarvasu": {
+        "Gemini",
+        "Cancer",
+    },
+    "Pushya": {
+        "Cancer"
+    },
+    "Ashlesha": {
+        "Cancer"
+    },
+    "Magha": {
+        "Leo"
+    },
+    "Purva Phalguni": {
+        "Leo"
+    },
+    "Uttara Phalguni": {
+        "Leo",
+        "Virgo",
+    },
+    "Hasta": {
+        "Virgo"
+    },
+    "Chitra": {
+        "Virgo",
+        "Libra",
+    },
+    "Swati": {
+        "Libra"
+    },
+    "Vishakha": {
+        "Libra",
+        "Scorpio",
+    },
+    "Anuradha": {
+        "Scorpio"
+    },
+    "Jyeshtha": {
+        "Scorpio"
+    },
+    "Mula": {
+        "Sagittarius"
+    },
+    "Purva Ashadha": {
+        "Sagittarius"
+    },
+    "Uttara Ashadha": {
+        "Sagittarius",
+        "Capricorn",
+    },
+    "Shravana": {
+        "Capricorn"
+    },
+    "Dhanishta": {
+        "Capricorn",
+        "Aquarius",
+    },
+    "Shatabhisha": {
+        "Aquarius"
+    },
+    "Purva Bhadrapada": {
+        "Aquarius",
+        "Pisces",
+    },
+    "Uttara Bhadrapada": {
+        "Pisces"
+    },
+    "Revati": {
+        "Pisces"
+    },
+}
+
+
+def validate_moon_consistency(
+    moon_sign_result: dict[str, Any],
+    moon_nakshatra_result: dict[str, Any],
+) -> dict[str, Any]:
+
+    moon_sign = extract_sign_name(
+        moon_sign_result
+    )
+
+    nakshatra = extract_nakshatra_name(
+        moon_nakshatra_result
+    )
+
+    if not moon_sign or not nakshatra:
+
+        return {
+            "status": "Fail",
+            "required": True,
+            "method": (
+                "MoonSignNakshatraConsistency"
+            ),
+            "error": (
+                "Could not parse Moon sign or "
+                "Moon nakshatra."
+            ),
+            "moon_sign": moon_sign,
+            "nakshatra": nakshatra,
+        }
+
+    allowed_signs = (
+        NAKSHATRA_ALLOWED_SIGNS.get(
+            nakshatra,
+            set(),
+        )
+    )
+
+    is_consistent = (
+        moon_sign in allowed_signs
+    )
+
+    return {
+        "status": (
+            "Pass"
+            if is_consistent
+            else "Fail"
+        ),
+        "required": True,
+        "method": (
+            "MoonSignNakshatraConsistency"
+        ),
+        "moon_sign": moon_sign,
+        "nakshatra": nakshatra,
+        "allowed_signs": sorted(
+            allowed_signs
+        ),
+        "error": (
+            None
+            if is_consistent
+            else (
+                f"Moon sign {moon_sign} is "
+                f"inconsistent with nakshatra "
+                f"{nakshatra}."
+            )
+        ),
+    }
+
+
+# ============================================================
+# CHART COMPONENTS
+# ============================================================
+
 def calculate_lagna(
     event_time: Time,
 ) -> dict[str, Any]:
 
-    # Some versions expose LagnaSignName(time).
     if hasattr(
         Calculate,
         "LagnaSignName",
     ):
+
         return vedastro_call(
             "LagnaSignName",
             event_time,
+            required=True,
         )
 
-    # Current fallback:
-    # House1 sign is the Lagna sign.
     return vedastro_call(
         "HouseSignName",
         HouseName.House1,
         event_time,
+        required=True,
     )
 
 
@@ -679,22 +955,14 @@ def calculate_moon_sign(
     event_time: Time,
 ) -> dict[str, Any]:
 
-    # Older or alternate package versions.
-    if hasattr(
-        Calculate,
-        "PlanetSignName",
-    ):
-        return vedastro_call(
-            "PlanetSignName",
-            PlanetName.Moon,
-            event_time,
-        )
-
-    # Current generated package method.
     return vedastro_call(
-        "PlanetRasiD1Sign",
+        [
+            "PlanetRasiD1Sign",
+            "PlanetSignName",
+        ],
         PlanetName.Moon,
         event_time,
+        required=True,
     )
 
 
@@ -709,6 +977,207 @@ def calculate_yoga(
         ],
         event_time,
     )
+
+
+def calculate_house(
+    house_name: str,
+    event_time: Time,
+) -> dict[str, Any]:
+
+    house = HOUSES[
+        house_name
+    ]
+
+    is_essential = (
+        house_name
+        in {
+            "House1",
+            "House7",
+        }
+    )
+
+    sign = vedastro_call(
+        "HouseSignName",
+        house,
+        event_time,
+        required=is_essential,
+    )
+
+    lord = vedastro_call(
+        "LordOfHouse",
+        house,
+        event_time,
+        required=is_essential,
+    )
+
+    constellation = vedastro_call(
+        "HouseConstellation",
+        house,
+        event_time,
+    )
+
+    constellation_lord = vedastro_call(
+        "HouseConstellationLord",
+        house,
+        event_time,
+    )
+
+    aspects = vedastro_call(
+        "PlanetsAspectingHouse",
+        house,
+        event_time,
+    )
+
+    required_results = [
+        sign,
+        lord,
+    ]
+
+    passed = all(
+        result["status"] == "Pass"
+        for result in required_results
+    )
+
+    return {
+        "status": (
+            "Pass"
+            if passed
+            else "Fail"
+        ),
+        "house": house_name,
+        "sign": sign,
+        "lord": lord,
+        "constellation": constellation,
+        "constellation_lord": (
+            constellation_lord
+        ),
+        "aspects": aspects,
+    }
+
+
+def calculate_planet(
+    planet_name: str,
+    event_time: Time,
+) -> dict[str, Any]:
+
+    planet = PLANETS[
+        planet_name
+    ]
+
+    is_moon = (
+        planet_name == "Moon"
+    )
+
+    d1_sign = vedastro_call(
+        [
+            "PlanetRasiD1Sign",
+            "PlanetSignName",
+        ],
+        planet,
+        event_time,
+        required=is_moon,
+    )
+
+    d9_sign = vedastro_call(
+        [
+            "PlanetNavamshaD9Sign",
+            "PlanetNavamshaSign",
+        ],
+        planet,
+        event_time,
+        required=is_moon,
+    )
+
+    longitude = vedastro_call(
+        "PlanetNirayanaLongitude",
+        planet,
+        event_time,
+        required=is_moon,
+    )
+
+    motion = vedastro_call(
+        "PlanetMotionName",
+        planet,
+        event_time,
+    )
+
+    retrograde = vedastro_call(
+        "IsPlanetRetrograde",
+        planet,
+        event_time,
+    )
+
+    combust = vedastro_call(
+        "IsPlanetCombust",
+        planet,
+        event_time,
+    )
+
+    exalted = vedastro_call(
+        "IsPlanetExaltedSign",
+        planet,
+        event_time,
+    )
+
+    debilitated = vedastro_call(
+        "IsPlanetDebilitated",
+        planet,
+        event_time,
+    )
+
+    own_sign = vedastro_call(
+        "IsPlanetInOwnSign",
+        planet,
+        event_time,
+    )
+
+    moolatrikona = vedastro_call(
+        "IsPlanetInMoolatrikona",
+        planet,
+        event_time,
+    )
+
+    shadbala = vedastro_call(
+        "PlanetShadbalaPinda",
+        planet,
+        event_time,
+    )
+
+    required_results = [
+        d1_sign,
+        d9_sign,
+        longitude,
+    ]
+
+    passed = all(
+        result["status"] == "Pass"
+        for result in required_results
+    )
+
+    return {
+        "status": (
+            "Pass"
+            if passed
+            else "Fail"
+        ),
+        "requested_planet": planet_name,
+        "request_shape": {
+            "PlanetName": {
+                "Name": planet_name
+            }
+        },
+        "d1_sign": d1_sign,
+        "d9_sign": d9_sign,
+        "sidereal_longitude": longitude,
+        "motion": motion,
+        "retrograde": retrograde,
+        "combust": combust,
+        "exalted": exalted,
+        "debilitated": debilitated,
+        "own_sign": own_sign,
+        "moolatrikona": moolatrikona,
+        "shadbala": shadbala,
+    }
 
 
 # ============================================================
@@ -737,7 +1206,7 @@ def root() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "VedAstro GPT Proxy",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "health": "/health",
     }
 
@@ -748,7 +1217,7 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "VedAstro GPT Proxy",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "vedastro_key_configured": bool(
             VEDASTRO_API_KEY
         ),
@@ -757,20 +1226,17 @@ def health() -> dict[str, Any]:
         ),
         "ayanamsa": "Lahiri",
         "engine": "VedAstro.Python",
-        "response_mode": "compact",
-        "planet_sign_method": (
-            "PlanetSignName"
-            if hasattr(
-                Calculate,
-                "PlanetSignName",
-            )
-            else "PlanetRasiD1Sign"
+        "planet_parameter_shape": (
+            "nested PlanetName object"
+        ),
+        "response_mode": (
+            "compact direct calculations"
         ),
     }
 
 
 # ============================================================
-# EVENT CHART CALCULATION
+# EVENT CHART
 # ============================================================
 
 def calculate_event_chart(
@@ -842,6 +1308,7 @@ def calculate_event_chart(
         "ayanamsa_degree": vedastro_call(
             "AyanamsaDegree",
             event_time,
+            required=True,
         ),
 
         "lagna_sign": calculate_lagna(
@@ -855,6 +1322,7 @@ def calculate_event_chart(
         "moon_nakshatra": vedastro_call(
             "MoonConstellation",
             event_time,
+            required=True,
         ),
 
         "tithi": vedastro_call(
@@ -884,136 +1352,58 @@ def calculate_event_chart(
 
 
     # --------------------------------------------------------
+    # MOON CONSISTENCY
+    # --------------------------------------------------------
+
+    moon_consistency = (
+        validate_moon_consistency(
+            core["moon_sign"],
+            core["moon_nakshatra"],
+        )
+    )
+
+    core["moon_consistency"] = (
+        moon_consistency
+    )
+
+
+    # --------------------------------------------------------
     # HOUSE DATA
     # --------------------------------------------------------
 
-    houses: dict[str, Any] = {}
-
-    for house_name in request.houses:
-
-        house = HOUSES[
-            house_name
-        ]
-
-        if hasattr(
-            Calculate,
-            "AllHouseData",
-        ):
-
-            houses[house_name] = (
-                vedastro_call(
-                    "AllHouseData",
-                    house,
-                    event_time,
-                )
-            )
-
-        else:
-
-            houses[house_name] = {
-
-                "sign": vedastro_call(
-                    "HouseSignName",
-                    house,
-                    event_time,
-                ),
-
-                "lord": vedastro_call(
-                    "LordOfHouse",
-                    house,
-                    event_time,
-                ),
-
-                "constellation": (
-                    vedastro_call(
-                        "HouseConstellation",
-                        house,
-                        event_time,
-                    )
-                ),
-
-                "aspects": vedastro_call(
-                    "PlanetsAspectingHouse",
-                    house,
-                    event_time,
-                ),
-            }
+    houses = {
+        house_name: calculate_house(
+            house_name,
+            event_time,
+        )
+        for house_name in dict.fromkeys(
+            request.houses
+        )
+    }
 
 
     # --------------------------------------------------------
     # PLANET DATA
     # --------------------------------------------------------
 
-    planets: dict[str, Any] = {}
-
-    for planet_name in request.planets:
-
-        planet = PLANETS[
-            planet_name
-        ]
-
-        if hasattr(
-            Calculate,
-            "AllPlanetData",
-        ):
-
-            planets[planet_name] = (
-                vedastro_call(
-                    "AllPlanetData",
-                    planet,
-                    event_time,
-                )
-            )
-
-        else:
-
-            planets[planet_name] = {
-
-                "d1_sign": vedastro_call(
-                    "PlanetRasiD1Sign",
-                    planet,
-                    event_time,
-                ),
-
-                "d9_sign": vedastro_call(
-                    "PlanetNavamshaD9Sign",
-                    planet,
-                    event_time,
-                ),
-
-                "sidereal_longitude": (
-                    vedastro_call(
-                        "PlanetNirayanaLongitude",
-                        planet,
-                        event_time,
-                    )
-                ),
-
-                "motion": vedastro_call(
-                    "PlanetMotionName",
-                    planet,
-                    event_time,
-                ),
-
-                "retrograde": vedastro_call(
-                    "IsPlanetRetrograde",
-                    planet,
-                    event_time,
-                ),
-
-                "combust": vedastro_call(
-                    "IsPlanetCombust",
-                    planet,
-                    event_time,
-                ),
-            }
+    planets = {
+        planet_name: calculate_planet(
+            planet_name,
+            event_time,
+        )
+        for planet_name in dict.fromkeys(
+            request.planets
+        )
+    }
 
 
     # --------------------------------------------------------
     # ESSENTIAL VALIDATION
     # --------------------------------------------------------
 
-    essential_results = [
+    essential_results: list[
+        dict[str, Any]
+    ] = [
 
         core["ayanamsa_degree"],
 
@@ -1023,21 +1413,80 @@ def calculate_event_chart(
 
         core["moon_nakshatra"],
 
-        houses.get(
-            "House1",
-            {"status": "Fail"},
-        ),
-
-        houses.get(
-            "House7",
-            {"status": "Fail"},
-        ),
-
-        planets.get(
-            "Moon",
-            {"status": "Fail"},
-        ),
+        moon_consistency,
     ]
+
+
+    for essential_house in (
+        "House1",
+        "House7",
+    ):
+
+        house_result = houses.get(
+            essential_house
+        )
+
+        if not house_result:
+
+            essential_results.append({
+                "status": "Fail",
+                "required": True,
+                "method": essential_house,
+                "error": (
+                    f"{essential_house} "
+                    "was not requested."
+                ),
+            })
+
+        elif (
+            house_result["status"]
+            != "Pass"
+        ):
+
+            essential_results.append({
+                "status": "Fail",
+                "required": True,
+                "method": essential_house,
+                "error": (
+                    f"{essential_house} "
+                    "essential data failed."
+                ),
+                "details": house_result,
+            })
+
+
+    moon_planet_result = planets.get(
+        "Moon"
+    )
+
+
+    if not moon_planet_result:
+
+        essential_results.append({
+            "status": "Fail",
+            "required": True,
+            "method": "MoonPlanetData",
+            "error": (
+                "Moon was not requested "
+                "in the planets list."
+            ),
+        })
+
+    elif (
+        moon_planet_result["status"]
+        != "Pass"
+    ):
+
+        essential_results.append({
+            "status": "Fail",
+            "required": True,
+            "method": "MoonPlanetData",
+            "error": (
+                "Essential Moon planetary "
+                "data failed."
+            ),
+            "details": moon_planet_result,
+        })
 
 
     essential_failures = [
@@ -1048,11 +1497,11 @@ def calculate_event_chart(
 
 
     strict_prediction_allowed = (
-        len(essential_failures) == 0
+        not essential_failures
     )
 
 
-    response = {
+    response: dict[str, Any] = {
 
         "status": (
             "Pass"
@@ -1093,9 +1542,12 @@ def calculate_event_chart(
                 "official VedAstro.Python"
             ),
 
-            "proxy_version": "1.3.0",
+            "proxy_version": "1.4.0",
 
-            "response_mode": "compact",
+            "planet_parameter_fix": (
+                "Every planet request is sent "
+                "as a nested Name object."
+            ),
 
             "vedastro_api_key": (
                 "stored only on Render"
@@ -1105,25 +1557,25 @@ def calculate_event_chart(
 
 
     # --------------------------------------------------------
-    # FINAL RESPONSE SIZE PROTECTION
+    # EMERGENCY RESPONSE SIZE PROTECTION
     # --------------------------------------------------------
 
-    encoded_response = json.dumps(
+    encoded = json.dumps(
         response,
         ensure_ascii=False,
         default=str,
     )
 
-    if len(encoded_response) > 60000:
 
-        for section_name in (
-            "houses",
-            "planets",
-        ):
+    if len(encoded) > 70000:
 
-            for item in response[
-                section_name
-            ].values():
+        for planet_result in response[
+            "planets"
+        ].values():
+
+            for key, item in (
+                planet_result.items()
+            ):
 
                 if (
                     isinstance(item, dict)
@@ -1131,11 +1583,33 @@ def calculate_event_chart(
                 ):
 
                     item["data"] = (
-                        limit_result_size(
+                        limit_data(
                             item["data"],
-                            700,
+                            250,
                         )
                     )
+
+
+        for house_result in response[
+            "houses"
+        ].values():
+
+            for key, item in (
+                house_result.items()
+            ):
+
+                if (
+                    isinstance(item, dict)
+                    and "data" in item
+                ):
+
+                    item["data"] = (
+                        limit_data(
+                            item["data"],
+                            250,
+                        )
+                    )
+
 
         response[
             "response_was_further_compacted"
@@ -1146,7 +1620,7 @@ def calculate_event_chart(
 
 
 # ============================================================
-# CUSTOM GPT ACTION ENDPOINTS
+# CUSTOM GPT ACTION ROUTES
 # ============================================================
 
 @app.post("/event-chart")
