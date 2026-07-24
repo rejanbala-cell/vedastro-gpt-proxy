@@ -34,7 +34,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.17.2"
+PROXY_VERSION = "1.18.0"
 
 
 # ============================================================
@@ -99,6 +99,23 @@ ACTION_RESPONSE_PAYLOAD_TARGET_CHARACTERS = max(
     23000,
     ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS - 700,
 )
+
+# Reliability policy:
+# - strict_book: preserves the most conservative book-locked gate.
+# - practical_verified: exact same-local-date stations remain vetoes, while
+#   non-same-day Vikala/near-station testimony becomes a LOW-confidence warning.
+RELIABILITY_POLICY_MODE = os.getenv(
+    "RELIABILITY_POLICY_MODE",
+    "strict_book",
+).strip().lower()
+
+if RELIABILITY_POLICY_MODE not in {
+    "strict_book",
+    "practical_verified",
+}:
+    raise RuntimeError(
+        "RELIABILITY_POLICY_MODE must be strict_book or practical_verified."
+    )
 
 
 # Optional directory containing Swiss Ephemeris .se1 files. Uranus, Neptune
@@ -7007,13 +7024,45 @@ def compact_reliability_audit_layer(
             motion_rows.append({
                 "planet": planet,
                 "vedastro_motion_label": label,
-                "kutila_or_stationary": row.get(
-                    "kutila_or_stationary"
+                "classification": row.get(
+                    "classification"
+                ),
+                "strict_book_veto": (
+                    row.get("strict_book_veto")
+                    if row.get("strict_book_veto") is not None
+                    else row.get("kutila_or_stationary")
+                ),
+                "practical_hard_veto": row.get(
+                    "practical_hard_veto"
+                ),
+                "practical_warning": row.get(
+                    "practical_warning"
                 ),
             })
 
     return compact_recursive({
         "status": layer.get("status"),
+        "policy_mode": layer.get("policy_mode"),
+        "strict_book_hard_veto": layer.get(
+            "strict_book_hard_veto"
+        ),
+        "strict_book_prediction_allowed": layer.get(
+            "strict_book_prediction_allowed"
+        ),
+        "strict_book_hard_veto_reasons": layer.get(
+            "strict_book_hard_veto_reasons",
+            [],
+        ),
+        "practical_hard_veto": layer.get(
+            "practical_hard_veto"
+        ),
+        "practical_prediction_allowed": layer.get(
+            "practical_prediction_allowed"
+        ),
+        "practical_hard_veto_reasons": layer.get(
+            "practical_hard_veto_reasons",
+            [],
+        ),
         "hard_veto": layer.get("hard_veto"),
         "strict_prediction_allowed_by_reliability": (
             layer.get(
@@ -7021,6 +7070,14 @@ def compact_reliability_audit_layer(
             )
         ),
         "decision": layer.get("decision"),
+        "confidence_cap": layer.get("confidence_cap"),
+        "performance_fallback_recommended": layer.get(
+            "performance_fallback_recommended"
+        ),
+        "market_assignment_note": compact_scalar_text(
+            layer.get("market_assignment_note"),
+            150,
+        ),
         "hard_veto_reasons": layer.get(
             "hard_veto_reasons",
             [],
@@ -7039,10 +7096,29 @@ def compact_reliability_audit_layer(
             "station_rows_omitted_from_transport": (
                 omitted_station_count
             ),
+            "same_local_date_station_planets": stationary.get(
+                "same_local_date_station_planets",
+                [],
+            ),
+            "strict_book_hard_veto_planets": stationary.get(
+                "strict_book_hard_veto_planets",
+                [],
+            ),
+            "practical_hard_veto_planets": stationary.get(
+                "practical_hard_veto_planets",
+                [],
+            ),
+            "practical_warning_planets": stationary.get(
+                "practical_warning_planets",
+                [],
+            ),
             "hard_veto_planets": sorted(
                 hard_veto_planets
             ),
             "hard_veto": stationary.get("hard_veto"),
+            "confidence_cap": stationary.get(
+                "confidence_cap"
+            ),
             "warning_planets": sorted(
                 warning_planets
             ),
@@ -13129,29 +13205,78 @@ def extract_motion_label(
     return label.strip() if label else None
 
 
-def motion_label_is_kutila(
+def normalise_motion_label(
     label: str | None,
-) -> bool:
+) -> str:
     if not label:
-        return False
+        return ""
 
-    normalised = (
+    return " ".join(
         label.lower()
         .replace("-", " ")
         .replace("_", " ")
-        .strip()
+        .split()
     )
 
-    return any(
-        token in normalised
-        for token in (
-            "vikala",
-            "kutila",
-            "stationary",
-            "station",
-        )
-    )
 
+def classify_motion_label(
+    label: str | None,
+) -> str:
+    """
+    Classify the upstream label without assuming all terminology is identical.
+
+    The Gambler's Dharma glossary defines kutila as stationary. VedAstro may
+    also return Vikala as a motion label. Strict mode treats Vikala as a veto;
+    practical mode requires same-date Swiss confirmation and otherwise treats
+    it as a warning.
+    """
+
+    normalised = normalise_motion_label(label)
+
+    if not normalised:
+        return "none"
+
+    if normalised in {
+        "kutila",
+        "stationary",
+        "station",
+        "exactly stationary",
+    }:
+        return "explicit_station"
+
+    if "stationary" in normalised:
+        return "explicit_station"
+
+    if "kutila" in normalised:
+        return "explicit_station"
+
+    if "vikala" in normalised:
+        return "vikala"
+
+    return "ordinary"
+
+
+def motion_label_is_kutila(
+    label: str | None,
+) -> bool:
+    """Backward-compatible strict-book classification."""
+
+    return classify_motion_label(label) in {
+        "explicit_station",
+        "vikala",
+    }
+
+
+def motion_label_is_practical_hard_veto(
+    label: str | None,
+) -> bool:
+    return classify_motion_label(label) == "explicit_station"
+
+
+def motion_label_is_practical_warning(
+    label: str | None,
+) -> bool:
+    return classify_motion_label(label) == "vikala"
 
 def julian_day_to_utc_datetime(
     julian_day_ut: float,
@@ -13421,33 +13546,84 @@ def calculate_stationary_audit(
         parsed["local_datetime"]
     )
     source_labels: list[dict[str, Any]] = []
-    hard_veto_labels: list[str] = []
+    strict_label_vetoes: list[str] = []
+    practical_label_vetoes: list[str] = []
+    practical_label_warnings: list[str] = []
 
     for planet_name, result in planets.items():
         label = extract_motion_label(result)
-        is_kutila = motion_label_is_kutila(label)
+        classification = classify_motion_label(label)
+        strict_veto = motion_label_is_kutila(label)
+        practical_veto = (
+            motion_label_is_practical_hard_veto(label)
+        )
+        practical_warning = (
+            motion_label_is_practical_warning(label)
+        )
 
         source_labels.append({
             "planet": planet_name,
             "vedastro_motion_label": label,
-            "kutila_or_stationary": is_kutila,
+            "classification": classification,
+            "strict_book_veto": strict_veto,
+            "practical_hard_veto": practical_veto,
+            "practical_warning": practical_warning,
         })
 
-        if is_kutila:
-            hard_veto_labels.append(planet_name)
+        if strict_veto:
+            strict_label_vetoes.append(planet_name)
+
+        if practical_veto:
+            practical_label_vetoes.append(planet_name)
+
+        if practical_warning:
+            practical_label_warnings.append(planet_name)
 
     if not SWISSEPH_AVAILABLE or event_jd is None:
+        selected_hard_veto_planets = (
+            strict_label_vetoes
+            if RELIABILITY_POLICY_MODE == "strict_book"
+            else practical_label_vetoes
+        )
+
         return {
             "status": "Partial",
             "method": "VedAstro motion labels plus Swiss speed-zero search",
+            "policy_mode": RELIABILITY_POLICY_MODE,
             "vedastro_motion_labels": source_labels,
             "swiss_station_search": [],
-            "hard_veto_planets": sorted(
-                set(hard_veto_labels),
+            "strict_book_hard_veto_planets": sorted(
+                set(strict_label_vetoes),
                 key=lambda name: PLANET_ORDER.get(name, 999),
             ),
-            "hard_veto": bool(hard_veto_labels),
-            "warning_planets": [],
+            "practical_hard_veto_planets": sorted(
+                set(practical_label_vetoes),
+                key=lambda name: PLANET_ORDER.get(name, 999),
+            ),
+            "practical_warning_planets": sorted(
+                set(practical_label_warnings),
+                key=lambda name: PLANET_ORDER.get(name, 999),
+            ),
+            "hard_veto_planets": sorted(
+                set(selected_hard_veto_planets),
+                key=lambda name: PLANET_ORDER.get(name, 999),
+            ),
+            "strict_book_hard_veto": bool(strict_label_vetoes),
+            "practical_hard_veto": bool(practical_label_vetoes),
+            "hard_veto": bool(selected_hard_veto_planets),
+            "warning_planets": sorted(
+                set(practical_label_warnings),
+                key=lambda name: PLANET_ORDER.get(name, 999),
+            ),
+            "confidence_cap": (
+                "LOW"
+                if (
+                    RELIABILITY_POLICY_MODE == "practical_verified"
+                    and practical_label_warnings
+                    and not practical_label_vetoes
+                )
+                else None
+            ),
             "error": "Swiss Ephemeris station search is unavailable.",
         }
 
@@ -13470,8 +13646,14 @@ def calculate_stationary_audit(
         for row in station_rows
         if row.get("same_local_calendar_date")
     ]
-    hard_veto_planets = sorted(
-        set(hard_veto_labels + same_date_planets),
+    seven_day_planets = [
+        row["body"]
+        for row in station_rows
+        if row.get("within_seven_days")
+    ]
+
+    strict_hard_veto_planets = sorted(
+        set(strict_label_vetoes + same_date_planets),
         key=lambda name: (
             PLANET_ORDER.get(
                 name,
@@ -13481,12 +13663,47 @@ def calculate_stationary_audit(
             )
         ),
     )
-    warning_planets = [
-        row["body"]
-        for row in station_rows
-        if row.get("within_seven_days")
-        and row["body"] not in hard_veto_planets
-    ]
+    practical_hard_veto_planets = sorted(
+        set(practical_label_vetoes + same_date_planets),
+        key=lambda name: (
+            PLANET_ORDER.get(
+                name,
+                100 + OUTER_BODY_ORDER.index(name)
+                if name in OUTER_BODY_ORDER
+                else 999,
+            )
+        ),
+    )
+    practical_warning_planets = sorted(
+        set(
+            practical_label_warnings
+            + [
+                name
+                for name in seven_day_planets
+                if name not in practical_hard_veto_planets
+            ]
+        ),
+        key=lambda name: (
+            PLANET_ORDER.get(
+                name,
+                100 + OUTER_BODY_ORDER.index(name)
+                if name in OUTER_BODY_ORDER
+                else 999,
+            )
+        ),
+    )
+
+    if RELIABILITY_POLICY_MODE == "strict_book":
+        selected_hard_veto_planets = strict_hard_veto_planets
+        selected_warning_planets = [
+            name
+            for name in seven_day_planets
+            if name not in selected_hard_veto_planets
+        ]
+    else:
+        selected_hard_veto_planets = practical_hard_veto_planets
+        selected_warning_planets = practical_warning_planets
+
     unavailable = [
         row
         for row in station_rows
@@ -13496,20 +13713,48 @@ def calculate_stationary_audit(
     return {
         "status": "Pass" if not unavailable else "Partial",
         "method": "VedAstro motion labels plus Swiss speed-zero search",
+        "policy_mode": RELIABILITY_POLICY_MODE,
         "book_rule": (
             "Do not wager when planets are kutila/stationary. The exact "
             "station day is especially to be avoided."
         ),
         "vedastro_motion_labels": source_labels,
         "swiss_station_search": station_rows,
-        "hard_veto_planets": hard_veto_planets,
-        "hard_veto": bool(hard_veto_planets),
-        "warning_planets": warning_planets,
+        "same_local_date_station_planets": same_date_planets,
+        "strict_book_hard_veto_planets": strict_hard_veto_planets,
+        "practical_hard_veto_planets": practical_hard_veto_planets,
+        "practical_warning_planets": practical_warning_planets,
+        "hard_veto_planets": selected_hard_veto_planets,
+        "strict_book_hard_veto": bool(
+            strict_hard_veto_planets
+        ),
+        "practical_hard_veto": bool(
+            practical_hard_veto_planets
+        ),
+        "hard_veto": bool(selected_hard_veto_planets),
+        "warning_planets": selected_warning_planets,
+        "confidence_cap": (
+            "LOW"
+            if (
+                RELIABILITY_POLICY_MODE == "practical_verified"
+                and selected_warning_planets
+                and not selected_hard_veto_planets
+            )
+            else None
+        ),
+        "policy_explanation": (
+            "strict_book treats an upstream Vikala label as a hard veto."
+            if RELIABILITY_POLICY_MODE == "strict_book"
+            else (
+                "practical_verified keeps same-local-date or explicit "
+                "Kutila/stationary conditions as hard vetoes; a non-same-date "
+                "Vikala/near-station condition is a LOW-confidence warning."
+            )
+        ),
         "one_to_seven_day_window_note": (
             "The book gives a broad one-to-seven-day range but no exact "
-            "planet-by-planet allocation. Proximity is reported; only an "
-            "explicit VedAstro kutila/stationary label or the exact local "
-            "station date is automatically vetoed."
+            "planet-by-planet numerical threshold. Both policy decisions "
+            "and exact station distances are returned transparently."
         ),
         "unavailable_bodies": unavailable,
         "pdf_pages": [38, 232, 233],
@@ -13517,7 +13762,6 @@ def calculate_stationary_audit(
             "One or more optional body station searches were unavailable."
         ),
     }
-
 
 def eclipse_flag_labels(
     flag: int,
@@ -14115,7 +14359,7 @@ def calculate_reliability_audit(
     navamsha_interpretation: dict[str, Any],
     kp_sublords: dict[str, Any],
 ) -> dict[str, Any]:
-    """Calculate the book-locked prediction-reliability gate."""
+    """Calculate strict-book and practical-verified reliability decisions."""
 
     stationary = calculate_stationary_audit(
         std_time,
@@ -14135,33 +14379,45 @@ def calculate_reliability_audit(
         kp_sublords,
     )
 
-    hard_veto_reasons: list[str] = []
+    strict_reasons: list[str] = []
+    practical_reasons: list[str] = []
 
-    if stationary.get("hard_veto"):
-        planets_text = ", ".join(
-            stationary.get("hard_veto_planets", [])
+    strict_station_planets = stationary.get(
+        "strict_book_hard_veto_planets",
+        [],
+    )
+    practical_station_planets = stationary.get(
+        "practical_hard_veto_planets",
+        [],
+    )
+
+    if strict_station_planets:
+        strict_reasons.append(
+            "Kutila/stationary planet veto: "
+            + ", ".join(strict_station_planets)
         )
-        hard_veto_reasons.append(
-            "Kutila/stationary planet veto"
-            + (f": {planets_text}" if planets_text else "")
+
+    if practical_station_planets:
+        practical_reasons.append(
+            "Exact or same-local-date stationary veto: "
+            + ", ".join(practical_station_planets)
         )
 
     if eclipses.get("hard_veto"):
-        hard_veto_reasons.append(
-            "Within three days of a major eclipse"
-        )
+        reason = "Within three days of a major eclipse"
+        strict_reasons.append(reason)
+        practical_reasons.append(reason)
 
     if sankranti.get("hard_veto"):
-        hard_veto_reasons.append(
-            "Sidereal Sun at 29 degrees or higher"
-        )
+        reason = "Sidereal Sun at 29 degrees or higher"
+        strict_reasons.append(reason)
+        practical_reasons.append(reason)
 
     warning_reasons: list[str] = []
 
     if stationary.get("warning_planets"):
         warning_reasons.append(
-            "Planetary station within the book's broad seven-day "
-            "discussion: "
+            "Manual station caution: "
             + ", ".join(stationary["warning_planets"])
         )
 
@@ -14178,6 +14434,16 @@ def calculate_reliability_audit(
             "Sunrise/sunset distance requires manual review because "
             "the book gives no numerical window."
         )
+
+    strict_book_hard_veto = bool(strict_reasons)
+    practical_hard_veto = bool(practical_reasons)
+
+    if RELIABILITY_POLICY_MODE == "strict_book":
+        selected_hard_veto = strict_book_hard_veto
+        selected_reasons = strict_reasons
+    else:
+        selected_hard_veto = practical_hard_veto
+        selected_reasons = practical_reasons
 
     sublayers = {
         "stationary_kutila": stationary,
@@ -14196,7 +14462,8 @@ def calculate_reliability_audit(
         for name, layer in sublayers.items()
         if layer.get("status") == "Partial"
     ]
-    hard_veto = bool(hard_veto_reasons)
+
+    confidence_cap = stationary.get("confidence_cap")
 
     return {
         "status": (
@@ -14204,26 +14471,49 @@ def calculate_reliability_audit(
             if not unavailable and not partial
             else "Partial"
         ),
-        "method": "BookLockedReliabilityAndSandhiAudit",
+        "method": "DualPolicyBookReliabilityAndSandhiAudit",
+        "policy_mode": RELIABILITY_POLICY_MODE,
         "book_chapters": [2, 9],
-        "hard_veto": hard_veto,
+        "strict_book_hard_veto": strict_book_hard_veto,
+        "strict_book_prediction_allowed": (
+            not strict_book_hard_veto
+        ),
+        "strict_book_hard_veto_reasons": strict_reasons,
+        "practical_hard_veto": practical_hard_veto,
+        "practical_prediction_allowed": (
+            not practical_hard_veto
+        ),
+        "practical_hard_veto_reasons": practical_reasons,
+        "hard_veto": selected_hard_veto,
         "strict_prediction_allowed_by_reliability": (
-            not hard_veto
+            not selected_hard_veto
         ),
         "decision": (
             "Avoid"
-            if hard_veto
+            if selected_hard_veto
+            else "Proceed with LOW confidence"
+            if confidence_cap == "LOW"
             else "Proceed with manual sandhi review"
             if warning_reasons
             else "No automatic reliability veto"
         ),
-        "hard_veto_reasons": hard_veto_reasons,
+        "confidence_cap": confidence_cap,
+        "hard_veto_reasons": selected_reasons,
         "warning_reasons": warning_reasons,
         "stationary_kutila": stationary,
         "eclipses": eclipses,
         "solar_sankranti": sankranti,
         "sunrise_sunset": sunrise_sunset,
         "karma_fixity": karma,
+        "performance_fallback_recommended": (
+            selected_hard_veto
+        ),
+        "market_assignment_note": (
+            "The astronomical chart does not change when the market "
+            "favourite changes. Remap participant labels using the frozen "
+            "pre-call consensus; recalculate only if event time/location "
+            "changes or participant-dependent name sounds were used."
+        ),
         "unavailable_sublayers": unavailable,
         "partial_sublayers": partial,
         "pdf_pages": RELIABILITY_AUDIT_PDF_PAGES,
@@ -14670,6 +14960,7 @@ def health() -> dict[str, Any]:
         "action_response_payload_target_characters": (
             ACTION_RESPONSE_PAYLOAD_TARGET_CHARACTERS
         ),
+        "reliability_policy_mode": RELIABILITY_POLICY_MODE,
         "advanced_layers": {
             "exact_lahiri_placidus_cusps": True,
             "planet_cusp_contacts": True,
