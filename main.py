@@ -25,7 +25,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.6.1"
+PROXY_VERSION = "1.7.0"
 
 
 # ============================================================
@@ -270,7 +270,8 @@ app = FastAPI(
     description=(
         "Compact Lahiri event-chart proxy using the official "
         "VedAstro.Python client, paid-key header authentication, "
-        "nested planet parameters and strict validation."
+        "nested planet parameters, exact Placidus cusps, "
+        "planet-to-cusp contacts and strict validation."
     ),
 )
 
@@ -313,6 +314,24 @@ ZODIAC_SIGNS = (
     "Aquarius",
     "Pisces",
 )
+
+
+# Gambler's Dharma Chapter 4 cusp-contact policy.
+# The currently supported invisible bodies are Rahu and Ketu. Outer planets
+# and special points will be added in a later version.
+VISIBLE_CUSP_ORB_DEGREES = 2.5
+INVISIBLE_CUSP_ORB_DEGREES = 2.0
+INVISIBLE_CUSP_BODIES = {"Rahu", "Ketu"}
+
+# Primary contest cusps used by the book.
+SENSITIVE_CUSP_DETAILS = {
+    "House1": {"axis": "1/7", "side": "Favourite"},
+    "House7": {"axis": "1/7", "side": "Underdog"},
+    "House6": {"axis": "6/12", "side": "Favourite"},
+    "House12": {"axis": "6/12", "side": "Underdog"},
+    "House10": {"axis": "10/4", "side": "Favourite"},
+    "House4": {"axis": "10/4", "side": "Underdog"},
+}
 
 
 # ============================================================
@@ -949,6 +968,209 @@ def calculate_rashi_placidus(event_time: Time) -> dict[str, Any]:
     return parsed
 
 
+def cusp_orb_policy(planet_name: str) -> tuple[str, float]:
+    """Return the book visibility class and maximum D1 cusp orb."""
+
+    if planet_name in INVISIBLE_CUSP_BODIES:
+        return "invisible", INVISIBLE_CUSP_ORB_DEGREES
+
+    return "visible", VISIBLE_CUSP_ORB_DEGREES
+
+
+def calculate_planet_cusp_contacts(
+    planets: dict[str, dict[str, Any]],
+    rashi_placidus: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Calculate exact distances from every requested planet to the six primary
+    Placidus contest cusps.
+
+    This layer reports objective geometry only. It deliberately does not assign
+    winner effects or Gambler's Dharma points; those depend on the planet, axis,
+    motion, dignity and the book's cumulative interpretation.
+    """
+
+    if rashi_placidus.get("status") != "Pass":
+        return {
+            "status": "Unavailable",
+            "method": "InternalPlanetToPlacidusCuspDistances",
+            "ayanamsa": "Lahiri",
+            "house_system": "Placidus",
+            "error": "Exact Placidus cusps did not pass validation.",
+            "distances_by_planet": {},
+            "qualifying_contacts": [],
+            "closest_planet_by_cusp": {},
+        }
+
+    cusp_source = rashi_placidus.get("cusps", {})
+    sensitive_cusps: dict[str, dict[str, Any]] = {}
+
+    for cusp_name, metadata in SENSITIVE_CUSP_DETAILS.items():
+        cusp = cusp_source.get(cusp_name, {})
+        cusp_longitude = cusp.get("sidereal_longitude")
+
+        if not isinstance(cusp_longitude, (int, float)):
+            return {
+                "status": "Fail",
+                "method": "InternalPlanetToPlacidusCuspDistances",
+                "ayanamsa": "Lahiri",
+                "house_system": "Placidus",
+                "error": f"{cusp_name} exact longitude is missing.",
+                "distances_by_planet": {},
+                "qualifying_contacts": [],
+                "closest_planet_by_cusp": {},
+            }
+
+        sensitive_cusps[cusp_name] = {
+            "cusp": cusp_name,
+            "axis": metadata["axis"],
+            "side": metadata["side"],
+            "sidereal_longitude": round(
+                normalise_degrees(float(cusp_longitude)),
+                8,
+            ),
+            "sign": cusp.get("sign"),
+            "degree_in_sign": cusp.get("degree_in_sign"),
+        }
+
+    distances_by_planet: dict[str, dict[str, Any]] = {}
+    unavailable_planets: list[dict[str, str]] = []
+    all_contacts: list[dict[str, Any]] = []
+
+    for planet_name, planet_result in planets.items():
+        longitude_result = planet_result.get("sidereal_longitude", {})
+        planet_longitude = extract_total_degrees(longitude_result)
+
+        if planet_longitude is None:
+            unavailable_planets.append({
+                "planet": planet_name,
+                "reason": "Could not parse exact sidereal longitude.",
+            })
+            continue
+
+        planet_longitude = normalise_degrees(planet_longitude)
+        visibility_class, orb_limit = cusp_orb_policy(planet_name)
+        planet_distances: dict[str, float] = {}
+
+        for cusp_name, cusp in sensitive_cusps.items():
+            distance = angular_distance(
+                planet_longitude,
+                cusp["sidereal_longitude"],
+            )
+            planet_distances[cusp_name] = round(distance, 8)
+
+            all_contacts.append({
+                "planet": planet_name,
+                "cusp": cusp_name,
+                "axis": cusp["axis"],
+                "side": cusp["side"],
+                "planet_longitude": round(planet_longitude, 8),
+                "cusp_longitude": cusp["sidereal_longitude"],
+                "angular_distance": round(distance, 8),
+                "visibility_class": visibility_class,
+                "orb_limit": orb_limit,
+                "within_orb": distance <= orb_limit + 1e-9,
+                "orb_margin": round(orb_limit - distance, 8),
+            })
+
+        nearest_cusp = min(
+            planet_distances,
+            key=planet_distances.get,
+        )
+
+        distances_by_planet[planet_name] = {
+            "planet": planet_name,
+            "sidereal_longitude": round(planet_longitude, 8),
+            **sign_details_from_longitude(planet_longitude),
+            "visibility_class": visibility_class,
+            "orb_limit": orb_limit,
+            "distances": planet_distances,
+            "nearest_sensitive_cusp": nearest_cusp,
+            "nearest_distance": planet_distances[nearest_cusp],
+            "nearest_within_orb": (
+                planet_distances[nearest_cusp] <= orb_limit + 1e-9
+            ),
+        }
+
+    closest_planet_by_cusp: dict[str, dict[str, Any]] = {}
+    qualifying_contacts: list[dict[str, Any]] = []
+
+    for cusp_name in sensitive_cusps:
+        cusp_contacts = sorted(
+            (
+                contact
+                for contact in all_contacts
+                if contact["cusp"] == cusp_name
+            ),
+            key=lambda contact: (
+                contact["angular_distance"],
+                contact["planet"],
+            ),
+        )
+
+        if not cusp_contacts:
+            continue
+
+        closest = dict(cusp_contacts[0])
+        closest["qualifies"] = closest["within_orb"]
+        closest_planet_by_cusp[cusp_name] = closest
+
+        qualifying_for_cusp = [
+            contact
+            for contact in cusp_contacts
+            if contact["within_orb"]
+        ]
+
+        for rank, contact in enumerate(qualifying_for_cusp, start=1):
+            ranked_contact = dict(contact)
+            ranked_contact["rank_on_cusp"] = rank
+            ranked_contact["closest_qualifying_contact"] = rank == 1
+            qualifying_contacts.append(ranked_contact)
+
+    if not distances_by_planet:
+        status = "Unavailable"
+        error = "No requested planet longitude could be parsed."
+    elif unavailable_planets:
+        status = "Partial"
+        error = "One or more requested planet longitudes were unavailable."
+    else:
+        status = "Pass"
+        error = None
+
+    cusp_order = list(SENSITIVE_CUSP_DETAILS)
+
+    return {
+        "status": status,
+        "method": "InternalPlanetToPlacidusCuspDistances",
+        "ayanamsa": "Lahiri",
+        "house_system": "Placidus",
+        "book_layer": "Tier 2 raw cusp geometry",
+        "interpretation_applied": False,
+        "orb_policy": {
+            "visible_planets_degrees": VISIBLE_CUSP_ORB_DEGREES,
+            "invisible_bodies_degrees": INVISIBLE_CUSP_ORB_DEGREES,
+            "currently_supported_invisible_bodies": sorted(
+                INVISIBLE_CUSP_BODIES
+            ),
+            "outer_planets_and_special_points": (
+                "Not yet supported by the current request schema."
+            ),
+        },
+        "sensitive_cusps": sensitive_cusps,
+        "distances_by_planet": distances_by_planet,
+        "qualifying_contacts": sorted(
+            qualifying_contacts,
+            key=lambda contact: (
+                cusp_order.index(contact["cusp"]),
+                contact["rank_on_cusp"],
+            ),
+        ),
+        "closest_planet_by_cusp": closest_planet_by_cusp,
+        "unavailable_planets": unavailable_planets,
+        "error": error,
+    }
+
+
 # ============================================================
 # CONSISTENCY VALIDATION
 # ============================================================
@@ -1376,7 +1598,7 @@ def health() -> dict[str, Any]:
         "response_mode": "compact direct calculations",
         "advanced_layers": {
             "exact_lahiri_placidus_cusps": True,
-            "planet_cusp_contacts": False,
+            "planet_cusp_contacts": True,
             "navamsha_cusps": False,
             "kp_sublords": False,
         },
@@ -1515,6 +1737,13 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         if name in planets
     }
 
+    # Exact Tier 2 raw geometry: requested planets against the six sensitive
+    # Placidus cusps. This remains non-essential for the standard chart gate.
+    planet_cusp_contacts = calculate_planet_cusp_contacts(
+        planets,
+        rashi_placidus,
+    )
+
     essential_results: list[dict[str, Any]] = [
         core["ayanamsa_degree"],
         core["lagna_sign"],
@@ -1619,6 +1848,7 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         },
         "core": core,
         "rashi_placidus": rashi_placidus,
+        "planet_cusp_contacts": planet_cusp_contacts,
         "houses": houses,
         "planets": planets,
         "provenance": {
@@ -1629,6 +1859,10 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
             ),
             "planet_parameter_fix": (
                 "Every planet request is sent as a nested Name object."
+            ),
+            "planet_cusp_contacts": (
+                "Internally calculated from exact Lahiri Placidus cusps and "
+                "requested VedAstro sidereal planet longitudes."
             ),
             "vedastro_api_key": "stored only on Render",
             "minimum_call_interval_seconds": VEDASTRO_MIN_INTERVAL_SECONDS,
