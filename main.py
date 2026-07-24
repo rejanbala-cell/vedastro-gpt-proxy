@@ -34,7 +34,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.13.1"
+PROXY_VERSION = "1.14.0"
 
 
 # ============================================================
@@ -409,6 +409,38 @@ SENSITIVE_CUSP_DETAILS = {
     "House10": {"axis": "10/4", "side": "Favourite"},
     "House4": {"axis": "10/4", "side": "Underdog"},
 }
+
+
+# Gambler's Dharma Chapter 4 stolen-cusp method.
+#
+# PDF pages 108-114 in the uploaded complete PDF:
+# - power cusps: 1/7, 6/12 and 4/10
+# - neutral cusps: 3/9 and 5/11
+# - power-to-neutral weakens a planet's cusp effect
+# - neutral-to-power activates the neutral cusp as the whole-sign power house
+# - power-to-power redirects the contact to the new power house
+STOLEN_CUSP_POWER_HOUSES = {1, 4, 6, 7, 10, 12}
+STOLEN_CUSP_NEUTRAL_HOUSES = {3, 5, 9, 11}
+
+STOLEN_CUSP_SIDE_BY_POWER_HOUSE = {
+    1: "Favourite",
+    6: "Favourite",
+    10: "Favourite",
+    7: "Underdog",
+    12: "Underdog",
+    4: "Underdog",
+}
+
+STOLEN_CUSP_AXIS_BY_POWER_HOUSE = {
+    1: "1/7",
+    7: "1/7",
+    6: "6/12",
+    12: "6/12",
+    10: "10/4",
+    4: "10/4",
+}
+
+STOLEN_CUSP_PDF_PAGES = [108, 109, 110, 111, 112, 113, 114]
 
 
 # Gambler's Dharma Chapter 5 exact Navamsha geometry.
@@ -6064,6 +6096,58 @@ def compact_special_points_layer(
     })
 
 
+def compact_stolen_cusps_layer(
+    layer: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve the complete decision-bearing stolen-cusp audit."""
+
+    return compact_recursive({
+        "status": layer.get("status"),
+        "method": layer.get("method"),
+        "book_chapter": layer.get("book_chapter"),
+        "book_tier": layer.get("book_tier"),
+        "pdf_pages": layer.get("pdf_pages"),
+        "ayanamsa": layer.get("ayanamsa"),
+        "house_system": layer.get("house_system"),
+        "whole_sign_reference": layer.get(
+            "whole_sign_reference"
+        ),
+        "book_rules": layer.get("book_rules"),
+        "orb_policy": layer.get("orb_policy"),
+        "audit_summary": layer.get("audit_summary"),
+        "stolen_cusps": layer.get(
+            "stolen_cusps",
+            [],
+        ),
+        "qualifying_contacts": layer.get(
+            "qualifying_contacts",
+            [],
+        ),
+        "dormant_stolen_cusps": layer.get(
+            "dormant_stolen_cusps",
+            [],
+        ),
+        "available_body_count": layer.get(
+            "available_body_count"
+        ),
+        "unavailable_bodies": layer.get(
+            "unavailable_bodies",
+            [],
+        ),
+        "coverage_status": layer.get(
+            "coverage_status"
+        ),
+        "interpretation_applied": layer.get(
+            "interpretation_applied"
+        ),
+        "winner_direction_inferred": layer.get(
+            "winner_direction_inferred"
+        ),
+        "points_applied": layer.get("points_applied"),
+        "error": layer.get("error"),
+    }, list_limit=24, string_limit=220)
+
+
 def compact_tara_layer(
     layer: dict[str, Any],
 ) -> dict[str, Any]:
@@ -6450,6 +6534,45 @@ def emergency_action_response(
         "special_points": compacted.get(
             "special_points"
         ),
+        "stolen_cusps": {
+            "status": compacted.get(
+                "stolen_cusps",
+                {},
+            ).get("status"),
+            "book_tier": compacted.get(
+                "stolen_cusps",
+                {},
+            ).get("book_tier"),
+            "pdf_pages": compacted.get(
+                "stolen_cusps",
+                {},
+            ).get("pdf_pages"),
+            "whole_sign_reference": compacted.get(
+                "stolen_cusps",
+                {},
+            ).get("whole_sign_reference"),
+            "audit_summary": compacted.get(
+                "stolen_cusps",
+                {},
+            ).get("audit_summary"),
+            "stolen_cusps": compacted.get(
+                "stolen_cusps",
+                {},
+            ).get("stolen_cusps", []),
+            "qualifying_contacts": compacted.get(
+                "stolen_cusps",
+                {},
+            ).get("qualifying_contacts", []),
+            "unavailable_bodies": compacted.get(
+                "stolen_cusps",
+                {},
+            ).get("unavailable_bodies", []),
+            "points_applied": False,
+            "error": compacted.get(
+                "stolen_cusps",
+                {},
+            ).get("error"),
+        },
         "nakshatra_taras": {
             "status": tara.get("status"),
             "orb_policy": tara.get("orb_policy"),
@@ -6563,6 +6686,9 @@ def compact_action_response(
         ),
         "special_points": compact_special_points_layer(
             response.get("special_points", {})
+        ),
+        "stolen_cusps": compact_stolen_cusps_layer(
+            response.get("stolen_cusps", {})
         ),
         "nakshatra_taras": compact_tara_layer(
             response.get("nakshatra_taras", {})
@@ -6683,6 +6809,605 @@ def compact_action_response(
     ] = len(final_encoded)
 
     return compacted
+
+
+def whole_sign_house_for_longitude(
+    sidereal_longitude: float,
+    ascendant_longitude: float,
+) -> int:
+    """Place one longitude in a whole-sign house relative to the Ascendant."""
+
+    longitude_sign_index = int(
+        normalise_degrees(float(sidereal_longitude)) // 30.0
+    )
+    ascendant_sign_index = int(
+        normalise_degrees(float(ascendant_longitude)) // 30.0
+    )
+
+    return (
+        (longitude_sign_index - ascendant_sign_index) % 12
+    ) + 1
+
+
+def stolen_cusp_house_class(house_number: int) -> str:
+    if house_number in STOLEN_CUSP_POWER_HOUSES:
+        return "Power"
+
+    if house_number in STOLEN_CUSP_NEUTRAL_HOUSES:
+        return "Neutral"
+
+    return "Outside explicit Chapter 4 contest classes"
+
+
+def signed_house_shift(
+    source_house: int,
+    target_house: int,
+) -> int:
+    """Return the shortest signed whole-sign displacement."""
+
+    shift = (target_house - source_house) % 12
+
+    if shift > 6:
+        shift -= 12
+
+    return shift
+
+
+def classify_stolen_cusp(
+    source_house: int,
+    whole_sign_house: int,
+) -> dict[str, Any]:
+    """
+    Classify the exact Chapter 4 stolen-cusp transformation.
+
+    Winner direction is deliberately not guessed. A transferred contact must
+    still use the body's book-defined effect on the effective power cusp.
+    """
+
+    source_class = stolen_cusp_house_class(source_house)
+    target_class = stolen_cusp_house_class(whole_sign_house)
+    is_stolen = source_house != whole_sign_house
+    source_side = STOLEN_CUSP_SIDE_BY_POWER_HOUSE.get(
+        source_house
+    )
+    effective_side = STOLEN_CUSP_SIDE_BY_POWER_HOUSE.get(
+        whole_sign_house
+    )
+    source_axis = STOLEN_CUSP_AXIS_BY_POWER_HOUSE.get(
+        source_house
+    )
+    effective_axis = STOLEN_CUSP_AXIS_BY_POWER_HOUSE.get(
+        whole_sign_house
+    )
+
+    if not is_stolen:
+        stolen_type = "Not stolen"
+        rule_status = "Not applicable"
+        transformation = "No transfer"
+        contact_strength = "Normal cusp rule"
+        interpretation = (
+            "The Placidus cusp remains in its same-numbered whole-sign "
+            "house."
+        )
+    elif source_class == "Power" and target_class == "Neutral":
+        stolen_type = "Power-to-neutral"
+        rule_status = "Book-defined"
+        transformation = "Weakened"
+        contact_strength = "Significantly reduced"
+        interpretation = (
+            "A planet conjoined with this power cusp loses effectiveness. "
+            "Both helpful and harmful cusp effects are reduced."
+        )
+    elif source_class == "Neutral" and target_class == "Power":
+        stolen_type = "Neutral-to-power"
+        rule_status = "Book-defined"
+        transformation = "Activated and transferred"
+        contact_strength = "Effective through target power house"
+        interpretation = (
+            "A planet conjoined with this normally neutral cusp becomes "
+            "eligible to affect the match through the whole-sign power "
+            f"house, House{whole_sign_house}."
+        )
+    elif source_class == "Power" and target_class == "Power":
+        stolen_type = "Power-to-power"
+        rule_status = "Book-defined"
+        transformation = "Redirected"
+        contact_strength = "Judge through target power house"
+        interpretation = (
+            "A planet conjoined with this cusp is judged through the "
+            f"whole-sign House{whole_sign_house}, not mechanically through "
+            f"the original House{source_house} cusp."
+        )
+    else:
+        stolen_type = "Other shifted cusp"
+        rule_status = "Not explicitly defined by book"
+        transformation = "No automatic contest rule"
+        contact_strength = "Unscored"
+        interpretation = (
+            "The cusp changed whole-sign house, but Chapter 4 does not "
+            "define this source/target class as one of its three contest "
+            "stolen-cusp types."
+        )
+
+    return {
+        "is_stolen": is_stolen,
+        "stolen_type": stolen_type,
+        "rule_status": rule_status,
+        "source_house_class": source_class,
+        "target_house_class": target_class,
+        "source_axis": source_axis,
+        "effective_axis": effective_axis,
+        "source_represented_side": source_side,
+        "effective_represented_side": effective_side,
+        "transformation": transformation,
+        "contact_strength": contact_strength,
+        "interpretation": interpretation,
+        "winner_direction_inferred": False,
+        "points_applied": False,
+    }
+
+
+def collect_stolen_cusp_bodies(
+    planets: dict[str, dict[str, Any]],
+    outer_planets: dict[str, Any],
+    special_points: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Collect every exact body currently available to the proxy."""
+
+    bodies: list[dict[str, Any]] = []
+    unavailable: list[dict[str, Any]] = []
+
+    for planet_name, result in planets.items():
+        longitude = extract_total_degrees(
+            result.get("sidereal_longitude", {})
+        )
+
+        if longitude is None:
+            unavailable.append({
+                "body": planet_name,
+                "category": "Classical planet",
+                "reason": "Exact sidereal longitude is unavailable.",
+            })
+            continue
+
+        visibility_class, orb_limit = cusp_orb_policy(
+            planet_name
+        )
+        bodies.append({
+            "body": planet_name,
+            "category": "Classical planet",
+            "sidereal_longitude": round(
+                normalise_degrees(longitude),
+                8,
+            ),
+            "visibility_class": visibility_class,
+            "orb_limit": orb_limit,
+            "motion": None,
+        })
+
+    for body_name, result in outer_planets.get(
+        "bodies",
+        {},
+    ).items():
+        longitude = result.get("sidereal_longitude")
+
+        if (
+            result.get("status") != "Pass"
+            or not isinstance(longitude, (int, float))
+        ):
+            unavailable.append({
+                "body": body_name,
+                "category": "Outer planet",
+                "reason": result.get(
+                    "error",
+                    "Exact sidereal longitude is unavailable.",
+                ),
+            })
+            continue
+
+        bodies.append({
+            "body": body_name,
+            "category": "Outer planet",
+            "sidereal_longitude": round(
+                normalise_degrees(float(longitude)),
+                8,
+            ),
+            "visibility_class": "invisible",
+            "orb_limit": OUTER_CUSP_ORB_DEGREES,
+            "motion": result.get("motion"),
+        })
+
+    for point_name, result in special_points.get(
+        "points",
+        {},
+    ).items():
+        longitude = result.get("sidereal_longitude")
+
+        if (
+            result.get("status") != "Pass"
+            or not isinstance(longitude, (int, float))
+        ):
+            unavailable.append({
+                "body": point_name,
+                "category": "Special point",
+                "reason": result.get(
+                    "error",
+                    "Exact sidereal longitude is unavailable.",
+                ),
+            })
+            continue
+
+        bodies.append({
+            "body": point_name,
+            "category": "Special point",
+            "sidereal_longitude": round(
+                normalise_degrees(float(longitude)),
+                8,
+            ),
+            "visibility_class": "invisible",
+            "orb_limit": SPECIAL_POINT_CUSP_ORB_DEGREES,
+            "motion": None,
+        })
+
+    return bodies, unavailable
+
+
+def stolen_cusp_contact_effect(
+    cusp: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the book-locked transfer instruction for one active contact."""
+
+    classification = cusp["classification"]
+    stolen_type = classification["stolen_type"]
+
+    if stolen_type == "Power-to-neutral":
+        instruction = (
+            "Reduce the body's normal positive or negative cusp influence. "
+            "Do not transfer it to a team."
+        )
+    elif stolen_type in {
+        "Neutral-to-power",
+        "Power-to-power",
+    }:
+        instruction = (
+            "Apply the body's separate Chapter 4 cusp rule as though it "
+            f"contacted House{cusp['whole_sign_house_number']}. The stolen-"
+            "cusp layer itself does not decide whether that body helps or "
+            "harms the represented side."
+        )
+    else:
+        instruction = (
+            "No automatic Chapter 4 contest transformation is applied."
+        )
+
+    return {
+        "stolen_type": stolen_type,
+        "transformation": classification["transformation"],
+        "contact_strength": classification["contact_strength"],
+        "source_cusp": cusp["cusp"],
+        "source_represented_side": classification[
+            "source_represented_side"
+        ],
+        "effective_power_house": (
+            f"House{cusp['whole_sign_house_number']}"
+            if classification["target_house_class"] == "Power"
+            else None
+        ),
+        "effective_axis": classification["effective_axis"],
+        "effective_represented_side": classification[
+            "effective_represented_side"
+        ],
+        "interpretation_instruction": instruction,
+        "winner_direction_inferred": False,
+        "points_applied": False,
+    }
+
+
+def calculate_stolen_cusps(
+    rashi_placidus: dict[str, Any],
+    planets: dict[str, dict[str, Any]],
+    outer_planets: dict[str, Any],
+    special_points: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Calculate all exact Chapter 4 stolen cusps and active body contacts.
+
+    The geometry uses exact Lahiri Placidus cusps and the rashi whole-sign
+    house counted from the sign containing the Ascendant.
+    """
+
+    if rashi_placidus.get("status") != "Pass":
+        return {
+            "status": "Unavailable",
+            "method": "BookLockedChapter4StolenCusps",
+            "book_chapter": 4,
+            "book_tier": 2,
+            "pdf_pages": STOLEN_CUSP_PDF_PAGES,
+            "ayanamsa": "Lahiri",
+            "house_system": "Placidus compared with whole-sign rashi",
+            "error": "Exact Lahiri Placidus cusps are unavailable.",
+            "cusp_audit": [],
+            "stolen_cusps": [],
+            "qualifying_contacts": [],
+        }
+
+    cusps = rashi_placidus.get("cusps", {})
+    ascendant_longitude = cusps.get(
+        "House1",
+        {},
+    ).get("sidereal_longitude")
+
+    if not isinstance(ascendant_longitude, (int, float)):
+        return {
+            "status": "Unavailable",
+            "method": "BookLockedChapter4StolenCusps",
+            "book_chapter": 4,
+            "book_tier": 2,
+            "pdf_pages": STOLEN_CUSP_PDF_PAGES,
+            "ayanamsa": "Lahiri",
+            "house_system": "Placidus compared with whole-sign rashi",
+            "error": "Exact Ascendant cusp longitude is unavailable.",
+            "cusp_audit": [],
+            "stolen_cusps": [],
+            "qualifying_contacts": [],
+        }
+
+    ascendant_longitude = normalise_degrees(
+        float(ascendant_longitude)
+    )
+    cusp_audit: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+
+    for house_number in range(1, 13):
+        cusp_name = f"House{house_number}"
+        cusp = cusps.get(cusp_name, {})
+        cusp_longitude = cusp.get("sidereal_longitude")
+
+        if not isinstance(cusp_longitude, (int, float)):
+            failures.append({
+                "cusp": cusp_name,
+                "reason": "Exact cusp longitude is unavailable.",
+            })
+            continue
+
+        cusp_longitude = normalise_degrees(
+            float(cusp_longitude)
+        )
+        whole_sign_house = whole_sign_house_for_longitude(
+            cusp_longitude,
+            ascendant_longitude,
+        )
+        classification = classify_stolen_cusp(
+            house_number,
+            whole_sign_house,
+        )
+
+        cusp_audit.append({
+            "cusp": cusp_name,
+            "source_house_number": house_number,
+            "sidereal_longitude": round(cusp_longitude, 8),
+            **sign_details_from_longitude(cusp_longitude),
+            "whole_sign_house_number": whole_sign_house,
+            "whole_sign_house": f"House{whole_sign_house}",
+            "signed_house_shift": signed_house_shift(
+                house_number,
+                whole_sign_house,
+            ),
+            "classification": classification,
+        })
+
+    if failures:
+        return {
+            "status": "Fail",
+            "method": "BookLockedChapter4StolenCusps",
+            "book_chapter": 4,
+            "book_tier": 2,
+            "pdf_pages": STOLEN_CUSP_PDF_PAGES,
+            "ayanamsa": "Lahiri",
+            "house_system": "Placidus compared with whole-sign rashi",
+            "error": "One or more exact cusp longitudes are missing.",
+            "failed_cusps": failures,
+            "cusp_audit": cusp_audit,
+            "stolen_cusps": [],
+            "qualifying_contacts": [],
+        }
+
+    stolen_cusps = [
+        cusp
+        for cusp in cusp_audit
+        if cusp["classification"]["is_stolen"]
+    ]
+    book_defined_stolen_cusps = [
+        cusp
+        for cusp in stolen_cusps
+        if cusp["classification"]["rule_status"] == "Book-defined"
+    ]
+
+    bodies, unavailable_bodies = collect_stolen_cusp_bodies(
+        planets,
+        outer_planets,
+        special_points,
+    )
+    qualifying_contacts: list[dict[str, Any]] = []
+
+    for cusp in book_defined_stolen_cusps:
+        for body in bodies:
+            distance = angular_distance(
+                body["sidereal_longitude"],
+                cusp["sidereal_longitude"],
+            )
+
+            if distance > body["orb_limit"] + 1e-9:
+                continue
+
+            qualifying_contacts.append({
+                "body": body["body"],
+                "body_category": body["category"],
+                "body_longitude": body["sidereal_longitude"],
+                "body_sign": sign_details_from_longitude(
+                    body["sidereal_longitude"]
+                )["sign"],
+                "body_motion": body.get("motion"),
+                "visibility_class": body[
+                    "visibility_class"
+                ],
+                "cusp": cusp["cusp"],
+                "cusp_longitude": cusp[
+                    "sidereal_longitude"
+                ],
+                "source_house_number": cusp[
+                    "source_house_number"
+                ],
+                "whole_sign_house_number": cusp[
+                    "whole_sign_house_number"
+                ],
+                "stolen_type": cusp[
+                    "classification"
+                ]["stolen_type"],
+                "angular_distance": round(distance, 8),
+                "orb_limit": body["orb_limit"],
+                "within_orb": True,
+                "orb_margin": round(
+                    body["orb_limit"] - distance,
+                    8,
+                ),
+                "book_effect": stolen_cusp_contact_effect(
+                    cusp
+                ),
+                "pdf_pages": STOLEN_CUSP_PDF_PAGES,
+                "points_applied": False,
+            })
+
+    type_order = {
+        "Power-to-power": 0,
+        "Neutral-to-power": 1,
+        "Power-to-neutral": 2,
+    }
+    qualifying_contacts.sort(
+        key=lambda item: (
+            type_order.get(item["stolen_type"], 9),
+            item["angular_distance"],
+            item["cusp"],
+            item["body"],
+        )
+    )
+
+    active_cusps = {
+        contact["cusp"]
+        for contact in qualifying_contacts
+    }
+    dormant_stolen_cusps = [
+        cusp["cusp"]
+        for cusp in book_defined_stolen_cusps
+        if cusp["cusp"] not in active_cusps
+    ]
+
+    type_counts = {
+        stolen_type: sum(
+            1
+            for cusp in book_defined_stolen_cusps
+            if cusp["classification"]["stolen_type"]
+            == stolen_type
+        )
+        for stolen_type in (
+            "Power-to-neutral",
+            "Neutral-to-power",
+            "Power-to-power",
+        )
+    }
+
+    return {
+        "status": "Pass",
+        "method": "BookLockedChapter4StolenCusps",
+        "book_chapter": 4,
+        "book_tier": 2,
+        "pdf_pages": STOLEN_CUSP_PDF_PAGES,
+        "ayanamsa": "Lahiri",
+        "house_system": "Placidus compared with whole-sign rashi",
+        "whole_sign_reference": {
+            "ascendant_longitude": round(
+                ascendant_longitude,
+                8,
+            ),
+            **sign_details_from_longitude(
+                ascendant_longitude
+            ),
+            "whole_sign_house1": sign_details_from_longitude(
+                ascendant_longitude
+            )["sign"],
+        },
+        "book_rules": {
+            "power_houses": sorted(
+                STOLEN_CUSP_POWER_HOUSES
+            ),
+            "neutral_houses": sorted(
+                STOLEN_CUSP_NEUTRAL_HOUSES
+            ),
+            "power_to_neutral": (
+                "Reduces the effect of a body conjoined with the cusp."
+            ),
+            "neutral_to_power": (
+                "Activates the neutral cusp through the target whole-sign "
+                "power house."
+            ),
+            "power_to_power": (
+                "Redirects the body contact to the target whole-sign "
+                "power house."
+            ),
+            "body_effect_required_separately": True,
+        },
+        "orb_policy": {
+            "visible_planets_degrees": VISIBLE_CUSP_ORB_DEGREES,
+            "invisible_planets_and_points_degrees": (
+                INVISIBLE_CUSP_ORB_DEGREES
+            ),
+            "outer_planets_degrees": OUTER_CUSP_ORB_DEGREES,
+            "special_points_degrees": (
+                SPECIAL_POINT_CUSP_ORB_DEGREES
+            ),
+            "exalted_or_retrograde_extra_orb_applied": False,
+            "extra_orb_note": (
+                "The book mentions a little extra orb for exalted or "
+                "retrograde bodies but does not provide one universal "
+                "mechanical quantity here, so no value is invented."
+            ),
+        },
+        "audit_summary": {
+            "all_12_cusps_checked": len(cusp_audit) == 12,
+            "stolen_cusp_count": len(stolen_cusps),
+            "book_defined_stolen_cusp_count": len(
+                book_defined_stolen_cusps
+            ),
+            "type_counts": type_counts,
+            "qualifying_contact_count": len(
+                qualifying_contacts
+            ),
+            "active_stolen_cusps": sorted(
+                active_cusps
+            ),
+            "dormant_stolen_cusps": sorted(
+                dormant_stolen_cusps
+            ),
+        },
+        "cusp_audit": cusp_audit,
+        "stolen_cusps": stolen_cusps,
+        "qualifying_contacts": qualifying_contacts,
+        "dormant_stolen_cusps": dormant_stolen_cusps,
+        "available_body_count": len(bodies),
+        "unavailable_bodies": unavailable_bodies,
+        "coverage_status": (
+            "Pass"
+            if not unavailable_bodies
+            else "Partial"
+        ),
+        "interpretation_applied": (
+            "Book-defined transfer/weakening only; body winner effect "
+            "must be interpreted separately."
+        ),
+        "winner_direction_inferred": False,
+        "points_applied": False,
+        "error": None,
+    }
 
 
 # ============================================================
@@ -7122,6 +7847,7 @@ def health() -> dict[str, Any]:
             "gulika_upaketu": True,
             "nakshatra_taras": True,
             "navamsha_name_sounds": True,
+            "stolen_cusps": True,
         },
         "outer_planet_engine": {
             "name": "pyswisseph",
@@ -7307,6 +8033,15 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         planets,
     )
 
+    # Chapter 4 exact stolen-cusp audit. This combines the exact Placidus
+    # geometry with all currently available classical, outer and special bodies.
+    stolen_cusps = calculate_stolen_cusps(
+        rashi_placidus,
+        planets,
+        outer_planets,
+        special_points,
+    )
+
     # Chapter 8 fixed marker stars. Book-stated rashi degrees only;
     # intentionally excluded from Navamsha.
     nakshatra_taras = calculate_nakshatra_taras(
@@ -7474,6 +8209,11 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
                 "Gulika and Upaketu exact Lahiri longitudes requested "
                 "from official VedAstro server calculators. Geometry "
                 "and book-supported contact labels are calculated locally."
+            ),
+            "stolen_cusps": (
+                "Chapter 4 exact Placidus cusps compared with whole-sign "
+                "rashi houses counted from the Lahiri Ascendant. Contacts "
+                "use the proxy's existing visible/invisible body orbs."
             ),
             "nakshatra_taras": (
                 "Chapter 8 marker-star contacts calculated against exact "
