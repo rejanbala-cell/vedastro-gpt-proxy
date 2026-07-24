@@ -34,7 +34,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.15.0"
+PROXY_VERSION = "1.15.1"
 
 
 # ============================================================
@@ -6634,6 +6634,1222 @@ def tighten_planet_results(
     return output
 
 
+def action_flatten_value(
+    value: Any,
+    limit: int = 90,
+) -> Any:
+    """Flatten common VedAstro value objects to their meaningful scalar."""
+
+    if isinstance(value, dict):
+        if (
+            value.get("response_compacted")
+            and isinstance(value.get("preview"), str)
+        ):
+            return value["preview"][:limit]
+
+        preferred_keys = (
+            "Name",
+            "name",
+            "TotalDegrees",
+            "total_degrees",
+            "Value",
+            "value",
+            "IsRetrograde",
+            "IsCombust",
+            "IsExalted",
+            "IsDebilitated",
+            "IsOwnSign",
+            "IsMoolatrikona",
+            "Motion",
+            "motion",
+        )
+
+        for key in preferred_keys:
+            candidate = value.get(key)
+
+            if isinstance(candidate, (str, int, float, bool)) or candidate is None:
+                if key in value:
+                    return compact_scalar_text(
+                        candidate,
+                        limit,
+                    )
+
+        scalar_items = {
+            key: compact_scalar_text(item, limit)
+            for key, item in value.items()
+            if isinstance(item, (str, int, float, bool))
+            or item is None
+        }
+
+        if scalar_items and len(scalar_items) <= 4:
+            return scalar_items
+
+        encoded = json.dumps(
+            json_safe(value),
+            ensure_ascii=False,
+            default=str,
+        )
+        return encoded[:limit] + (
+            "…" if len(encoded) > limit else ""
+        )
+
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+
+        if all(
+            isinstance(item, (str, int, float, bool))
+            or item is None
+            for item in items
+        ):
+            return items[:8]
+
+        encoded = json.dumps(
+            json_safe(items),
+            ensure_ascii=False,
+            default=str,
+        )
+        return encoded[:limit] + (
+            "…" if len(encoded) > limit else ""
+        )
+
+    return compact_scalar_text(value, limit)
+
+
+def action_direct_value(
+    record: Any,
+    limit: int = 90,
+) -> Any:
+    """
+    Convert a successful calculation wrapper into a direct transport value.
+
+    Validation status is retained at the parent object. Repeated per-field
+    method/status wrappers are the largest avoidable source of Action payload
+    growth.
+    """
+
+    if not isinstance(record, dict):
+        return action_flatten_value(record, limit)
+
+    if "value" in record:
+        return action_flatten_value(
+            record["value"],
+            limit,
+        )
+
+    if "value_preview" in record:
+        return compact_scalar_text(
+            record.get("value_preview"),
+            limit,
+        )
+
+    if "data" in record:
+        return action_flatten_value(
+            record["data"],
+            limit,
+        )
+
+    if (
+        record.get("response_compacted")
+        and isinstance(record.get("preview"), str)
+    ):
+        return record["preview"][:limit]
+
+    return action_flatten_value(record, limit)
+
+
+def action_compact_houses(
+    houses: dict[str, Any],
+) -> dict[str, Any]:
+    """Retain required house values without repeated wrappers."""
+
+    output: dict[str, Any] = {}
+
+    for house_name, result in houses.items():
+        entry = {
+            "status": result.get("status"),
+            "sign": action_direct_value(
+                result.get("sign"),
+                55,
+            ),
+            "lord": action_direct_value(
+                result.get("lord"),
+                55,
+            ),
+            "constellation": action_direct_value(
+                result.get("constellation"),
+                55,
+            ),
+            "constellation_lord": action_direct_value(
+                result.get("constellation_lord"),
+                55,
+            ),
+            "aspects": action_direct_value(
+                result.get("aspects"),
+                85,
+            ),
+        }
+
+        if entry["status"] != "Pass":
+            entry["error"] = compact_scalar_text(
+                result.get("error"),
+                120,
+            )
+
+        output[house_name] = entry
+
+    return output
+
+
+def action_compact_planets(
+    planets: dict[str, Any],
+) -> dict[str, Any]:
+    """Retain all material D1/D9 and dignity fields directly."""
+
+    output: dict[str, Any] = {}
+    material_keys = (
+        "d1_sign",
+        "d9_sign",
+        "sidereal_longitude",
+        "motion",
+        "retrograde",
+        "combust",
+        "exalted",
+        "debilitated",
+        "own_sign",
+        "moolatrikona",
+        "shadbala",
+        "sign_longitude_consistency",
+    )
+
+    for planet_name, result in planets.items():
+        entry: dict[str, Any] = {
+            "status": result.get("status"),
+        }
+
+        for key in material_keys:
+            if key in result:
+                entry[key] = action_direct_value(
+                    result[key],
+                    65 if key != "shadbala" else 85,
+                )
+
+        if entry["status"] != "Pass":
+            entry["error"] = compact_scalar_text(
+                result.get("error"),
+                120,
+            )
+
+        output[planet_name] = entry
+
+    return output
+
+
+def action_compact_core(
+    core: dict[str, Any],
+) -> dict[str, Any]:
+    """Retain essential validation calculations as direct values."""
+
+    output: dict[str, Any] = {}
+
+    for key, record in core.items():
+        status = (
+            record.get("status")
+            if isinstance(record, dict)
+            else None
+        )
+        entry = {
+            "status": status,
+            "value": action_direct_value(record, 90),
+        }
+
+        if status not in {None, "Pass"}:
+            entry["error"] = compact_scalar_text(
+                record.get("error"),
+                120,
+            )
+
+        output[key] = entry
+
+    return output
+
+
+def action_compact_rashi(
+    layer: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep exact cusp geometry and axis validation only."""
+
+    cusps: dict[str, Any] = {}
+
+    for cusp_name, cusp in layer.get("cusps", {}).items():
+        cusps[cusp_name] = {
+            key: cusp.get(key)
+            for key in (
+                "house",
+                "sidereal_longitude",
+                "sign",
+                "degree_in_sign",
+            )
+            if key in cusp
+        }
+
+    return {
+        "status": layer.get("status"),
+        "ayanamsa": layer.get("ayanamsa"),
+        "house_system": layer.get("house_system"),
+        "cusps": cusps,
+        "axis_validation": compact_recursive(
+            layer.get("axis_validation", []),
+            list_limit=8,
+            string_limit=100,
+        ),
+        "error": compact_scalar_text(
+            layer.get("error"),
+            120,
+        ),
+    }
+
+
+def action_compact_tier1(
+    layer: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep the signed ledger and yoga decisions without duplicated prose."""
+
+    victory = layer.get("victory_houses", {})
+    concise_ledger = []
+
+    for item in victory.get("ledger", []):
+        concise_ledger.append({
+            key: item.get(key)
+            for key in (
+                "planet",
+                "house",
+                "side",
+                "natural_class",
+                "strength_sources",
+                "debilitated",
+                "combust",
+                "points",
+                "signed_points",
+            )
+            if key in item
+        })
+        concise_ledger[-1]["eligibility"] = (
+            compact_scalar_text(
+                item.get("eligibility"),
+                100,
+            )
+        )
+
+    manual_candidates = []
+
+    for item in victory.get("manual_candidates", []):
+        manual_candidates.append({
+            "planet": item.get("planet"),
+            "side": item.get("side"),
+            "house": item.get("house"),
+            "reason": compact_scalar_text(
+                item.get("reason"),
+                120,
+            ),
+            "strength_sources": item.get(
+                "strength_sources",
+                [],
+            ),
+            "automatic_points": item.get(
+                "automatic_points"
+            ),
+        })
+
+    sky_pky = layer.get("sky_pky", {})
+    concise_sides: dict[str, Any] = {}
+
+    for side, side_result in sky_pky.get("sides", {}).items():
+        sky = side_result.get("sky", {})
+        pky = side_result.get("pky", {})
+
+        concise_sides[side] = {
+            "target_house": side_result.get("target_house"),
+            "flanking_houses": side_result.get(
+                "flanking_houses"
+            ),
+            "flanking_occupancy": side_result.get(
+                "flanking_occupancy"
+            ),
+            "sky": {
+                "formed": sky.get("formed"),
+                "condition": sky.get("condition"),
+                "benefics_previous_side": sky.get(
+                    "benefics_previous_side"
+                ),
+                "benefics_next_side": sky.get(
+                    "benefics_next_side"
+                ),
+                "mild_or_shadow_marring": sky.get(
+                    "mild_or_shadow_marring"
+                ),
+                "heavy_marring": sky.get(
+                    "heavy_marring"
+                ),
+                "debilitated_benefics": sky.get(
+                    "debilitated_benefics"
+                ),
+                "automatic_points_applied": False,
+            },
+            "pky": {
+                "formed": pky.get("formed"),
+                "condition": pky.get("condition"),
+                "classical_malefics_previous_side": pky.get(
+                    "classical_malefics_previous_side"
+                ),
+                "classical_malefics_next_side": pky.get(
+                    "classical_malefics_next_side"
+                ),
+                "nodes_previous_side": pky.get(
+                    "nodes_previous_side"
+                ),
+                "nodes_next_side": pky.get(
+                    "nodes_next_side"
+                ),
+                "intensified_by_nodes": pky.get(
+                    "intensified_by_nodes"
+                ),
+                "automatic_points_applied": False,
+            },
+            "mixed_testimony": side_result.get(
+                "cancellation_or_mixed_testimony"
+            ),
+        }
+
+    parivartana = layer.get("parivartana", {})
+    concise_pairs = []
+
+    for pair in parivartana.get("pairs", []):
+        concise_pairs.append({
+            "planets": pair.get("planets"),
+            "first": pair.get("first"),
+            "second": pair.get("second"),
+            "victory_house_relevance": pair.get(
+                "victory_house_relevance"
+            ),
+            "especially_relevant": pair.get(
+                "especially_relevant"
+            ),
+            "fixed_points_defined": False,
+        })
+
+    war = layer.get("planetary_war", {})
+    concise_wars = []
+
+    for item in war.get("wars", []):
+        concise_wars.append({
+            key: item.get(key)
+            for key in (
+                "planets",
+                "angular_distance",
+                "within_one_degree",
+                "first_roles",
+                "second_roles",
+                "cross_side_war",
+                "winner",
+                "loser",
+                "winner_represented_sides",
+                "loser_represented_sides",
+                "fixed_points_defined",
+                "points_applied",
+            )
+            if key in item
+        })
+
+    return {
+        "status": layer.get("status"),
+        "assignment": layer.get("assignment"),
+        "ascendant": layer.get("ascendant"),
+        "victory_houses": {
+            "status": victory.get("status"),
+            "ledger": concise_ledger,
+            "manual_candidates": manual_candidates,
+            "unavailable_planets": victory.get(
+                "unavailable_planets",
+                [],
+            ),
+            "favourite_points": victory.get(
+                "favourite_points"
+            ),
+            "underdog_points": victory.get(
+                "underdog_points"
+            ),
+            "signed_favourite_total": victory.get(
+                "signed_favourite_total"
+            ),
+        },
+        "sky_pky": {
+            "status": sky_pky.get("status"),
+            "sides": concise_sides,
+            "points_applied": False,
+        },
+        "parivartana": {
+            "status": parivartana.get("status"),
+            "detected": parivartana.get("detected"),
+            "pairs": concise_pairs,
+            "eligible_benefics": parivartana.get(
+                "eligible_benefics",
+                [],
+            ),
+            "points_applied": False,
+        },
+        "planetary_war": {
+            "status": war.get("status"),
+            "detected": war.get("detected"),
+            "orb_degrees": war.get("orb_degrees"),
+            "wars": concise_wars,
+            "winner_standard": war.get(
+                "winner_standard"
+            ),
+            "lesser_longitude_fallback_used": war.get(
+                "lesser_longitude_fallback_used"
+            ),
+            "points_applied": False,
+            "time_error": compact_scalar_text(
+                war.get("time_error"),
+                100,
+            ),
+        },
+        "automatic_signed_total": layer.get(
+            "automatic_signed_total"
+        ),
+        "missing_required_planets": layer.get(
+            "missing_required_planets",
+            [],
+        ),
+        "error": compact_scalar_text(
+            layer.get("error"),
+            120,
+        ),
+    }
+
+
+def action_compact_d9(
+    layer: dict[str, Any],
+) -> dict[str, Any]:
+    planets: dict[str, Any] = {}
+
+    for planet_name, record in layer.get("planets", {}).items():
+        planets[planet_name] = {
+            key: record.get(key)
+            for key in (
+                "d1_sidereal_longitude",
+                "d1_sign",
+                "navamsha_number_in_d1_sign",
+                "d9_sidereal_longitude",
+                "d9_sign",
+                "d9_degree_in_sign",
+                "vedastro_d9_sign",
+                "vedastro_sign_match",
+                "nearest_d9_cusp",
+                "nearest_distance",
+                "orb_limit",
+                "nearest_within_orb",
+            )
+            if key in record
+        }
+
+    return {
+        "status": layer.get("status"),
+        "ayanamsa": layer.get("ayanamsa"),
+        "lagna": layer.get("lagna"),
+        "seventh_cusp": layer.get("seventh_cusp"),
+        "axis_validation": layer.get("axis_validation"),
+        "planets": planets,
+        "qualifying_contacts": compact_recursive(
+            layer.get("qualifying_contacts", []),
+            list_limit=16,
+            string_limit=110,
+        ),
+        "unavailable_planets": layer.get(
+            "unavailable_planets",
+            [],
+        ),
+        "failed_validations": layer.get(
+            "failed_validations",
+            [],
+        ),
+        "error": compact_scalar_text(
+            layer.get("error"),
+            120,
+        ),
+    }
+
+
+def action_compact_kp(
+    layer: dict[str, Any],
+) -> dict[str, Any]:
+    cusp_sublords = layer.get("cusp_sublords", {})
+    key_cusps = {
+        house: cusp_sublords.get(house)
+        for house in (
+            "House1",
+            "House4",
+            "House6",
+            "House7",
+            "House10",
+            "House12",
+        )
+        if house in cusp_sublords
+    }
+
+    sublord_array = layer.get("sublord_array", {})
+    concise_array = {
+        "status": sublord_array.get("status"),
+        "pointers": compact_recursive(
+            sublord_array.get("pointers", {}),
+            list_limit=12,
+            string_limit=100,
+        ),
+        "signed_favourite_total": sublord_array.get(
+            "signed_favourite_total"
+        ),
+        "error": compact_scalar_text(
+            sublord_array.get("error"),
+            100,
+        ),
+    }
+
+    return {
+        "status": layer.get("status"),
+        "ayanamsa": layer.get("ayanamsa"),
+        "book_tier": layer.get("book_tier"),
+        "cusp_sublords": key_cusps,
+        "main_sublord_comparison": compact_recursive(
+            layer.get("main_sublord_comparison", {}),
+            list_limit=12,
+            string_limit=110,
+        ),
+        "sublord_array": concise_array,
+        "failed_planets": layer.get(
+            "failed_planets",
+            [],
+        ),
+        "missing_planet_houses": layer.get(
+            "missing_planet_houses",
+            [],
+        ),
+        "error": compact_scalar_text(
+            layer.get("error"),
+            120,
+        ),
+    }
+
+
+def action_compact_outer(
+    layer: dict[str, Any],
+) -> dict[str, Any]:
+    bodies: dict[str, Any] = {}
+
+    for body_name, body in layer.get("bodies", {}).items():
+        bodies[body_name] = {
+            key: body.get(key)
+            for key in (
+                "status",
+                "sidereal_longitude",
+                "sign",
+                "degree_in_sign",
+                "motion",
+                "retrograde",
+                "placidus_house",
+                "nearest_sensitive_cusp",
+                "nearest_sensitive_cusp_distance",
+                "missing_ephemeris_file",
+                "error",
+            )
+            if key in body
+        }
+
+    return {
+        "status": layer.get("status"),
+        "ayanamsa": layer.get("ayanamsa"),
+        "bodies": bodies,
+        "qualifying_contacts": compact_recursive(
+            layer.get("qualifying_contacts", []),
+            list_limit=12,
+            string_limit=100,
+        ),
+        "available_bodies": layer.get(
+            "available_bodies",
+            [],
+        ),
+        "unavailable_bodies": layer.get(
+            "unavailable_bodies",
+            [],
+        ),
+        "error": compact_scalar_text(
+            layer.get("error"),
+            120,
+        ),
+    }
+
+
+def action_compact_special(
+    layer: dict[str, Any],
+) -> dict[str, Any]:
+    points: dict[str, Any] = {}
+
+    for point_name, point in layer.get("points", {}).items():
+        rashi = point.get("rashi", {})
+        d9 = point.get("d9", {})
+
+        points[point_name] = {
+            "status": point.get("status"),
+            "sidereal_longitude": point.get(
+                "sidereal_longitude"
+            ),
+            "sign": point.get("sign"),
+            "degree_in_sign": point.get(
+                "degree_in_sign"
+            ),
+            "placidus_house": point.get(
+                "placidus_house"
+            ),
+            "rashi": {
+                key: rashi.get(key)
+                for key in (
+                    "orb_limit",
+                    "nearest_sensitive_cusp",
+                    "nearest_distance",
+                )
+                if key in rashi
+            },
+            "d9": {
+                key: d9.get(key)
+                for key in (
+                    "position",
+                    "orb_limit",
+                    "nearest_cusp",
+                    "nearest_distance",
+                )
+                if key in d9
+            },
+            "error": compact_scalar_text(
+                point.get("error"),
+                100,
+            ),
+        }
+
+    return {
+        "status": layer.get("status"),
+        "points": points,
+        "gulika_house_lord_contacts": compact_recursive(
+            layer.get("gulika_house_lord_contacts", {}),
+            list_limit=5,
+            string_limit=80,
+        ),
+        "qualifying_rashi_contacts": compact_contact_rows(
+            layer.get("qualifying_rashi_contacts", []),
+            maximum=8,
+        ),
+        "qualifying_d9_contacts": compact_contact_rows(
+            layer.get("qualifying_d9_contacts", []),
+            maximum=8,
+        ),
+        "unavailable_points": layer.get(
+            "unavailable_points",
+            [],
+        ),
+        "error": compact_scalar_text(
+            layer.get("error"),
+            120,
+        ),
+    }
+
+
+def action_compact_stolen(
+    layer: dict[str, Any],
+) -> dict[str, Any]:
+    stolen = []
+
+    for cusp in layer.get("stolen_cusps", []):
+        classification = cusp.get("classification", {})
+
+        stolen.append({
+            "cusp": cusp.get("cusp"),
+            "sidereal_longitude": cusp.get(
+                "sidereal_longitude"
+            ),
+            "whole_sign_house": cusp.get(
+                "whole_sign_house"
+            ),
+            "signed_house_shift": cusp.get(
+                "signed_house_shift"
+            ),
+            "stolen_type": classification.get(
+                "stolen_type"
+            ),
+            "rule_status": classification.get(
+                "rule_status"
+            ),
+            "effective_represented_side": (
+                classification.get(
+                    "effective_represented_side"
+                )
+            ),
+            "transformation": classification.get(
+                "transformation"
+            ),
+        })
+
+    contacts = []
+
+    for item in layer.get("qualifying_contacts", []):
+        contacts.append({
+            key: item.get(key)
+            for key in (
+                "body",
+                "body_category",
+                "cusp",
+                "source_house_number",
+                "whole_sign_house_number",
+                "stolen_type",
+                "angular_distance",
+                "orb_limit",
+                "book_effect",
+                "points_applied",
+            )
+            if key in item
+        })
+
+    return {
+        "status": layer.get("status"),
+        "audit_summary": layer.get("audit_summary"),
+        "stolen_cusps": compact_recursive(
+            stolen,
+            list_limit=12,
+            string_limit=100,
+        ),
+        "qualifying_contacts": compact_recursive(
+            contacts,
+            list_limit=12,
+            string_limit=100,
+        ),
+        "unavailable_bodies": layer.get(
+            "unavailable_bodies",
+            [],
+        ),
+        "coverage_status": layer.get(
+            "coverage_status"
+        ),
+        "points_applied": False,
+        "error": compact_scalar_text(
+            layer.get("error"),
+            120,
+        ),
+    }
+
+
+def compact_contact_rows(
+    rows: Any,
+    maximum: int = 8,
+) -> list[Any]:
+    """Keep the event-bearing fields of contact rows with an omission count."""
+
+    if not isinstance(rows, list):
+        return []
+
+    compacted: list[Any] = []
+    preferred_keys = (
+        "marker",
+        "body",
+        "planet",
+        "point",
+        "target",
+        "target_id",
+        "target_type",
+        "cusp",
+        "house",
+        "side",
+        "supports",
+        "afflicts",
+        "stolen_type",
+        "angular_distance",
+        "distance",
+        "orb_limit",
+        "within_orb",
+        "book_effect",
+        "decision_grade",
+        "status",
+        "reason",
+    )
+
+    for row in rows[:maximum]:
+        if isinstance(row, dict):
+            compacted.append({
+                key: compact_recursive(
+                    row.get(key),
+                    list_limit=4,
+                    string_limit=80,
+                )
+                for key in preferred_keys
+                if key in row
+            })
+        else:
+            compacted.append(
+                compact_scalar_text(row, 80)
+            )
+
+    if len(rows) > maximum:
+        compacted.append({
+            "items_omitted_from_transport": (
+                len(rows) - maximum
+            ),
+            "full_calculation_performed": True,
+        })
+
+    return compacted
+
+
+def action_compact_taras(
+    layer: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "status": layer.get("status"),
+        "qualifying_contacts": compact_contact_rows(
+            layer.get("qualifying_contacts", []),
+            maximum=8,
+        ),
+        "decision_contacts": compact_contact_rows(
+            layer.get("decision_contacts", []),
+            maximum=8,
+        ),
+        "contextual_or_research_contacts": compact_contact_rows(
+            layer.get(
+                "contextual_or_research_contacts",
+                [],
+            ),
+            maximum=4,
+        ),
+        "same_tara_side_comparisons": compact_contact_rows(
+            layer.get("same_tara_side_comparisons", []),
+            maximum=4,
+        ),
+        "cancellations": compact_contact_rows(
+            layer.get("cancellations", []),
+            maximum=4,
+        ),
+        "error": compact_scalar_text(
+            layer.get("error"),
+            120,
+        ),
+    }
+
+
+def action_compact_names(
+    layer: dict[str, Any],
+) -> dict[str, Any]:
+    syllables: dict[str, Any] = {}
+
+    for planet_name, record in layer.get(
+        "planet_syllables",
+        {},
+    ).items():
+        syllables[planet_name] = {
+            "house": record.get("placidus_house"),
+            "syllable": record.get(
+                "table_7_1_syllable"
+            ),
+            "status": record.get("status"),
+        }
+
+    return {
+        "status": layer.get("status"),
+        "participants": compact_recursive(
+            layer.get("participants", {}),
+            list_limit=8,
+            string_limit=100,
+        ),
+        "house10_main_test": compact_recursive(
+            layer.get("house10_main_test", {}),
+            list_limit=10,
+            string_limit=110,
+        ),
+        "planet_syllables": syllables,
+        "planet_resonance_matches": compact_recursive(
+            layer.get("planet_resonance_matches", []),
+            list_limit=12,
+            string_limit=100,
+        ),
+        "name_comparison_allowed": layer.get(
+            "name_comparison_allowed"
+        ),
+        "error": compact_scalar_text(
+            layer.get("error"),
+            120,
+        ),
+    }
+
+
+def action_compact_v2(
+    compacted: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Deterministic prediction-grade payload designed for Custom GPT Actions.
+
+    It keeps every layer and all active testimony while removing repeated
+    wrappers, prose and nonqualifying reference tables.
+    """
+
+    result = {
+        "status": compacted.get("status"),
+        "strict_prediction_allowed": compacted.get(
+            "strict_prediction_allowed"
+        ),
+        "essential_failures": compacted.get(
+            "essential_failures",
+            [],
+        ),
+        "event": compact_recursive(
+            compacted.get("event", {}),
+            list_limit=8,
+            string_limit=120,
+        ),
+        "core": action_compact_core(
+            compacted.get("core", {})
+        ),
+        "rashi_placidus": action_compact_rashi(
+            compacted.get("rashi_placidus", {})
+        ),
+        "tier1_combinations": action_compact_tier1(
+            compacted.get("tier1_combinations", {})
+        ),
+        "planet_cusp_contacts": {
+            "status": compacted.get(
+                "planet_cusp_contacts",
+                {},
+            ).get("status"),
+            "orb_policy": compacted.get(
+                "planet_cusp_contacts",
+                {},
+            ).get("orb_policy"),
+            "qualifying_contacts": compact_recursive(
+                compacted.get(
+                    "planet_cusp_contacts",
+                    {},
+                ).get("qualifying_contacts", []),
+                list_limit=16,
+                string_limit=100,
+            ),
+        },
+        "navamsha_cusps": action_compact_d9(
+            compacted.get("navamsha_cusps", {})
+        ),
+        "kp_sublords": action_compact_kp(
+            compacted.get("kp_sublords", {})
+        ),
+        "outer_planets": action_compact_outer(
+            compacted.get("outer_planets", {})
+        ),
+        "special_points": action_compact_special(
+            compacted.get("special_points", {})
+        ),
+        "stolen_cusps": action_compact_stolen(
+            compacted.get("stolen_cusps", {})
+        ),
+        "nakshatra_taras": action_compact_taras(
+            compacted.get("nakshatra_taras", {})
+        ),
+        "navamsha_name_sounds": action_compact_names(
+            compacted.get("navamsha_name_sounds", {})
+        ),
+        "houses": action_compact_houses(
+            compacted.get("houses", {})
+        ),
+        "planets": action_compact_planets(
+            compacted.get("planets", {})
+        ),
+        "provenance": {
+            "engine": compacted.get(
+                "provenance",
+                {},
+            ).get("engine"),
+            "proxy_version": PROXY_VERSION,
+            "standard_ayanamsa": "Lahiri",
+            "kp_ayanamsa": "Krishnamurti",
+            "response_profile": "prediction-grade compact v2",
+        },
+        "response_compaction": {
+            "applied": True,
+            "profile": "action-compact-v2",
+            "target_characters": (
+                ACTION_RESPONSE_TARGET_CHARACTERS
+            ),
+            "full_calculation_performed": True,
+            "all_advanced_layers_retained": True,
+            "nonqualifying_reference_tables_omitted": True,
+        },
+    }
+
+    return result
+
+
+def enforce_action_response_limit(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply deterministic low-priority trims until the target is met."""
+
+    def encoded_size() -> int:
+        return len(json.dumps(
+            payload,
+            ensure_ascii=False,
+            default=str,
+        ))
+
+    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+        return payload
+
+    # 1. House aspects are already represented in dedicated geometry layers.
+    for house in payload.get("houses", {}).values():
+        house.pop("aspects", None)
+
+    payload["response_compaction"][
+        "house_aspects_omitted"
+    ] = True
+
+    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+        return payload
+
+    # 2. Shadbala remains available in the full server calculation but is not
+    # assigned a fabricated automatic threshold.
+    for planet in payload.get("planets", {}).values():
+        planet.pop("shadbala", None)
+        planet.pop("sign_longitude_consistency", None)
+
+    payload["response_compaction"][
+        "raw_shadbala_omitted"
+    ] = True
+
+    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+        return payload
+
+    # 3. D9 nearest nonqualifying distances are redundant when the actual
+    # qualifying-contact list is retained.
+    for planet in payload.get(
+        "navamsha_cusps",
+        {},
+    ).get("planets", {}).values():
+        planet.pop("nearest_distance", None)
+        planet.pop("nearest_d9_cusp", None)
+        planet.pop("orb_limit", None)
+        planet.pop("nearest_within_orb", None)
+
+    payload["response_compaction"][
+        "nonqualifying_d9_distances_omitted"
+    ] = True
+
+    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+        return payload
+
+    # 4. Planet syllables are only secondary resonance evidence; the exact
+    # House 10 name test and all actual resonance matches stay present.
+    payload.get(
+        "navamsha_name_sounds",
+        {},
+    ).pop("planet_syllables", None)
+
+    payload["response_compaction"][
+        "unmatched_planet_syllables_omitted"
+    ] = True
+
+    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+        return payload
+
+    # 5. Preserve the KP main comparison and first/seventh cusp evidence; the
+    # full pointer array was calculated but is omitted from transport.
+    payload.get(
+        "kp_sublords",
+        {},
+    ).pop("sublord_array", None)
+
+    payload["response_compaction"][
+        "kp_pointer_array_omitted_from_transport"
+    ] = True
+
+    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+        return payload
+
+    # 6. Final bounded pass.
+    bounded = compact_recursive(
+        payload,
+        list_limit=6,
+        string_limit=75,
+    )
+    bounded["response_compaction"] = {
+        **payload.get("response_compaction", {}),
+        "profile": "action-compact-v2-bounded",
+        "final_bounded_pass": True,
+    }
+
+    bounded_size = len(json.dumps(
+        bounded,
+        ensure_ascii=False,
+        default=str,
+    ))
+
+    if bounded_size <= ACTION_RESPONSE_TARGET_CHARACTERS:
+        return bounded
+
+    # 7. Hard transport ceiling. Every layer and every result summary remains,
+    # while repeated secondary arrays are represented by counts.
+    for key in (
+        "contextual_or_research_contacts",
+        "same_tara_side_comparisons",
+        "cancellations",
+    ):
+        rows = bounded.get(
+            "nakshatra_taras",
+            {},
+        ).get(key, [])
+
+        bounded.get(
+            "nakshatra_taras",
+            {},
+        )[key] = {
+            "count": (
+                len(rows) if isinstance(rows, list) else 0
+            ),
+            "transport_detail_omitted": True,
+        }
+
+    for key in (
+        "qualifying_rashi_contacts",
+        "qualifying_d9_contacts",
+    ):
+        rows = bounded.get(
+            "special_points",
+            {},
+        ).get(key, [])
+
+        if isinstance(rows, list) and len(rows) > 4:
+            bounded["special_points"][key] = (
+                rows[:4]
+                + [{
+                    "items_omitted_from_transport": (
+                        len(rows) - 4
+                    )
+                }]
+            )
+
+    bounded = compact_recursive(
+        bounded,
+        list_limit=4,
+        string_limit=60,
+    )
+    bounded["response_compaction"] = {
+        **payload.get("response_compaction", {}),
+        "profile": "action-compact-v2-hard-bounded",
+        "hard_transport_ceiling_applied": True,
+        "full_calculation_performed": True,
+    }
+
+    return bounded
+
+
 def emergency_action_response(
     compacted: dict[str, Any],
 ) -> dict[str, Any]:
@@ -6941,7 +8157,7 @@ def compact_action_response(
             "standard_ayanamsa": "Lahiri",
             "kp_ayanamsa": "Krishnamurti",
             "response_profile": (
-                "prediction-grade compact; calculations unchanged"
+                "prediction-grade compact v2; calculations unchanged"
             ),
         },
         "response_compaction": {
@@ -7013,21 +8229,10 @@ def compact_action_response(
     )
 
     if len(encoded) > ACTION_RESPONSE_TARGET_CHARACTERS:
-        # Bound text and list lengths after the decision-bearing projection.
-        compacted = compact_recursive(
-            compacted,
-            list_limit=10,
-            string_limit=140,
+        compacted = action_compact_v2(compacted)
+        compacted = enforce_action_response_limit(
+            compacted
         )
-        compacted["response_compaction"] = {
-            "applied": True,
-            "profile": "action-compact-v1-emergency-bounded",
-            "target_characters": (
-                ACTION_RESPONSE_TARGET_CHARACTERS
-            ),
-            "full_calculation_performed": True,
-            "emergency_bounded_pass": True,
-        }
 
     final_encoded = json.dumps(
         compacted,
@@ -9214,7 +10419,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v1",
+        "response_mode": "prediction-grade compact v2",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
