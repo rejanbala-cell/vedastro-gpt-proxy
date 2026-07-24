@@ -34,7 +34,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.16.0"
+PROXY_VERSION = "1.16.1"
 
 
 # ============================================================
@@ -6411,7 +6411,7 @@ def compact_navamsha_interpretation_layer(
     concise_d9_contacts = []
 
     for contact in (layer.get("d9_cusp_contacts") or []):
-        effect = contact.get("book_effect", {})
+        effect = contact.get("book_effect") or {}
         concise_d9_contacts.append({
             "body": contact.get("body"),
             "category": contact.get("category"),
@@ -6421,11 +6421,21 @@ def compact_navamsha_interpretation_layer(
             ),
             "orb_limit": contact.get("orb_limit"),
             "motion": contact.get("motion"),
-            "direction": effect.get("direction"),
-            "supports": effect.get("supports"),
-            "reliability": effect.get("reliability"),
-            "book_point_range": effect.get(
-                "book_point_range"
+            "direction": (
+                effect.get("direction")
+                or contact.get("direction")
+            ),
+            "supports": (
+                effect.get("supports")
+                or contact.get("supports")
+            ),
+            "reliability": (
+                effect.get("reliability")
+                or contact.get("reliability")
+            ),
+            "book_point_range": (
+                effect.get("book_point_range")
+                or contact.get("book_point_range")
             ),
             "exact_points_applied": False,
         })
@@ -6433,7 +6443,7 @@ def compact_navamsha_interpretation_layer(
     concise_d1_contacts = []
 
     for contact in (layer.get("d1_cusp_contacts") or []):
-        effect = contact.get("book_effect", {})
+        effect = contact.get("book_effect") or {}
         concise_d1_contacts.append({
             "body": contact.get("body"),
             "category": contact.get("category"),
@@ -6444,11 +6454,21 @@ def compact_navamsha_interpretation_layer(
             "angular_distance": contact.get(
                 "angular_distance"
             ),
-            "direction": effect.get("direction"),
-            "supports": effect.get("supports"),
-            "stolen_type": effect.get("stolen_type"),
-            "contact_strength": effect.get(
-                "contact_strength"
+            "direction": (
+                effect.get("direction")
+                or contact.get("direction")
+            ),
+            "supports": (
+                effect.get("supports")
+                or contact.get("supports")
+            ),
+            "stolen_type": (
+                effect.get("stolen_type")
+                or contact.get("stolen_type")
+            ),
+            "contact_strength": (
+                effect.get("contact_strength")
+                or contact.get("contact_strength")
             ),
         })
 
@@ -6517,15 +6537,19 @@ def compact_navamsha_interpretation_layer(
             {
                 "body": item.get("body"),
                 "cusp": item.get("cusp"),
-                "reason": item.get(
-                    "book_effect",
-                    {},
-                ).get("note"),
+                "reason": (
+                    (item.get("book_effect") or {}).get("note")
+                    or item.get("reason")
+                ),
             }
-            for item in layer.get(
-                "research_or_undefined_d9_contacts",
-                [],
+            for item in (
+                layer.get(
+                    "research_or_undefined_d9_contacts",
+                    [],
+                )
+                or []
             )
+            if isinstance(item, dict)
         ],
         "completeness": layer.get("completeness"),
         "pdf_pages": layer.get("pdf_pages"),
@@ -8304,14 +8328,30 @@ def emergency_action_response(
                 "navamsha_interpretation",
                 {},
             ).get("status"),
+            "assignment": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("assignment"),
+            "tier_hierarchy": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("tier_hierarchy"),
             "d9_cusp_contacts": compacted.get(
                 "navamsha_interpretation",
                 {},
             ).get("d9_cusp_contacts", []),
+            "d9_cusp_summary": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("d9_cusp_summary"),
             "navamsha_combinations": compacted.get(
                 "navamsha_interpretation",
                 {},
             ).get("navamsha_combinations"),
+            "d1_cusp_contacts": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("d1_cusp_contacts", []),
             "d1_summary": compacted.get(
                 "navamsha_interpretation",
                 {},
@@ -8332,10 +8372,30 @@ def emergency_action_response(
                 "navamsha_interpretation",
                 {},
             ).get("signed_points"),
+            "unavailable_d9_bodies": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("unavailable_d9_bodies", []),
+            "optional_body_coverage_status": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("optional_body_coverage_status"),
+            "research_or_undefined_d9_contacts": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("research_or_undefined_d9_contacts", []),
             "completeness": compacted.get(
                 "navamsha_interpretation",
                 {},
             ).get("completeness"),
+            "pdf_pages": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("pdf_pages"),
+            "points_applied": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("points_applied"),
             "error": compacted.get(
                 "navamsha_interpretation",
                 {},
@@ -8548,7 +8608,11 @@ def compact_action_response(
     )
 
     if len(encoded) > ACTION_RESPONSE_TARGET_CHARACTERS:
-        compacted = emergency_action_response(
+        # Compact-v2 must receive the complete first-pass projection.
+        # Running the older emergency profile first can discard newer-layer
+        # metadata before compact-v2 has a chance to retain it.
+        compacted = action_compact_v2(compacted)
+        compacted = enforce_action_response_limit(
             compacted
         )
 
@@ -8559,8 +8623,9 @@ def compact_action_response(
     )
 
     if len(encoded) > ACTION_RESPONSE_TARGET_CHARACTERS:
-        compacted = action_compact_v2(compacted)
-        compacted = enforce_action_response_limit(
+        # Final legacy fallback only. It is no longer allowed to precede
+        # compact-v2.
+        compacted = emergency_action_response(
             compacted
         )
 
