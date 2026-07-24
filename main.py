@@ -34,7 +34,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.14.0"
+PROXY_VERSION = "1.14.1"
 
 
 # ============================================================
@@ -8172,6 +8172,7 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         "kp_sublords": kp_sublords,
         "outer_planets": outer_planets,
         "special_points": special_points,
+        "stolen_cusps": stolen_cusps,
         "nakshatra_taras": nakshatra_taras,
         "navamsha_name_sounds": navamsha_name_sounds,
         "houses": houses,
