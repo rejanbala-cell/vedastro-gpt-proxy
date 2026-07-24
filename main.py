@@ -4,10 +4,16 @@ import json
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from enum import Enum
 from typing import Any, Callable
+
+try:
+    import swisseph as swe
+except ImportError:
+    swe = None
 
 import requests
 from fastapi import FastAPI, Header, HTTPException
@@ -26,7 +32,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.9.0"
+PROXY_VERSION = "1.10.0"
 
 
 # ============================================================
@@ -68,6 +74,18 @@ MAX_RESPONSE_CHARACTERS = int(
     os.getenv("MAX_RESPONSE_CHARACTERS", "70000")
 )
 
+
+# Optional directory containing Swiss Ephemeris .se1 files. Uranus, Neptune
+# and Pluto work through the built-in Moshier fallback when no files are
+# supplied. Ceres and Chiron require external asteroid ephemeris files.
+SWISSEPH_EPHE_PATH = os.getenv(
+    "SWISSEPH_EPHE_PATH",
+    "",
+).strip()
+
+SWISSEPH_AVAILABLE = swe is not None
+SWISSEPH_LOCK = threading.Lock()
+
 if not VEDASTRO_API_KEY:
     raise RuntimeError("VEDASTRO_API_KEY is missing from Render.")
 
@@ -82,6 +100,14 @@ if VEDASTRO_MAX_RETRIES < 1:
 
 if VEDASTRO_MAX_WORKERS < 1:
     raise RuntimeError("VEDASTRO_MAX_WORKERS must be at least 1.")
+
+if SWISSEPH_AVAILABLE and SWISSEPH_EPHE_PATH:
+    try:
+        swe.set_ephe_path(SWISSEPH_EPHE_PATH)
+    except Exception as error:
+        raise RuntimeError(
+            f"Invalid SWISSEPH_EPHE_PATH: {error}"
+        ) from error
 
 
 # ============================================================
@@ -307,7 +333,8 @@ app = FastAPI(
         "VedAstro.Python client, paid-key header authentication, "
         "nested planet parameters, exact Placidus cusps, "
         "planet-to-cusp contacts, exact Navamsha cusp geometry, "
-        "Krishnamurti KP sublords and strict validation."
+        "Krishnamurti KP sublords, outer-planet geometry "
+        "and strict validation."
     ),
 )
 
@@ -506,6 +533,66 @@ KP_WEAK_UNDERDOG_ARRAY_HOUSES = {2, 4, 5, 7, 9, 12}
 PLANET_ORDER = {
     name: index
     for index, name in enumerate(PLANETS)
+}
+
+
+# Swiss Ephemeris body numbers. These are stable Swiss Ephemeris constants.
+OUTER_BODY_IDS = {
+    "Uranus": 7,
+    "Neptune": 8,
+    "Pluto": 9,
+    "Chiron": 15,
+    "Ceres": 17,
+}
+
+OUTER_BODY_ORDER = (
+    "Uranus",
+    "Neptune",
+    "Pluto",
+    "Ceres",
+    "Chiron",
+)
+
+OUTER_CUSP_ORB_DEGREES = 2.0
+
+# Qualitative Chapter 4 rules only. No points are assigned in this layer.
+OUTER_BODY_BOOK_RULES = {
+    "Uranus": {
+        "direct": "Supports the team represented by the contacted cusp.",
+        "retrograde": "Harms the team represented by the contacted cusp.",
+        "stationary": "Uncertain/kutila; do not treat as a clean signal.",
+        "axis_note": "Same motion rule on the primary rashi cusps.",
+    },
+    "Neptune": {
+        "direct": "Harms the team represented by the contacted cusp.",
+        "retrograde": "Supports the team represented by the contacted cusp.",
+        "stationary": "Uncertain/kutila; do not treat as a clean signal.",
+        "axis_note": "Negative on any cusp when direct; reversed when retrograde.",
+    },
+    "Pluto": {
+        "direct": "Axis-dependent; motion does not reverse the rule.",
+        "retrograde": "Axis-dependent; motion does not reverse the rule.",
+        "stationary": "Axis-dependent but station adds uncertainty.",
+        "axis_note": (
+            "Negative on 1/7; positive on 4/10; "
+            "6/12 effect is not explicitly defined by the book."
+        ),
+    },
+    "Ceres": {
+        "direct": "Supports the team represented by the contacted cusp.",
+        "retrograde": "Harms the team represented by the contacted cusp.",
+        "stationary": "Uncertain/kutila; do not treat as a clean signal.",
+        "axis_note": "Beneficial direct, detrimental retrograde.",
+    },
+    "Chiron": {
+        "direct": "Supports the team represented by the contacted cusp.",
+        "retrograde": (
+            "Harms the team represented by the contacted cusp; "
+            "injuries or poor play may be indicated."
+        ),
+        "stationary": "Uncertain/kutila; injuries or poor play may be indicated.",
+        "axis_note": "Beneficial direct, detrimental retrograde/stationary.",
+    },
 }
 
 
@@ -2603,6 +2690,453 @@ def calculate_kp_sublords(
     }
 
 
+def parse_std_time_to_utc(std_time: str) -> dict[str, Any]:
+    """Parse the proxy's exact local time format and convert it to UTC."""
+
+    try:
+        local_datetime = datetime.strptime(
+            std_time,
+            "%H:%M %d/%m/%Y %z",
+        )
+    except ValueError as error:
+        raise ValueError(
+            "std_time must use HH:MM DD/MM/YYYY +HH:MM format."
+        ) from error
+
+    utc_datetime = local_datetime.astimezone(timezone.utc)
+    decimal_hour = (
+        utc_datetime.hour
+        + (utc_datetime.minute / 60.0)
+        + (utc_datetime.second / 3600.0)
+        + (utc_datetime.microsecond / 3_600_000_000.0)
+    )
+
+    if not SWISSEPH_AVAILABLE:
+        julian_day_ut = None
+    else:
+        julian_day_ut = swe.julday(
+            utc_datetime.year,
+            utc_datetime.month,
+            utc_datetime.day,
+            decimal_hour,
+            swe.GREG_CAL,
+        )
+
+    return {
+        "local_datetime": local_datetime.isoformat(),
+        "utc_datetime": utc_datetime.isoformat(),
+        "julian_day_ut": julian_day_ut,
+    }
+
+
+def swisseph_ephemeris_mode(return_flags: int) -> str:
+    """Describe which Swiss Ephemeris source actually supplied the result."""
+
+    if not SWISSEPH_AVAILABLE:
+        return "Unavailable"
+
+    if return_flags & swe.FLG_JPLEPH:
+        return "JPL ephemeris"
+
+    if return_flags & swe.FLG_SWIEPH:
+        return "Swiss Ephemeris file"
+
+    if return_flags & swe.FLG_MOSEPH:
+        return "Moshier fallback"
+
+    return "Unknown"
+
+
+def outer_motion_name(speed_longitude: float) -> str:
+    """
+    Report objective direction only.
+
+    No arbitrary stationary threshold is invented here. Exact daily speed is
+    returned so the later sandhi/kutila layer can apply a documented threshold.
+    """
+
+    if speed_longitude < 0:
+        return "Retrograde"
+
+    if speed_longitude > 0:
+        return "Direct"
+
+    return "Exactly stationary"
+
+
+def outer_contact_effect(
+    body_name: str,
+    cusp_name: str,
+    motion_name: str,
+) -> dict[str, Any]:
+    """Apply only the qualitative Chapter 4 outer-body cusp rule."""
+
+    side = SENSITIVE_CUSP_DETAILS[cusp_name]["side"]
+    axis = SENSITIVE_CUSP_DETAILS[cusp_name]["axis"]
+    motion_key = motion_name.lower()
+
+    if motion_key == "exactly stationary":
+        motion_key = "stationary"
+
+    if body_name == "Pluto":
+        if axis == "1/7":
+            direction = "Harms"
+            summary = f"Harms the {side.lower()} side represented by {cusp_name}."
+        elif axis == "10/4":
+            direction = "Supports"
+            summary = (
+                f"Supports the {side.lower()} side represented by {cusp_name}."
+            )
+        else:
+            direction = "Undefined"
+            summary = (
+                "The book does not explicitly define Pluto's 6/12 cusp effect."
+            )
+    else:
+        rule_text = OUTER_BODY_BOOK_RULES[body_name].get(
+            motion_key,
+            OUTER_BODY_BOOK_RULES[body_name]["stationary"],
+        )
+
+        if rule_text.startswith("Supports"):
+            direction = "Supports"
+        elif rule_text.startswith("Harms"):
+            direction = "Harms"
+        else:
+            direction = "Uncertain"
+
+        summary = rule_text
+
+    return {
+        "body": body_name,
+        "cusp": cusp_name,
+        "axis": axis,
+        "represented_side": side,
+        "motion": motion_name,
+        "direction": direction,
+        "summary": summary,
+        "points_applied": False,
+    }
+
+
+def calculate_one_outer_body(
+    body_name: str,
+    body_id: int,
+    julian_day_ut: float,
+    rashi_placidus: dict[str, Any],
+) -> dict[str, Any]:
+    """Calculate one Lahiri sidereal outer-body position and cusp geometry."""
+
+    if not SWISSEPH_AVAILABLE:
+        return {
+            "status": "Unavailable",
+            "body": body_name,
+            "error": (
+                "pyswisseph is not installed. Add it to requirements.txt."
+            ),
+        }
+
+    flags = (
+        swe.FLG_SWIEPH
+        | swe.FLG_SPEED
+        | swe.FLG_SIDEREAL
+    )
+
+    try:
+        with SWISSEPH_LOCK:
+            swe.set_sid_mode(swe.SIDM_LAHIRI)
+
+            if SWISSEPH_EPHE_PATH:
+                swe.set_ephe_path(SWISSEPH_EPHE_PATH)
+
+            position, return_flags = swe.calc_ut(
+                julian_day_ut,
+                body_id,
+                flags,
+            )
+            ayanamsa_degree = swe.get_ayanamsa_ut(julian_day_ut)
+    except Exception as error:
+        message = str(error)
+
+        missing_file = None
+        marker = "file '"
+
+        if marker in message:
+            remainder = message.split(marker, 1)[1]
+            missing_file = remainder.split("'", 1)[0]
+
+        return {
+            "status": "Unavailable",
+            "body": body_name,
+            "engine": "Swiss Ephemeris via pyswisseph",
+            "ayanamsa": "Lahiri",
+            "error": message,
+            "missing_ephemeris_file": missing_file,
+            "remedy": (
+                "Set SWISSEPH_EPHE_PATH to a directory containing the "
+                "required Swiss Ephemeris asteroid files."
+                if missing_file
+                else None
+            ),
+        }
+
+    longitude = normalise_degrees(float(position[0]))
+    latitude = float(position[1])
+    distance_au = float(position[2])
+    speed_longitude = float(position[3])
+    speed_latitude = float(position[4])
+    speed_distance = float(position[5])
+    motion_name = outer_motion_name(speed_longitude)
+
+    house = None
+
+    if rashi_placidus.get("status") == "Pass":
+        house = house_number_for_longitude(
+            longitude,
+            rashi_placidus["cusps"],
+        )
+
+    distances = {}
+    qualifying_contacts = []
+
+    if rashi_placidus.get("status") == "Pass":
+        for cusp_name in SENSITIVE_CUSP_DETAILS:
+            cusp_longitude = (
+                rashi_placidus["cusps"][cusp_name]["sidereal_longitude"]
+            )
+            distance = angular_distance(longitude, cusp_longitude)
+
+            distances[cusp_name] = round(distance, 8)
+
+            if distance <= OUTER_CUSP_ORB_DEGREES + 1e-9:
+                qualifying_contacts.append({
+                    "body": body_name,
+                    "cusp": cusp_name,
+                    "axis": SENSITIVE_CUSP_DETAILS[cusp_name]["axis"],
+                    "side": SENSITIVE_CUSP_DETAILS[cusp_name]["side"],
+                    "body_longitude": round(longitude, 8),
+                    "cusp_longitude": round(cusp_longitude, 8),
+                    "angular_distance": round(distance, 8),
+                    "orb_limit": OUTER_CUSP_ORB_DEGREES,
+                    "within_orb": True,
+                    "orb_margin": round(
+                        OUTER_CUSP_ORB_DEGREES - distance,
+                        8,
+                    ),
+                    "book_effect": outer_contact_effect(
+                        body_name,
+                        cusp_name,
+                        motion_name,
+                    ),
+                })
+
+    nearest_cusp = (
+        min(distances, key=distances.get)
+        if distances
+        else None
+    )
+
+    d9_position = exact_navamsha_position(longitude)
+
+    return {
+        "status": "Pass",
+        "body": body_name,
+        "engine": "Swiss Ephemeris via pyswisseph",
+        "ayanamsa": "Lahiri",
+        "lahiri_ayanamsa_degree": round(
+            float(ayanamsa_degree),
+            8,
+        ),
+        "julian_day_ut": round(julian_day_ut, 8),
+        "sidereal_longitude": round(longitude, 8),
+        **sign_details_from_longitude(longitude),
+        "ecliptic_latitude": round(latitude, 8),
+        "distance_au": round(distance_au, 8),
+        "daily_motion_longitude": round(speed_longitude, 10),
+        "daily_motion_latitude": round(speed_latitude, 10),
+        "daily_motion_distance": round(speed_distance, 10),
+        "motion": motion_name,
+        "retrograde": speed_longitude < 0,
+        "stationary_threshold_applied": False,
+        "stationary_note": (
+            "Raw speed returned; no arbitrary stationary threshold "
+            "is applied in Step 5A."
+        ),
+        "placidus_house": house,
+        "sensitive_cusp_distances": distances,
+        "nearest_sensitive_cusp": nearest_cusp,
+        "nearest_sensitive_cusp_distance": (
+            distances.get(nearest_cusp)
+            if nearest_cusp
+            else None
+        ),
+        "qualifying_contacts": qualifying_contacts,
+        "d9_position_raw": d9_position,
+        "d9_contact_interpretation_applied": False,
+        "ephemeris_mode": swisseph_ephemeris_mode(return_flags),
+        "return_flags": int(return_flags),
+        "book_motion_rule": OUTER_BODY_BOOK_RULES[body_name],
+        "points_applied": False,
+    }
+
+
+def calculate_outer_planets(
+    std_time: str,
+    rashi_placidus: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Calculate Uranus, Neptune, Pluto, Ceres and Chiron.
+
+    This is a non-essential advanced layer. Missing asteroid files do not
+    invalidate the standard event chart.
+    """
+
+    if not SWISSEPH_AVAILABLE:
+        return {
+            "status": "Unavailable",
+            "method": "LocalSwissEphemerisOuterPlanets",
+            "engine": "pyswisseph",
+            "ayanamsa": "Lahiri",
+            "bodies": {},
+            "available_bodies": [],
+            "unavailable_bodies": list(OUTER_BODY_ORDER),
+            "error": (
+                "pyswisseph is not installed. Deploy the supplied "
+                "requirements.txt together with main.py."
+            ),
+        }
+
+    try:
+        time_data = parse_std_time_to_utc(std_time)
+        julian_day_ut = time_data["julian_day_ut"]
+    except Exception as error:
+        return {
+            "status": "Fail",
+            "method": "LocalSwissEphemerisOuterPlanets",
+            "engine": "pyswisseph",
+            "ayanamsa": "Lahiri",
+            "bodies": {},
+            "available_bodies": [],
+            "unavailable_bodies": list(OUTER_BODY_ORDER),
+            "error": str(error),
+        }
+
+    bodies = {}
+
+    for body_name in OUTER_BODY_ORDER:
+        bodies[body_name] = calculate_one_outer_body(
+            body_name,
+            OUTER_BODY_IDS[body_name],
+            julian_day_ut,
+            rashi_placidus,
+        )
+
+    available_bodies = [
+        body_name
+        for body_name, result in bodies.items()
+        if result.get("status") == "Pass"
+    ]
+    unavailable_bodies = [
+        body_name
+        for body_name, result in bodies.items()
+        if result.get("status") != "Pass"
+    ]
+
+    qualifying_contacts = []
+
+    for body_name in OUTER_BODY_ORDER:
+        body_result = bodies[body_name]
+
+        if body_result.get("status") != "Pass":
+            continue
+
+        qualifying_contacts.extend(
+            body_result.get("qualifying_contacts", [])
+        )
+
+    closest_body_by_cusp = {}
+
+    for cusp_name in SENSITIVE_CUSP_DETAILS:
+        candidates = []
+
+        for body_name in available_bodies:
+            body = bodies[body_name]
+            distance = body["sensitive_cusp_distances"].get(cusp_name)
+
+            if distance is None:
+                continue
+
+            candidates.append({
+                "body": body_name,
+                "cusp": cusp_name,
+                "angular_distance": distance,
+                "orb_limit": OUTER_CUSP_ORB_DEGREES,
+                "within_orb": (
+                    distance <= OUTER_CUSP_ORB_DEGREES + 1e-9
+                ),
+                "motion": body["motion"],
+            })
+
+        if candidates:
+            closest_body_by_cusp[cusp_name] = min(
+                candidates,
+                key=lambda item: (
+                    item["angular_distance"],
+                    OUTER_BODY_ORDER.index(item["body"]),
+                ),
+            )
+
+    if len(available_bodies) == len(OUTER_BODY_ORDER):
+        status = "Pass"
+        error = None
+    elif available_bodies:
+        status = "Partial"
+        error = (
+            "Some outer bodies were calculated, while others require "
+            "additional Swiss Ephemeris asteroid files."
+        )
+    else:
+        status = "Unavailable"
+        error = "No outer-body position could be calculated."
+
+    return {
+        "status": status,
+        "method": "LocalSwissEphemerisOuterPlanets",
+        "book_chapter": 4,
+        "book_layer": "Tier 2 invisible-graha cusp geometry",
+        "engine": "Swiss Ephemeris via pyswisseph",
+        "engine_version": getattr(swe, "version", None),
+        "python_binding_version": getattr(swe, "__version__", None),
+        "ayanamsa": "Lahiri",
+        "event_time": time_data,
+        "orb_policy": {
+            "outer_planets_degrees": OUTER_CUSP_ORB_DEGREES,
+            "applies_to": list(OUTER_BODY_ORDER),
+        },
+        "interpretation_applied": "Qualitative cusp effect only",
+        "points_applied": False,
+        "bodies": bodies,
+        "available_bodies": available_bodies,
+        "unavailable_bodies": unavailable_bodies,
+        "qualifying_contacts": sorted(
+            qualifying_contacts,
+            key=lambda item: (
+                list(SENSITIVE_CUSP_DETAILS).index(item["cusp"]),
+                item["angular_distance"],
+                OUTER_BODY_ORDER.index(item["body"]),
+            ),
+        ),
+        "closest_body_by_cusp": closest_body_by_cusp,
+        "ephemeris_path_configured": bool(SWISSEPH_EPHE_PATH),
+        "ephemeris_path": (
+            SWISSEPH_EPHE_PATH
+            if SWISSEPH_EPHE_PATH
+            else None
+        ),
+        "error": error,
+    }
+
+
 # ============================================================
 # CONSISTENCY VALIDATION
 # ============================================================
@@ -3033,6 +3567,17 @@ def health() -> dict[str, Any]:
             "planet_cusp_contacts": True,
             "navamsha_cusps": True,
             "kp_sublords": True,
+            "outer_planets": SWISSEPH_AVAILABLE,
+        },
+        "outer_planet_engine": {
+            "name": "pyswisseph",
+            "available": SWISSEPH_AVAILABLE,
+            "version": (
+                getattr(swe, "version", None)
+                if SWISSEPH_AVAILABLE
+                else None
+            ),
+            "ephemeris_path_configured": bool(SWISSEPH_EPHE_PATH),
         },
         "minimum_call_interval_seconds": VEDASTRO_MIN_INTERVAL_SECONDS,
         "maximum_attempts_per_method": VEDASTRO_MAX_RETRIES,
@@ -3191,6 +3736,13 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         requested_planets,
     )
 
+    # Chapter 4 outer planets are calculated locally because the official
+    # VedAstro PlanetName enum contains only the nine classical bodies.
+    outer_planets = calculate_outer_planets(
+        request.std_time,
+        rashi_placidus,
+    )
+
     essential_results: list[dict[str, Any]] = [
         core["ayanamsa_degree"],
         core["lagna_sign"],
@@ -3298,6 +3850,7 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         "planet_cusp_contacts": planet_cusp_contacts,
         "navamsha_cusps": navamsha_cusps,
         "kp_sublords": kp_sublords,
+        "outer_planets": outer_planets,
         "houses": houses,
         "planets": planets,
         "provenance": {
@@ -3323,6 +3876,11 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
                 "Chapter 6 KP cusps and planet longitudes calculated "
                 "with an isolated KRISHNAMURTI payload. Standard chart "
                 "calls remain LAHIRI."
+            ),
+            "outer_planets": (
+                "Uranus, Neptune, Pluto, Ceres and Chiron calculated "
+                "locally with Swiss Ephemeris under Lahiri. This layer "
+                "is non-essential and does not replace VedAstro."
             ),
             "vedastro_api_key": "stored only on Render",
             "minimum_call_interval_seconds": VEDASTRO_MIN_INTERVAL_SECONDS,
