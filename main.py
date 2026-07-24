@@ -25,7 +25,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.8.0"
+PROXY_VERSION = "1.8.1"
 
 
 # ============================================================
@@ -1633,35 +1633,61 @@ def calculate_exact_navamsha_cusps(
             ranked["closest_qualifying_contact"] = rank == 1
             qualifying_contacts.append(ranked)
 
-    failed_validations = [
+    failed_house_validations = [
         validation
-        for validation in (
-            house_sign_validation + planet_sign_validation
-        )
+        for validation in house_sign_validation
         if validation["status"] == "Fail"
     ]
-    unavailable_validations = [
+    failed_planet_validations = [
         validation
-        for validation in (
-            house_sign_validation + planet_sign_validation
-        )
+        for validation in planet_sign_validation
+        if validation["status"] == "Fail"
+    ]
+    unavailable_house_validations = [
+        validation
+        for validation in house_sign_validation
         if validation["status"] == "Unavailable"
     ]
+    unavailable_planet_validations = [
+        validation
+        for validation in planet_sign_validation
+        if validation["status"] == "Unavailable"
+    ]
+
+    failed_validations = (
+        failed_house_validations + failed_planet_validations
+    )
+
+    # The exact D9 cusps are derived from the already verified D1 Placidus
+    # cusps. VedAstro's whole-house D9 sign method is only an optional
+    # secondary cross-check because some Python-client versions do not expose
+    # AllHouseNavamshaSigns. Its absence must not downgrade otherwise verified
+    # exact D9 geometry.
+    optional_house_sign_cross_check = {
+        "status": vedastro_house_signs.get("status", "Unavailable"),
+        "required_for_layer_pass": False,
+        "available": vedastro_house_signs.get("status") in {
+            "Pass",
+            "Partial",
+        },
+        "unavailable_validations": unavailable_house_validations,
+        "note": (
+            "Optional VedAstro whole-house D9 sign cross-check. "
+            "Unavailable does not downgrade exact D9 geometry."
+        ),
+    }
 
     if axis_status == "Fail" or failed_validations:
         status = "Fail"
         error = (
-            "D9 axis or VedAstro D9 sign cross-validation failed."
+            "D9 axis or an available VedAstro D9 sign "
+            "cross-validation failed."
         )
-    elif (
-        unavailable_planets
-        or unavailable_validations
-        or vedastro_house_signs.get("status") != "Pass"
-    ):
+    elif unavailable_planets or unavailable_planet_validations:
         status = "Partial"
         error = (
-            "Exact D9 geometry was calculated, but one or more "
-            "VedAstro sign cross-checks were unavailable."
+            "Exact D9 cusp geometry passed, but one or more requested "
+            "planet D9 validations were unavailable."
         )
     else:
         status = "Pass"
@@ -1698,6 +1724,9 @@ def calculate_exact_navamsha_cusps(
             "status": axis_status,
         },
         "vedastro_house_signs": vedastro_house_signs,
+        "optional_house_sign_cross_check": (
+            optional_house_sign_cross_check
+        ),
         "house_sign_validation": house_sign_validation,
         "planets": planet_positions,
         "planet_sign_validation": planet_sign_validation,
@@ -2419,7 +2448,9 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
             ),
             "navamsha_cusps": (
                 "Exact Chapter 5 D9 degrees derived from Lahiri D1 "
-                "longitudes and cross-checked against VedAstro D9 signs."
+                "longitudes and cross-checked against available "
+                "VedAstro D9 planet signs. Whole-house D9 sign "
+                "cross-check is optional."
             ),
             "vedastro_api_key": "stored only on Render",
             "minimum_call_interval_seconds": VEDASTRO_MIN_INTERVAL_SECONDS,
