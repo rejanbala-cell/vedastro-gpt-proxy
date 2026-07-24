@@ -32,7 +32,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.10.0"
+PROXY_VERSION = "1.11.0"
 
 
 # ============================================================
@@ -333,8 +333,8 @@ app = FastAPI(
         "VedAstro.Python client, paid-key header authentication, "
         "nested planet parameters, exact Placidus cusps, "
         "planet-to-cusp contacts, exact Navamsha cusp geometry, "
-        "Krishnamurti KP sublords, outer-planet geometry "
-        "and strict validation."
+        "Krishnamurti KP sublords, outer-planet geometry, "
+        "Gulika/Upaketu geometry and strict validation."
     ),
 )
 
@@ -596,6 +596,28 @@ OUTER_BODY_BOOK_RULES = {
 }
 
 
+# Gambler's Dharma invisible-upagraha rules.
+SPECIAL_POINT_NAMES = ("Gulika", "Upaketu")
+SPECIAL_POINT_CUSP_ORB_DEGREES = 2.0
+GULIKA_HOUSE_LORD_ORB_DEGREES = 1.0
+
+# The current generated VedAstro.Python client does not expose these two
+# methods, although the official VedAstro server/API Builder does. The proxy
+# therefore calls the official endpoint directly through the already patched
+# and authenticated Calculate._make_request method.
+SPECIAL_POINT_ENDPOINTS = {
+    "Gulika": (
+        "GulikaLongitude",
+        "MaandiLongitude",
+        "MandiLongitude",
+    ),
+    "Upaketu": (
+        "UpaketuLongitude",
+        "UpaKetuLongitude",
+    ),
+}
+
+
 # ============================================================
 # REQUEST MODELS
 # ============================================================
@@ -819,6 +841,83 @@ def vedastro_call_for_ayanamsa(
 
     result["ayanamsa_requested"] = str(ayanamsa_name)
     return result
+
+
+def direct_vedastro_time_endpoint_call(
+    endpoint_names: tuple[str, ...] | list[str],
+    event_time: Time,
+    ayanamsa_name: str = "LAHIRI",
+) -> dict[str, Any]:
+    """
+    Call a time-based official VedAstro server calculator that is absent from
+    the generated Python client.
+
+    Most current calculators use the parameter name ``time``. The inputTime
+    and birthTime variants are attempted only when the installed server
+    signature differs. Every attempt uses the existing shared throttle,
+    authentication headers, retry policy and thread-local ayanamsa.
+    """
+
+    parameter_names = ("time", "inputTime", "birthTime")
+    failures: list[dict[str, Any]] = []
+    attempts = 0
+
+    for endpoint in endpoint_names:
+        for parameter_name in parameter_names:
+            final_error = ""
+
+            for attempt in range(1, VEDASTRO_MAX_RETRIES + 1):
+                attempts += 1
+
+                try:
+                    wait_for_call_slot()
+
+                    with use_request_ayanamsa(ayanamsa_name):
+                        result = Calculate._make_request(
+                            endpoint,
+                            {
+                                parameter_name: event_time.to_json(),
+                            },
+                        )
+
+                    return {
+                        "status": "Pass",
+                        "method": endpoint,
+                        "parameter_name": parameter_name,
+                        "attempt": attempt,
+                        "total_attempts": attempts,
+                        "ayanamsa_requested": ayanamsa_name,
+                        "data": limit_data(result),
+                    }
+
+                except Exception as error:
+                    final_error = str(error)
+
+                    if attempt >= VEDASTRO_MAX_RETRIES:
+                        break
+
+                    if not is_retryable_error(final_error):
+                        break
+
+                    time.sleep(min(2 ** (attempt - 1), 4))
+
+            failures.append({
+                "method": endpoint,
+                "parameter_name": parameter_name,
+                "error": final_error or "Unknown VedAstro error",
+            })
+
+    return {
+        "status": "Fail",
+        "method": endpoint_names[0],
+        "attempts": attempts,
+        "ayanamsa_requested": ayanamsa_name,
+        "failures": failures,
+        "error": (
+            "All official VedAstro endpoint and time-parameter "
+            "combinations failed."
+        ),
+    }
 
 
 # ============================================================
@@ -3137,6 +3236,514 @@ def calculate_outer_planets(
     }
 
 
+def extract_planet_name_from_result(
+    result: dict[str, Any],
+) -> str | None:
+    """Extract one supported planet name from a VedAstro result."""
+
+    value = find_named_value(
+        unwrap_data(result),
+        ("Name", "PlanetName", "name"),
+    )
+
+    if value is None:
+        data = unwrap_data(result)
+
+        if isinstance(data, str):
+            value = data
+
+    if not value:
+        return None
+
+    normalised = str(value).lower()
+
+    for planet_name in PLANETS:
+        if planet_name.lower() in normalised:
+            return planet_name
+
+    return None
+
+
+def special_point_rashi_effect(
+    point_name: str,
+    cusp_name: str,
+) -> dict[str, Any]:
+    """Return only the qualitative book rule for one qualifying D1 contact."""
+
+    metadata = SENSITIVE_CUSP_DETAILS[cusp_name]
+    side = metadata["side"]
+    axis = metadata["axis"]
+    opposing_side = (
+        "Underdog"
+        if side == "Favourite"
+        else "Favourite"
+    )
+
+    if point_name == "Upaketu":
+        direction = "Harms cusp side"
+        supports = opposing_side
+        rule = (
+            "Upaketu acts like Ketu and is negative on every "
+            "contacted rashi cusp."
+        )
+        status = "Book-defined"
+    elif axis == "1/7":
+        direction = "Harms cusp side"
+        supports = opposing_side
+        rule = (
+            "Gulika is negative on the first and seventh cusps."
+        )
+        status = "Book-defined"
+    elif axis == "10/4":
+        direction = "Supports cusp side"
+        supports = side
+        rule = (
+            "Gulika behaves like Saturn on the fourth and tenth "
+            "cusps and helps the represented team."
+        )
+        status = "Book-defined"
+    else:
+        direction = "Undefined"
+        supports = None
+        rule = (
+            "The book does not explicitly define Gulika's effect "
+            "on the sixth/twelfth axis."
+        )
+        status = "Not defined by book"
+
+    return {
+        "point": point_name,
+        "cusp": cusp_name,
+        "axis": axis,
+        "represented_side": side,
+        "direction": direction,
+        "supports": supports,
+        "rule": rule,
+        "rule_status": status,
+        "points_applied": False,
+    }
+
+
+def special_point_d9_effect(
+    point_name: str,
+    cusp_name: str,
+) -> dict[str, Any]:
+    """Return the book's qualitative D9 1/7 rule."""
+
+    side = (
+        "Favourite"
+        if cusp_name == "D9Lagna"
+        else "Underdog"
+    )
+    opposing_side = (
+        "Underdog"
+        if side == "Favourite"
+        else "Favourite"
+    )
+
+    if point_name == "Gulika":
+        rule = (
+            "Gulika on the D9 Lagna or D9 seventh cusp indicates "
+            "defeat for the represented side."
+        )
+    else:
+        rule = (
+            "Upaketu acts like Ketu in D9 and is negative for the "
+            "represented side."
+        )
+
+    return {
+        "point": point_name,
+        "cusp": cusp_name,
+        "represented_side": side,
+        "direction": "Harms cusp side",
+        "supports": opposing_side,
+        "rule": rule,
+        "points_applied": False,
+    }
+
+
+def calculate_one_special_point(
+    point_name: str,
+    event_time: Time,
+    rashi_placidus: dict[str, Any],
+    navamsha_cusps: dict[str, Any],
+) -> dict[str, Any]:
+    """Calculate one exact Lahiri upagraha through VedAstro's official API."""
+
+    upstream = direct_vedastro_time_endpoint_call(
+        SPECIAL_POINT_ENDPOINTS[point_name],
+        event_time,
+        ayanamsa_name="LAHIRI",
+    )
+    longitude = extract_total_degrees(upstream)
+
+    if upstream.get("status") != "Pass" or longitude is None:
+        return {
+            "status": "Unavailable",
+            "point": point_name,
+            "engine": "Official VedAstro server calculator",
+            "ayanamsa": "Lahiri",
+            "upstream": upstream,
+            "error": (
+                f"Could not obtain exact {point_name} longitude "
+                "from the official VedAstro calculator."
+            ),
+        }
+
+    longitude = normalise_degrees(longitude)
+    house = None
+
+    if rashi_placidus.get("status") == "Pass":
+        house = house_number_for_longitude(
+            longitude,
+            rashi_placidus["cusps"],
+        )
+
+    d1_distances: dict[str, float] = {}
+    d1_contacts: list[dict[str, Any]] = []
+
+    if rashi_placidus.get("status") == "Pass":
+        for cusp_name, metadata in SENSITIVE_CUSP_DETAILS.items():
+            cusp_longitude = rashi_placidus[
+                "cusps"
+            ][cusp_name]["sidereal_longitude"]
+            distance = angular_distance(
+                longitude,
+                cusp_longitude,
+            )
+            d1_distances[cusp_name] = round(distance, 8)
+
+            if distance <= SPECIAL_POINT_CUSP_ORB_DEGREES + 1e-9:
+                d1_contacts.append({
+                    "point": point_name,
+                    "cusp": cusp_name,
+                    "axis": metadata["axis"],
+                    "side": metadata["side"],
+                    "point_longitude": round(longitude, 8),
+                    "cusp_longitude": round(cusp_longitude, 8),
+                    "angular_distance": round(distance, 8),
+                    "orb_limit": SPECIAL_POINT_CUSP_ORB_DEGREES,
+                    "within_orb": True,
+                    "orb_margin": round(
+                        SPECIAL_POINT_CUSP_ORB_DEGREES - distance,
+                        8,
+                    ),
+                    "book_effect": special_point_rashi_effect(
+                        point_name,
+                        cusp_name,
+                    ),
+                })
+
+    nearest_d1_cusp = (
+        min(d1_distances, key=d1_distances.get)
+        if d1_distances
+        else None
+    )
+
+    d9_position = exact_navamsha_position(longitude)
+    d9_distances: dict[str, float] = {}
+    d9_contacts: list[dict[str, Any]] = []
+
+    if navamsha_cusps.get("status") in {"Pass", "Partial"}:
+        for cusp_name, cusp_data in (
+            ("D9Lagna", navamsha_cusps.get("lagna")),
+            ("D9House7", navamsha_cusps.get("seventh_cusp")),
+        ):
+            if not isinstance(cusp_data, dict):
+                continue
+
+            cusp_longitude = cusp_data.get(
+                "d9_sidereal_longitude"
+            )
+
+            if not isinstance(cusp_longitude, (int, float)):
+                continue
+
+            distance = angular_distance(
+                d9_position["d9_sidereal_longitude"],
+                cusp_longitude,
+            )
+            d9_distances[cusp_name] = round(distance, 8)
+
+            if distance <= SPECIAL_POINT_CUSP_ORB_DEGREES + 1e-9:
+                d9_contacts.append({
+                    "point": point_name,
+                    "cusp": cusp_name,
+                    "point_d9_longitude": d9_position[
+                        "d9_sidereal_longitude"
+                    ],
+                    "cusp_d9_longitude": round(
+                        float(cusp_longitude),
+                        8,
+                    ),
+                    "angular_distance": round(distance, 8),
+                    "orb_limit": SPECIAL_POINT_CUSP_ORB_DEGREES,
+                    "within_orb": True,
+                    "orb_margin": round(
+                        SPECIAL_POINT_CUSP_ORB_DEGREES - distance,
+                        8,
+                    ),
+                    "book_effect": special_point_d9_effect(
+                        point_name,
+                        cusp_name,
+                    ),
+                })
+
+    nearest_d9_cusp = (
+        min(d9_distances, key=d9_distances.get)
+        if d9_distances
+        else None
+    )
+
+    return {
+        "status": "Pass",
+        "point": point_name,
+        "engine": "Official VedAstro server calculator",
+        "ayanamsa": "Lahiri",
+        "upstream_method": upstream.get("method"),
+        "upstream_parameter_name": upstream.get(
+            "parameter_name"
+        ),
+        "sidereal_longitude": round(longitude, 8),
+        **sign_details_from_longitude(longitude),
+        "placidus_house": house,
+        "rashi": {
+            "orb_limit": SPECIAL_POINT_CUSP_ORB_DEGREES,
+            "sensitive_cusp_distances": d1_distances,
+            "nearest_sensitive_cusp": nearest_d1_cusp,
+            "nearest_distance": (
+                d1_distances.get(nearest_d1_cusp)
+                if nearest_d1_cusp
+                else None
+            ),
+            "qualifying_contacts": d1_contacts,
+        },
+        "d9": {
+            "position": d9_position,
+            "orb_limit": SPECIAL_POINT_CUSP_ORB_DEGREES,
+            "cusp_distances": d9_distances,
+            "nearest_cusp": nearest_d9_cusp,
+            "nearest_distance": (
+                d9_distances.get(nearest_d9_cusp)
+                if nearest_d9_cusp
+                else None
+            ),
+            "qualifying_contacts": d9_contacts,
+        },
+        "points_applied": False,
+        "upstream": {
+            key: value
+            for key, value in upstream.items()
+            if key not in {"data", "failures"}
+        },
+    }
+
+
+def calculate_gulika_house_lord_contacts(
+    gulika_result: dict[str, Any],
+    houses: dict[str, dict[str, Any]],
+    planets: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Test the book's special one-degree Gulika conjunction with the lords of
+    House 1 and House 7.
+    """
+
+    if gulika_result.get("status") != "Pass":
+        return {
+            "status": "Unavailable",
+            "orb_limit": GULIKA_HOUSE_LORD_ORB_DEGREES,
+            "contacts": [],
+            "error": "Exact Gulika longitude is unavailable.",
+        }
+
+    gulika_longitude = gulika_result["sidereal_longitude"]
+    contacts: list[dict[str, Any]] = []
+    unavailable: list[dict[str, Any]] = []
+
+    for house_name, represented_side in (
+        ("House1", "Favourite"),
+        ("House7", "Underdog"),
+    ):
+        house_result = houses.get(house_name, {})
+        lord_name = extract_planet_name_from_result(
+            house_result.get("lord", {})
+        )
+
+        if not lord_name:
+            unavailable.append({
+                "house": house_name,
+                "reason": "Could not parse the house lord.",
+            })
+            continue
+
+        planet_result = planets.get(lord_name)
+        planet_longitude = (
+            extract_total_degrees(
+                planet_result.get("sidereal_longitude", {})
+            )
+            if planet_result
+            else None
+        )
+
+        if planet_longitude is None:
+            unavailable.append({
+                "house": house_name,
+                "lord": lord_name,
+                "reason": (
+                    "The house-lord planet longitude was not returned "
+                    "in the Action request."
+                ),
+            })
+            continue
+
+        distance = angular_distance(
+            gulika_longitude,
+            planet_longitude,
+        )
+        within_orb = (
+            distance <= GULIKA_HOUSE_LORD_ORB_DEGREES + 1e-9
+        )
+
+        contacts.append({
+            "house": house_name,
+            "represented_side": represented_side,
+            "house_lord": lord_name,
+            "gulika_longitude": round(gulika_longitude, 8),
+            "lord_longitude": round(
+                normalise_degrees(planet_longitude),
+                8,
+            ),
+            "angular_distance": round(distance, 8),
+            "orb_limit": GULIKA_HOUSE_LORD_ORB_DEGREES,
+            "within_orb": within_orb,
+            "severe_detriment": within_orb,
+            "book_effect": (
+                "The represented side is highly detrimented."
+                if within_orb
+                else "No special one-degree Gulika/lord testimony."
+            ),
+            "points_applied": False,
+        })
+
+    if unavailable and not contacts:
+        status = "Unavailable"
+    elif unavailable:
+        status = "Partial"
+    else:
+        status = "Pass"
+
+    return {
+        "status": status,
+        "orb_limit": GULIKA_HOUSE_LORD_ORB_DEGREES,
+        "contacts": contacts,
+        "qualifying_contacts": [
+            contact
+            for contact in contacts
+            if contact["within_orb"]
+        ],
+        "unavailable": unavailable,
+        "points_applied": False,
+    }
+
+
+def calculate_special_points(
+    event_time: Time,
+    rashi_placidus: dict[str, Any],
+    navamsha_cusps: dict[str, Any],
+    houses: dict[str, dict[str, Any]],
+    planets: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Calculate and validate Gulika and Upaketu as a non-essential layer."""
+
+    points = {
+        point_name: calculate_one_special_point(
+            point_name,
+            event_time,
+            rashi_placidus,
+            navamsha_cusps,
+        )
+        for point_name in SPECIAL_POINT_NAMES
+    }
+
+    available_points = [
+        name
+        for name, result in points.items()
+        if result.get("status") == "Pass"
+    ]
+    unavailable_points = [
+        name
+        for name, result in points.items()
+        if result.get("status") != "Pass"
+    ]
+
+    gulika_lord_contacts = calculate_gulika_house_lord_contacts(
+        points["Gulika"],
+        houses,
+        planets,
+    )
+
+    qualifying_rashi_contacts = []
+    qualifying_d9_contacts = []
+
+    for point_name in SPECIAL_POINT_NAMES:
+        point_result = points[point_name]
+
+        if point_result.get("status") != "Pass":
+            continue
+
+        qualifying_rashi_contacts.extend(
+            point_result["rashi"]["qualifying_contacts"]
+        )
+        qualifying_d9_contacts.extend(
+            point_result["d9"]["qualifying_contacts"]
+        )
+
+    if len(available_points) == len(SPECIAL_POINT_NAMES):
+        status = "Pass"
+        error = None
+    elif available_points:
+        status = "Partial"
+        error = (
+            "One special point passed while the other official "
+            "VedAstro calculation was unavailable."
+        )
+    else:
+        status = "Unavailable"
+        error = (
+            "Neither official VedAstro special-point calculator "
+            "returned an exact longitude."
+        )
+
+    return {
+        "status": status,
+        "method": "OfficialVedAstroGulikaUpaketuLongitudes",
+        "book_chapters": [4, 5],
+        "book_layer": "Invisible upagraha cusp geometry",
+        "engine": "Official VedAstro server calculators",
+        "ayanamsa": "Lahiri",
+        "house_system": "Placidus",
+        "interpretation_applied": "Qualitative book rules only",
+        "points_applied": False,
+        "orb_policy": {
+            "rashi_and_d9_cusp_degrees": (
+                SPECIAL_POINT_CUSP_ORB_DEGREES
+            ),
+            "gulika_house_lord_degrees": (
+                GULIKA_HOUSE_LORD_ORB_DEGREES
+            ),
+        },
+        "points": points,
+        "gulika_house_lord_contacts": gulika_lord_contacts,
+        "qualifying_rashi_contacts": qualifying_rashi_contacts,
+        "qualifying_d9_contacts": qualifying_d9_contacts,
+        "available_points": available_points,
+        "unavailable_points": unavailable_points,
+        "error": error,
+    }
+
+
 # ============================================================
 # CONSISTENCY VALIDATION
 # ============================================================
@@ -3568,6 +4175,7 @@ def health() -> dict[str, Any]:
             "navamsha_cusps": True,
             "kp_sublords": True,
             "outer_planets": SWISSEPH_AVAILABLE,
+            "gulika_upaketu": True,
         },
         "outer_planet_engine": {
             "name": "pyswisseph",
@@ -3743,6 +4351,16 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         rashi_placidus,
     )
 
+    # Official VedAstro Gulika and Upaketu calculators. This remains a
+    # non-essential advanced layer and cannot invalidate the standard chart.
+    special_points = calculate_special_points(
+        event_time,
+        rashi_placidus,
+        navamsha_cusps,
+        houses,
+        planets,
+    )
+
     essential_results: list[dict[str, Any]] = [
         core["ayanamsa_degree"],
         core["lagna_sign"],
@@ -3851,6 +4469,7 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         "navamsha_cusps": navamsha_cusps,
         "kp_sublords": kp_sublords,
         "outer_planets": outer_planets,
+        "special_points": special_points,
         "houses": houses,
         "planets": planets,
         "provenance": {
@@ -3881,6 +4500,11 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
                 "Uranus, Neptune, Pluto, Ceres and Chiron calculated "
                 "locally with Swiss Ephemeris under Lahiri. This layer "
                 "is non-essential and does not replace VedAstro."
+            ),
+            "special_points": (
+                "Gulika and Upaketu exact Lahiri longitudes requested "
+                "from official VedAstro server calculators. Geometry "
+                "and book-supported contact labels are calculated locally."
             ),
             "vedastro_api_key": "stored only on Render",
             "minimum_call_interval_seconds": VEDASTRO_MIN_INTERVAL_SECONDS,
