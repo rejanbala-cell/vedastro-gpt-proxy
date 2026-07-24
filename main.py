@@ -32,7 +32,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.11.0"
+PROXY_VERSION = "1.12.0"
 
 
 # ============================================================
@@ -334,7 +334,8 @@ app = FastAPI(
         "nested planet parameters, exact Placidus cusps, "
         "planet-to-cusp contacts, exact Navamsha cusp geometry, "
         "Krishnamurti KP sublords, outer-planet geometry, "
-        "Gulika/Upaketu geometry and strict validation."
+        "Gulika/Upaketu geometry, Chapter 8 nakshatra taras "
+        "and strict validation."
     ),
 )
 
@@ -616,6 +617,438 @@ SPECIAL_POINT_ENDPOINTS = {
         "UpaKetuLongitude",
     ),
 }
+
+
+# Gambler's Dharma Chapter 8 marker-star/yogatara method.
+#
+# These are the book's stated sidereal sign-degrees, not a dynamically
+# precessed modern fixed-star catalogue. The author explicitly instructs
+# readers to use these rashi positions and notes that some are rounded.
+TARA_ORB_DEGREES = 1.0
+
+TARA_TARGETS = {
+    "House1": {
+        "side": "Favourite",
+        "role": "Lagna",
+        "priority": "Primary",
+        "priority_rank": 1,
+    },
+    "House10": {
+        "side": "Favourite",
+        "role": "Honour",
+        "priority": "Secondary",
+        "priority_rank": 2,
+    },
+    "House7": {
+        "side": "Underdog",
+        "role": "Lagna",
+        "priority": "Primary",
+        "priority_rank": 1,
+    },
+    "House4": {
+        "side": "Underdog",
+        "role": "Honour",
+        "priority": "Secondary",
+        "priority_rank": 2,
+    },
+}
+
+# Outcome classes:
+# - positive / mildly_positive: supports the represented side
+# - negative / mildly_negative: harms the represented side
+# - axis_dependent: Wasat's Saturn-like cusp rule
+# - context_*: descriptive testimony only, no winner direction
+# - research_only / none: no automatic contest interpretation
+#
+# "positions" are absolute sidereal longitudes. "range" is inclusive.
+TARA_CATALOG = (
+    {
+        "nakshatra": "Ashvini",
+        "marker": "Sheratan / Hamal",
+        "positions": (10.0, 13.75),
+        "book_position": "10° Aries; 13°45′ Aries",
+        "effect_class": "context_speed",
+        "effect": "Light and swift; gives speed.",
+        "tier_hint": "Context only",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 208],
+    },
+    {
+        "nakshatra": "Bharani",
+        "marker": "Bharani marker stars",
+        "positions": (24.33333333,),
+        "book_position": "24°20′ Aries",
+        "effect_class": "context_harm",
+        "effect": "Violence or injury; no proven win/loss direction.",
+        "tier_hint": "Context only",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 209],
+    },
+    {
+        "nakshatra": "Krittika",
+        "marker": "Alcyone",
+        "positions": (36.0,),
+        "book_position": "6° Taurus",
+        "effect_class": "mildly_positive",
+        "effect": "Mildly positive.",
+        "tier_hint": "First tier",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 209],
+    },
+    {
+        "nakshatra": "Rohini",
+        "marker": "Aldebaran",
+        "positions": (46.0,),
+        "book_position": "16° Taurus",
+        "effect_class": "research_only",
+        "effect": (
+            "No settled cusp outcome; may help relevant lords, but "
+            "the book says more research is needed."
+        ),
+        "tier_hint": "Research only",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 209],
+    },
+    {
+        "nakshatra": "Mrigashira",
+        "marker": "Mrigashira marker star",
+        "positions": (59.75,),
+        "book_position": "29°45′ Taurus",
+        "effect_class": "mildly_positive",
+        "effect": "Mild positive boost.",
+        "tier_hint": "First tier",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 209],
+    },
+    {
+        "nakshatra": "Ardra",
+        "marker": "Betelgeuse",
+        "positions": (65.0,),
+        "book_position": "5° Gemini",
+        "effect_class": "negative",
+        "effect": (
+            "Negative placement with serious obstacles; resilience "
+            "may still overcome it."
+        ),
+        "tier_hint": "Book does not fix an exact point value",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 210],
+    },
+    {
+        "nakshatra": "Punarvasu",
+        "marker": "Pollux",
+        "positions": (89.5,),
+        "book_position": "29°30′ Gemini",
+        "effect_class": "positive",
+        "effect": "Strong victory tara.",
+        "tier_hint": "Second tier when tight",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 204, 210],
+    },
+    {
+        "nakshatra": "Pushya",
+        "marker": "Pushya cluster",
+        "positions": (103.5, 105.0),
+        "book_position": "13°30′ or 15° Cancer",
+        "effect_class": "none",
+        "effect": "No dependable contest effect established.",
+        "tier_hint": "None",
+        "applies_to_cusps": False,
+        "applies_to_lords": False,
+        "pdf_pages": [203, 211],
+    },
+    {
+        "nakshatra": "Ashlesha",
+        "marker": "Ashlesha marker stars",
+        "positions": (108.0, 110.66666667),
+        "book_position": "18° or 20°40′ Cancer",
+        "effect_class": "context_harm",
+        "effect": "May paralyse, freeze or suffocate; not a proven winner rule.",
+        "tier_hint": "Context only",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 211],
+    },
+    {
+        "nakshatra": "Magha",
+        "marker": "Regulus",
+        "positions": (126.0,),
+        "book_position": "6° Leo",
+        "effect_class": "positive",
+        "effect": "Confers victory.",
+        "tier_hint": "Second tier when tight",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 206, 211],
+    },
+    {
+        "nakshatra": "Purva Phalguni",
+        "marker": "Zosma",
+        "positions": (137.5,),
+        "book_position": "17°30′ Leo",
+        "effect_class": "mildly_negative",
+        "effect": "Mildly negative or lazy influence.",
+        "tier_hint": "First tier",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 211],
+    },
+    {
+        "nakshatra": "Uttara Phalguni",
+        "marker": "Denebola",
+        "positions": (147.75,),
+        "book_position": "27°45′ Leo",
+        "effect_class": "mildly_negative",
+        "effect": "Mildly negative or lazy influence.",
+        "tier_hint": "First tier",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 211],
+    },
+    {
+        "nakshatra": "Hasta",
+        "marker": "Book gives conflicting candidate degrees",
+        "positions": (),
+        "book_position": "Ambiguous in the book text/table",
+        "effect_class": "none",
+        "effect": "No dependable contest effect established.",
+        "tier_hint": "Unavailable",
+        "applies_to_cusps": False,
+        "applies_to_lords": False,
+        "pdf_pages": [203, 211, 212],
+    },
+    {
+        "nakshatra": "Chitra",
+        "marker": "Spica",
+        "positions": (179.91666667,),
+        "book_position": "29°55′ Virgo",
+        "effect_class": "negative",
+        "effect": "Loss-producing on contest cusps.",
+        "tier_hint": "Second tier when tight",
+        "applies_to_cusps": True,
+        "applies_to_lords": False,
+        "lord_note": "The book says more research is needed for house lords.",
+        "pdf_pages": [203, 212, 218, 219],
+    },
+    {
+        "nakshatra": "Svati",
+        "marker": "Arcturus",
+        "positions": (180.25,),
+        "book_position": "0°15′ Libra",
+        "effect_class": "research_only",
+        "effect": (
+            "Difficult to separate from nearby Spica by longitude; "
+            "no independent outcome rule applied."
+        ),
+        "tier_hint": "Research only",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 212],
+    },
+    {
+        "nakshatra": "Vishakha",
+        "marker": "Zuben Elgenubi",
+        "positions": (201.0,),
+        "book_position": "21° Libra",
+        "effect_class": "positive",
+        "effect": "Victory-oriented positive influence.",
+        "tier_hint": "Second tier when tight",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 212],
+    },
+    {
+        "nakshatra": "Anuradha",
+        "marker": "Anuradha marker stars",
+        "positions": (218.0, 220.0),
+        "book_position": "8° or 10° Scorpio",
+        "effect_class": "none",
+        "effect": "No dependable contest effect established.",
+        "tier_hint": "None",
+        "applies_to_cusps": False,
+        "applies_to_lords": False,
+        "pdf_pages": [203, 212],
+    },
+    {
+        "nakshatra": "Jyeshtha",
+        "marker": "Antares",
+        "positions": (226.0,),
+        "book_position": "16° Scorpio",
+        "effect_class": "research_only",
+        "effect": (
+            "May be destructive for relevant lords; Aldebaran/Antares "
+            "opposition can cancel on cusps. More research is required."
+        ),
+        "tier_hint": "Research only",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 209, 212, 215],
+    },
+    {
+        "nakshatra": "Mula",
+        "marker": "Multiple proposed Mula points",
+        "positions": (238.5, 240.75, 243.0),
+        "book_position": "28°30′ Scorpio; 0°45′ or 3° Sagittarius",
+        "effect_class": "none",
+        "effect": "No dependable contest effect established.",
+        "tier_hint": "None",
+        "applies_to_cusps": False,
+        "applies_to_lords": False,
+        "pdf_pages": [203, 213],
+    },
+    {
+        "nakshatra": "Purva Ashadha",
+        "marker": "Kaus Medius",
+        "positions": (250.66666667,),
+        "book_position": "10°40′ Sagittarius",
+        "effect_class": "research_only",
+        "effect": "At most a mild positive influence; evidence is limited.",
+        "tier_hint": "Research only",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 213],
+    },
+    {
+        "nakshatra": "Uttara Ashadha",
+        "marker": "Pelagus / Ascella",
+        "positions": (258.5, 259.66666667),
+        "book_position": "18°30′ or 19°40′ Sagittarius",
+        "effect_class": "none",
+        "effect": "No dependable contest effect established.",
+        "tier_hint": "None",
+        "applies_to_cusps": False,
+        "applies_to_lords": False,
+        "pdf_pages": [203, 213],
+    },
+    {
+        "nakshatra": "Abhijit",
+        "marker": "Vega",
+        "positions": (261.5,),
+        "book_position": "21°30′ Sagittarius",
+        "effect_class": "positive",
+        "effect": "Victory-producing.",
+        "tier_hint": "Second tier when tight",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [201, 203, 213, 214],
+    },
+    {
+        "nakshatra": "Shravana",
+        "marker": "Altair",
+        "positions": (278.0,),
+        "book_position": "8° Capricorn",
+        "effect_class": "context_speed",
+        "effect": "Speed, surprise and performance beyond expectations.",
+        "tier_hint": "First tier",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [203, 214],
+    },
+    {
+        "nakshatra": "Dhanishta",
+        "marker": "Beta / Alpha Delphini",
+        "positions": (292.5, 294.0),
+        "book_position": "22°30′ and 24° Capricorn",
+        "effect_class": "none",
+        "effect": "No dependable contest effect established.",
+        "tier_hint": "None",
+        "applies_to_cusps": False,
+        "applies_to_lords": False,
+        "pdf_pages": [204, 214],
+    },
+    {
+        "nakshatra": "Shatabhisha",
+        "marker": "Shatabhisha marker star",
+        "positions": (317.75,),
+        "book_position": "17°45′ Aquarius",
+        "effect_class": "mildly_positive",
+        "effect": "Mildly positive.",
+        "tier_hint": "First tier",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [204, 214],
+    },
+    {
+        "nakshatra": "Purva Bhadrapada",
+        "marker": "Alpha Pegasi",
+        "positions": (329.5,),
+        "book_position": "29°30′ Aquarius",
+        "effect_class": "none",
+        "effect": "No appreciable sports-cusp effect.",
+        "tier_hint": "None",
+        "applies_to_cusps": False,
+        "applies_to_lords": False,
+        "pdf_pages": [204, 215],
+    },
+    {
+        "nakshatra": "Uttara Bhadrapada",
+        "marker": "Algenib",
+        "positions": (345.0,),
+        "book_position": "15° Pisces",
+        "effect_class": "none",
+        "effect": "No appreciable sports-cusp effect.",
+        "tier_hint": "None",
+        "applies_to_cusps": False,
+        "applies_to_lords": False,
+        "pdf_pages": [204, 215],
+    },
+    {
+        "nakshatra": "Revati",
+        "marker": "Revati marker star(s)",
+        "positions": (356.0,),
+        "book_position": "Around 26° Pisces",
+        "effect_class": "none",
+        "effect": "No appreciable sports-cusp effect.",
+        "tier_hint": "None",
+        "applies_to_cusps": False,
+        "applies_to_lords": False,
+        "pdf_pages": [204, 215],
+    },
+    {
+        "nakshatra": "Additional fixed star",
+        "marker": "Algol",
+        "positions": (32.0,),
+        "book_position": "2° Taurus",
+        "effect_class": "context_harm",
+        "effect": "Loss-of-head or crisis symbolism; not a proven winner rule.",
+        "tier_hint": "Context only",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [204, 216, 217],
+    },
+    {
+        "nakshatra": "Additional constellation",
+        "marker": "Hyades",
+        "positions": (),
+        "range": (41.0, 43.0),
+        "book_position": "11°-13° Taurus",
+        "effect_class": "mildly_positive",
+        "effect": "Mildly positive.",
+        "tier_hint": "First tier",
+        "applies_to_cusps": True,
+        "applies_to_lords": True,
+        "pdf_pages": [204, 209],
+    },
+    {
+        "nakshatra": "Additional fixed star",
+        "marker": "Wasat",
+        "positions": (85.0,),
+        "book_position": "25° Gemini",
+        "effect_class": "axis_dependent",
+        "effect": "Saturn-like on a cusp, with slightly less force.",
+        "tier_hint": "Qualitative axis rule",
+        "applies_to_cusps": True,
+        "applies_to_lords": False,
+        "pdf_pages": [204, 210],
+    },
+)
 
 
 # ============================================================
@@ -3744,6 +4177,690 @@ def calculate_special_points(
     }
 
 
+def opposite_contest_side(side: str) -> str:
+    return "Underdog" if side == "Favourite" else "Favourite"
+
+
+def distance_to_circular_range(
+    longitude: float,
+    range_start: float,
+    range_end: float,
+) -> tuple[float, float]:
+    """
+    Return minimum angular distance to an inclusive circular longitude range
+    and the nearest longitude on that range.
+    """
+
+    value = normalise_degrees(longitude)
+    start = normalise_degrees(range_start)
+    end = normalise_degrees(range_end)
+
+    if start <= end:
+        inside = start <= value <= end
+    else:
+        inside = value >= start or value <= end
+
+    if inside:
+        return 0.0, value
+
+    start_distance = angular_distance(value, start)
+    end_distance = angular_distance(value, end)
+
+    if start_distance <= end_distance:
+        return start_distance, start
+
+    return end_distance, end
+
+
+def distance_to_tara_marker(
+    longitude: float,
+    tara: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Find the closest book-defined marker position for one tara."""
+
+    candidates: list[dict[str, Any]] = []
+
+    for marker_longitude in tara.get("positions", ()):
+        candidates.append({
+            "distance": angular_distance(
+                longitude,
+                marker_longitude,
+            ),
+            "nearest_marker_longitude": normalise_degrees(
+                marker_longitude
+            ),
+            "marker_type": "Point",
+        })
+
+    marker_range = tara.get("range")
+
+    if marker_range:
+        distance, nearest = distance_to_circular_range(
+            longitude,
+            marker_range[0],
+            marker_range[1],
+        )
+        candidates.append({
+            "distance": distance,
+            "nearest_marker_longitude": nearest,
+            "marker_type": "Range",
+            "marker_range": [
+                normalise_degrees(marker_range[0]),
+                normalise_degrees(marker_range[1]),
+            ],
+        })
+
+    if not candidates:
+        return None
+
+    return min(
+        candidates,
+        key=lambda item: (
+            item["distance"],
+            item["nearest_marker_longitude"],
+        ),
+    )
+
+
+def tara_effect_for_target(
+    tara: dict[str, Any],
+    target: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply only the explicit Chapter 8 qualitative direction."""
+
+    effect_class = tara["effect_class"]
+    represented_side = target["side"]
+    opposing_side = opposite_contest_side(represented_side)
+    target_house = target["house"]
+
+    direction = "No winner direction"
+    supports = None
+    harms = None
+    status = "Context or research only"
+
+    if effect_class in {"positive", "mildly_positive"}:
+        direction = "Supports represented side"
+        supports = represented_side
+        harms = opposing_side
+        status = "Book-defined"
+    elif effect_class in {"negative", "mildly_negative"}:
+        direction = "Harms represented side"
+        supports = opposing_side
+        harms = represented_side
+        status = "Book-defined"
+    elif effect_class == "axis_dependent":
+        if target["target_type"] != "Cusp":
+            status = "Not applied to house lords"
+        elif target_house in {"House10", "House4"}:
+            direction = "Supports represented side"
+            supports = represented_side
+            harms = opposing_side
+            status = "Book-defined Wasat/Saturn cusp rule"
+        elif target_house in {"House1", "House7"}:
+            direction = "Harms represented side"
+            supports = opposing_side
+            harms = represented_side
+            status = "Book-defined Wasat/Saturn cusp rule"
+
+    return {
+        "effect_class": effect_class,
+        "direction": direction,
+        "supports": supports,
+        "harms": harms,
+        "rule_status": status,
+        "description": tara["effect"],
+        "tier_hint": tara["tier_hint"],
+        "points_applied": False,
+    }
+
+
+def build_tara_targets(
+    rashi_placidus: dict[str, Any],
+    houses: dict[str, dict[str, Any]],
+    planets: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Build exact H1/H10/H7/H4 cusp targets and their house-lord targets.
+
+    A repeated planet is kept only in its highest-priority role. This applies
+    the book's instruction that a Lagna lord outranks an opposing honour lord.
+    """
+
+    cusp_targets: list[dict[str, Any]] = []
+    lord_candidates: list[dict[str, Any]] = []
+    unavailable: list[dict[str, Any]] = []
+
+    if rashi_placidus.get("status") != "Pass":
+        return {
+            "status": "Unavailable",
+            "cusp_targets": [],
+            "lord_targets": [],
+            "suppressed_lord_roles": [],
+            "unavailable": [{
+                "reason": "Exact Lahiri Placidus cusps are unavailable."
+            }],
+        }
+
+    cusp_map = rashi_placidus.get("cusps", {})
+
+    for house_name, metadata in TARA_TARGETS.items():
+        cusp_longitude = cusp_map.get(
+            house_name,
+            {},
+        ).get("sidereal_longitude")
+
+        if not isinstance(cusp_longitude, (int, float)):
+            unavailable.append({
+                "target_type": "Cusp",
+                "house": house_name,
+                "reason": "Exact cusp longitude is unavailable.",
+            })
+        else:
+            cusp_targets.append({
+                "target_id": f"{house_name}_cusp",
+                "target_type": "Cusp",
+                "house": house_name,
+                "side": metadata["side"],
+                "role": metadata["role"],
+                "priority": metadata["priority"],
+                "priority_rank": metadata["priority_rank"],
+                "longitude": round(
+                    normalise_degrees(cusp_longitude),
+                    8,
+                ),
+            })
+
+        house_result = houses.get(house_name, {})
+        lord_name = extract_planet_name_from_result(
+            house_result.get("lord", {})
+        )
+
+        if not lord_name:
+            unavailable.append({
+                "target_type": "House lord",
+                "house": house_name,
+                "reason": "Could not parse the house lord.",
+            })
+            continue
+
+        planet_result = planets.get(lord_name)
+        lord_longitude = (
+            extract_total_degrees(
+                planet_result.get("sidereal_longitude", {})
+            )
+            if planet_result
+            else None
+        )
+
+        if lord_longitude is None:
+            unavailable.append({
+                "target_type": "House lord",
+                "house": house_name,
+                "planet": lord_name,
+                "reason": (
+                    "The exact house-lord longitude was not returned."
+                ),
+            })
+            continue
+
+        lord_candidates.append({
+            "target_id": f"{house_name}_lord_{lord_name}",
+            "target_type": "House lord",
+            "house": house_name,
+            "planet": lord_name,
+            "side": metadata["side"],
+            "role": metadata["role"],
+            "priority": metadata["priority"],
+            "priority_rank": metadata["priority_rank"],
+            "longitude": round(
+                normalise_degrees(lord_longitude),
+                8,
+            ),
+        })
+
+    lord_targets: list[dict[str, Any]] = []
+    suppressed: list[dict[str, Any]] = []
+
+    for planet_name in PLANETS:
+        roles = [
+            item
+            for item in lord_candidates
+            if item["planet"] == planet_name
+        ]
+
+        if not roles:
+            continue
+
+        roles = sorted(
+            roles,
+            key=lambda item: (
+                item["priority_rank"],
+                0 if item["house"] == "House1" else
+                1 if item["house"] == "House7" else
+                2 if item["house"] == "House10" else 3,
+            ),
+        )
+
+        winner = roles[0]
+        lord_targets.append(winner)
+
+        for suppressed_role in roles[1:]:
+            suppressed.append({
+                **suppressed_role,
+                "suppressed_by": winner["target_id"],
+                "reason": (
+                    "The same planet already represents a higher-priority "
+                    "Lagna role; the book gives Lagna lords priority over "
+                    "honour-house lords."
+                ),
+            })
+
+    status = "Pass" if not unavailable else "Partial"
+
+    return {
+        "status": status,
+        "cusp_targets": cusp_targets,
+        "lord_targets": lord_targets,
+        "suppressed_lord_roles": suppressed,
+        "unavailable": unavailable,
+    }
+
+
+def calculate_tara_contacts_for_targets(
+    targets: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Calculate all strict one-degree contacts and each target's nearest marker."""
+
+    qualifying: list[dict[str, Any]] = []
+    closest_by_target: dict[str, dict[str, Any]] = {}
+
+    for target in targets:
+        closest_candidate = None
+
+        for tara_index, tara in enumerate(TARA_CATALOG):
+            applies = (
+                tara.get("applies_to_cusps", False)
+                if target["target_type"] == "Cusp"
+                else tara.get("applies_to_lords", False)
+            )
+
+            if not applies:
+                continue
+
+            marker = distance_to_tara_marker(
+                target["longitude"],
+                tara,
+            )
+
+            if marker is None:
+                continue
+
+            contact = {
+                "catalog_index": tara_index,
+                "nakshatra": tara["nakshatra"],
+                "marker": tara["marker"],
+                "book_position": tara["book_position"],
+                "book_position_precision": (
+                    "Book-stated sidereal degree; some table values "
+                    "are explicitly rounded."
+                ),
+                "target_id": target["target_id"],
+                "target_type": target["target_type"],
+                "house": target["house"],
+                "planet": target.get("planet"),
+                "side": target["side"],
+                "role": target["role"],
+                "priority": target["priority"],
+                "priority_rank": target["priority_rank"],
+                "target_longitude": target["longitude"],
+                "nearest_marker_longitude": round(
+                    marker["nearest_marker_longitude"],
+                    8,
+                ),
+                "marker_type": marker["marker_type"],
+                "marker_range": marker.get("marker_range"),
+                "angular_distance": round(
+                    marker["distance"],
+                    8,
+                ),
+                "orb_limit": TARA_ORB_DEGREES,
+                "within_orb": (
+                    marker["distance"] <= TARA_ORB_DEGREES + 1e-9
+                ),
+                "orb_margin": round(
+                    TARA_ORB_DEGREES - marker["distance"],
+                    8,
+                ),
+                "book_effect": tara_effect_for_target(
+                    tara,
+                    target,
+                ),
+                "pdf_pages": tara["pdf_pages"],
+                "points_applied": False,
+            }
+
+            if (
+                closest_candidate is None
+                or contact["angular_distance"]
+                < closest_candidate["angular_distance"]
+            ):
+                closest_candidate = contact
+
+            if contact["within_orb"]:
+                qualifying.append(contact)
+
+        if closest_candidate is not None:
+            closest_by_target[target["target_id"]] = {
+                **closest_candidate,
+                "qualifies": closest_candidate["within_orb"],
+            }
+
+    qualifying.sort(
+        key=lambda item: (
+            item["priority_rank"],
+            0 if item["target_type"] == "House lord" else 1,
+            item["angular_distance"],
+            item["catalog_index"],
+        )
+    )
+
+    return qualifying, closest_by_target
+
+
+def compare_same_tara_sides(
+    qualifying_contacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Compare opposing-side contacts to the same tara.
+
+    Primary house-lord testimony outranks secondary house-lord testimony.
+    Where priority is equal, the closer conjunction wins. Cusp and house-lord
+    contacts are not mechanically ranked against each other.
+    """
+
+    comparisons: list[dict[str, Any]] = []
+
+    star_keys = sorted({
+        (
+            contact["nakshatra"],
+            contact["marker"],
+            contact["target_type"],
+        )
+        for contact in qualifying_contacts
+        if contact["book_effect"]["supports"] is not None
+    })
+
+    for nakshatra, marker, target_type in star_keys:
+        relevant = [
+            contact
+            for contact in qualifying_contacts
+            if contact["nakshatra"] == nakshatra
+            and contact["marker"] == marker
+            and contact["target_type"] == target_type
+            and contact["book_effect"]["supports"] is not None
+        ]
+
+        favourite = [
+            item for item in relevant
+            if item["side"] == "Favourite"
+        ]
+        underdog = [
+            item for item in relevant
+            if item["side"] == "Underdog"
+        ]
+
+        if not favourite or not underdog:
+            continue
+
+        best_favourite = min(
+            favourite,
+            key=lambda item: (
+                item["priority_rank"],
+                item["angular_distance"],
+            ),
+        )
+        best_underdog = min(
+            underdog,
+            key=lambda item: (
+                item["priority_rank"],
+                item["angular_distance"],
+            ),
+        )
+
+        if (
+            target_type == "House lord"
+            and best_favourite["priority_rank"]
+            != best_underdog["priority_rank"]
+        ):
+            winning_contact = min(
+                (best_favourite, best_underdog),
+                key=lambda item: item["priority_rank"],
+            )
+            comparison_rule = (
+                "Primary Lagna lord outranks secondary honour-house lord."
+            )
+            balanced = False
+        else:
+            difference = abs(
+                best_favourite["angular_distance"]
+                - best_underdog["angular_distance"]
+            )
+
+            if difference <= 1e-8:
+                winning_contact = None
+                comparison_rule = "Equal-priority contacts are equally close."
+                balanced = True
+            else:
+                winning_contact = min(
+                    (best_favourite, best_underdog),
+                    key=lambda item: item["angular_distance"],
+                )
+                comparison_rule = (
+                    "Equal-priority significators: the closer conjunction "
+                    "normally prevails."
+                )
+                balanced = False
+
+        comparisons.append({
+            "nakshatra": nakshatra,
+            "marker": marker,
+            "target_type": target_type,
+            "favourite_contact": best_favourite,
+            "underdog_contact": best_underdog,
+            "comparison_rule": comparison_rule,
+            "dominant_represented_side": (
+                winning_contact["side"]
+                if winning_contact
+                else None
+            ),
+            "dominant_supported_side": (
+                winning_contact["book_effect"]["supports"]
+                if winning_contact
+                else None
+            ),
+            "balanced": balanced,
+            "points_applied": False,
+        })
+
+    return comparisons
+
+
+def detect_aldebaran_antares_cancellation(
+    qualifying_contacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Flag the book's specific Aldebaran/Antares cusp cancellation."""
+
+    aldebaran = [
+        item for item in qualifying_contacts
+        if item["marker"] == "Aldebaran"
+        and item["target_type"] == "Cusp"
+    ]
+    antares = [
+        item for item in qualifying_contacts
+        if item["marker"] == "Antares"
+        and item["target_type"] == "Cusp"
+    ]
+
+    cancellations = []
+
+    for first in aldebaran:
+        for second in antares:
+            cancellations.append({
+                "markers": ["Aldebaran", "Antares"],
+                "contacts": [first, second],
+                "book_rule": (
+                    "When Aldebaran and Antares both sit on cusps, "
+                    "the book says they more or less nullify one another."
+                ),
+                "status": "Cancellation testimony",
+                "points_applied": False,
+            })
+
+    return cancellations
+
+
+def calculate_nakshatra_taras(
+    rashi_placidus: dict[str, Any],
+    houses: dict[str, dict[str, Any]],
+    planets: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Calculate the Chapter 8 rashi marker-star layer.
+
+    This intentionally does not inspect D9, because the book says not to use
+    taras in Navamsha. Appendix 3 Tara Balam is also kept unavailable unless
+    a verified natal Moon nakshatra is supplied outside the event-chart API.
+    """
+
+    targets = build_tara_targets(
+        rashi_placidus,
+        houses,
+        planets,
+    )
+
+    if targets["status"] == "Unavailable":
+        return {
+            "status": "Unavailable",
+            "method": "BookLockedChapter8NakshatraTaras",
+            "ayanamsa": "Lahiri",
+            "chart_layer": "Rashi only",
+            "targets": targets,
+            "qualifying_contacts": [],
+            "error": "Exact rashi targets were unavailable.",
+        }
+
+    combined_targets = (
+        targets["cusp_targets"] + targets["lord_targets"]
+    )
+    qualifying, closest = calculate_tara_contacts_for_targets(
+        combined_targets
+    )
+
+    same_tara_comparisons = compare_same_tara_sides(
+        qualifying
+    )
+    cancellations = detect_aldebaran_antares_cancellation(
+        qualifying
+    )
+
+    decision_contacts = [
+        contact
+        for contact in qualifying
+        if contact["book_effect"]["rule_status"].startswith(
+            "Book-defined"
+        )
+        and contact["book_effect"]["supports"] is not None
+    ]
+    contextual_contacts = [
+        contact
+        for contact in qualifying
+        if contact not in decision_contacts
+    ]
+
+    catalog_summary = [
+        {
+            "nakshatra": tara["nakshatra"],
+            "marker": tara["marker"],
+            "book_position": tara["book_position"],
+            "effect_class": tara["effect_class"],
+            "effect": tara["effect"],
+            "tier_hint": tara["tier_hint"],
+            "tested_on_cusps": tara["applies_to_cusps"],
+            "tested_on_house_lords": tara["applies_to_lords"],
+            "pdf_pages": tara["pdf_pages"],
+        }
+        for tara in TARA_CATALOG
+    ]
+
+    return {
+        "status": targets["status"],
+        "method": "BookLockedChapter8NakshatraTaras",
+        "book_chapter": 8,
+        "book_layer": "Nakshatra marker stars / yogataras",
+        "ayanamsa": "Lahiri",
+        "chart_layer": "Rashi only",
+        "navamsha_checked": False,
+        "navamsha_exclusion_reason": (
+            "Chapter 8 explicitly says not to use this tara technique "
+            "in Navamsha."
+        ),
+        "orb_policy": {
+            "sports_event_chart_degrees": TARA_ORB_DEGREES,
+            "strict_maximum": True,
+            "closer_is_stronger": True,
+        },
+        "position_policy": {
+            "source": "Gambler's Dharma Table 8.1 and Chapter 8 prose",
+            "precision": (
+                "Book-stated sidereal sign-degrees; the book notes "
+                "that some values are rounded."
+            ),
+            "dynamic_precession_applied": False,
+        },
+        "assignment_policy": {
+            "favourite": ["House1", "House10"],
+            "underdog": ["House7", "House4"],
+            "primary_lords": ["House1", "House7"],
+            "secondary_lords": ["House10", "House4"],
+            "same_planet_priority": (
+                "Lagna-lord role retained; secondary honour-lord "
+                "role suppressed."
+            ),
+            "same_star_equal_priority": "Closer conjunction normally prevails.",
+        },
+        "targets": targets,
+        "qualifying_contacts": qualifying,
+        "decision_contacts": decision_contacts,
+        "contextual_or_research_contacts": contextual_contacts,
+        "closest_marker_by_target": closest,
+        "same_tara_side_comparisons": same_tara_comparisons,
+        "cancellations": cancellations,
+        "catalog_summary": catalog_summary,
+        "appendix_3_tara_balam": {
+            "status": "Unavailable",
+            "reason": (
+                "Tara Balam requires a verified natal Moon nakshatra. "
+                "An event chart alone is insufficient."
+            ),
+            "fabricated": False,
+        },
+        "interpretation_applied": "Qualitative book direction only",
+        "points_applied": False,
+        "points_note": (
+            "No automatic signed points are assigned. Chapter 8 strength "
+            "depends on star quality, exact orb and competing testimony."
+        ),
+        "error": (
+            None
+            if targets["status"] == "Pass"
+            else (
+                "The tara layer ran, but one or more requested target "
+                "lords or cusps were unavailable."
+            )
+        ),
+    }
+
+
 # ============================================================
 # CONSISTENCY VALIDATION
 # ============================================================
@@ -4176,6 +5293,7 @@ def health() -> dict[str, Any]:
             "kp_sublords": True,
             "outer_planets": SWISSEPH_AVAILABLE,
             "gulika_upaketu": True,
+            "nakshatra_taras": True,
         },
         "outer_planet_engine": {
             "name": "pyswisseph",
@@ -4361,6 +5479,14 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         planets,
     )
 
+    # Chapter 8 fixed marker stars. Book-stated rashi degrees only;
+    # intentionally excluded from Navamsha.
+    nakshatra_taras = calculate_nakshatra_taras(
+        rashi_placidus,
+        houses,
+        planets,
+    )
+
     essential_results: list[dict[str, Any]] = [
         core["ayanamsa_degree"],
         core["lagna_sign"],
@@ -4470,6 +5596,7 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         "kp_sublords": kp_sublords,
         "outer_planets": outer_planets,
         "special_points": special_points,
+        "nakshatra_taras": nakshatra_taras,
         "houses": houses,
         "planets": planets,
         "provenance": {
@@ -4505,6 +5632,11 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
                 "Gulika and Upaketu exact Lahiri longitudes requested "
                 "from official VedAstro server calculators. Geometry "
                 "and book-supported contact labels are calculated locally."
+            ),
+            "nakshatra_taras": (
+                "Chapter 8 marker-star contacts calculated against exact "
+                "Lahiri rashi cusps and house-lord longitudes using the "
+                "book's stated sidereal degrees and strict one-degree orb."
             ),
             "vedastro_api_key": "stored only on Render",
             "minimum_call_interval_seconds": VEDASTRO_MIN_INTERVAL_SECONDS,
