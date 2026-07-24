@@ -34,7 +34,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.15.1"
+PROXY_VERSION = "1.16.0"
 
 
 # ============================================================
@@ -612,6 +612,120 @@ TIER1_PDF_PAGES = {
     "sky_pky": [55, 56, 57, 59, 60, 61, 173],
     "parivartana": [67, 68, 70],
     "planetary_war": [67, 68, 70],
+}
+
+
+# Gambler's Dharma Chapter 5, printed PDF pages 108-140.
+#
+# Table 5.3 gives the D9 1/7 cusp effects.
+# Table 5.4 gives the named D9 combinations.
+# Table 5.5 establishes the hierarchy:
+#   Tier 3 D9 cusp strength > Tier 2 rashi cusp/SKY/PKY >
+#   Tier 1 victory houses and D9 combinations.
+# Table 6.5 later values a Navamsha combination at 5 points.
+NAVAMSHA_INTERPRETATION_PDF_PAGES = {
+    "principle": [108, 109],
+    "cusp_method": [109, 112, 113, 114, 115, 116],
+    "combinations": [124, 126, 127],
+    "double_whammy": [131, 132],
+    "hierarchy": [136, 137, 140],
+    "points": [173, 174],
+}
+
+D9_COMBINATION_TABLE = {
+    frozenset(("Sun", "Ketu")): {
+        "effect": "Loss",
+        "rule_grade": "Table 5.4",
+        "automatic_points": 5.0,
+        "pdf_pages": [124, 126],
+    },
+    frozenset(("Venus", "Ketu")): {
+        "effect": "Win",
+        "rule_grade": "Table 5.4",
+        "automatic_points": 5.0,
+        "pdf_pages": [124, 126, 127],
+    },
+    frozenset(("Sun", "Jupiter")): {
+        "effect": "Loss",
+        "rule_grade": "Table 5.4",
+        "automatic_points": 5.0,
+        "pdf_pages": [124, 126],
+    },
+    frozenset(("Moon", "Rahu")): {
+        "effect": "Win",
+        "rule_grade": "Table 5.4",
+        "automatic_points": 5.0,
+        "pdf_pages": [124, 126],
+    },
+    frozenset(("Moon", "Saturn")): {
+        "effect": "Loss",
+        "rule_grade": "Table 5.4",
+        "automatic_points": 5.0,
+        "pdf_pages": [124, 126],
+    },
+    frozenset(("Venus", "Rahu")): {
+        "effect": "Loss",
+        "rule_grade": "Table 5.4",
+        "automatic_points": 5.0,
+        "pdf_pages": [124, 126],
+    },
+    frozenset(("Sun", "Saturn")): {
+        "effect": "Loss",
+        "rule_grade": "Explicit Chapter 5 text",
+        "automatic_points": 5.0,
+        "pdf_pages": [124],
+    },
+}
+
+# The author explicitly says these appear promising but need more study.
+# They are reported, not automatically scored.
+D9_RESEARCH_COMBINATIONS = {
+    frozenset(("Mars", "Saturn")): {
+        "effect": "Win",
+        "rule_grade": "Research tendency",
+        "automatic_points": 0.0,
+        "pdf_pages": [124],
+    },
+    frozenset(("Mars", "Jupiter")): {
+        "effect": "Win",
+        "rule_grade": "Research tendency",
+        "automatic_points": 0.0,
+        "pdf_pages": [124],
+    },
+}
+
+D9_COMBINATION_ALLOWED_PLANETS = {
+    "Sun",
+    "Moon",
+    "Mars",
+    "Mercury",
+    "Jupiter",
+    "Venus",
+    "Saturn",
+    "Rahu",
+    "Ketu",
+}
+
+D9_VISIBLE_CUSP_BODIES = {
+    "Sun",
+    "Moon",
+    "Mars",
+    "Mercury",
+    "Jupiter",
+    "Venus",
+    "Saturn",
+}
+
+D9_INVISIBLE_CUSP_BODIES = {
+    "Rahu",
+    "Ketu",
+    "Uranus",
+    "Neptune",
+    "Pluto",
+    "Ceres",
+    "Chiron",
+    "Gulika",
+    "Upaketu",
 }
 
 KP_COLUMN_WEIGHTS = {
@@ -6289,6 +6403,137 @@ def compact_tier1_combinations_layer(
     }, list_limit=24, string_limit=220)
 
 
+def compact_navamsha_interpretation_layer(
+    layer: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve every decision-bearing Chapter 5 result compactly."""
+
+    concise_d9_contacts = []
+
+    for contact in (layer.get("d9_cusp_contacts") or []):
+        effect = contact.get("book_effect", {})
+        concise_d9_contacts.append({
+            "body": contact.get("body"),
+            "category": contact.get("category"),
+            "cusp": contact.get("cusp"),
+            "angular_distance": contact.get(
+                "angular_distance"
+            ),
+            "orb_limit": contact.get("orb_limit"),
+            "motion": contact.get("motion"),
+            "direction": effect.get("direction"),
+            "supports": effect.get("supports"),
+            "reliability": effect.get("reliability"),
+            "book_point_range": effect.get(
+                "book_point_range"
+            ),
+            "exact_points_applied": False,
+        })
+
+    concise_d1_contacts = []
+
+    for contact in (layer.get("d1_cusp_contacts") or []):
+        effect = contact.get("book_effect", {})
+        concise_d1_contacts.append({
+            "body": contact.get("body"),
+            "category": contact.get("category"),
+            "cusp": contact.get("cusp"),
+            "effective_cusp": contact.get(
+                "effective_cusp"
+            ),
+            "angular_distance": contact.get(
+                "angular_distance"
+            ),
+            "direction": effect.get("direction"),
+            "supports": effect.get("supports"),
+            "stolen_type": effect.get("stolen_type"),
+            "contact_strength": effect.get(
+                "contact_strength"
+            ),
+        })
+
+    combos = layer.get("navamsha_combinations") or {}
+    combo_items = combos.get("combinations") or []
+    concise_combos = [
+        {
+            key: item.get(key)
+            for key in (
+                "planets",
+                "d9_house",
+                "represented_side",
+                "effect_for_represented_side",
+                "supports",
+                "rule_grade",
+                "book_points",
+                "signed_favourite_points",
+                "points_applied",
+                "manual_review_required",
+                "pdf_pages",
+            )
+            if key in item
+        }
+        for item in combo_items
+        if isinstance(item, dict)
+    ]
+
+    return compact_recursive({
+        "status": layer.get("status"),
+        "assignment": layer.get("assignment"),
+        "tier_hierarchy": layer.get("tier_hierarchy"),
+        "d9_cusp_contacts": concise_d9_contacts,
+        "d9_cusp_summary": layer.get(
+            "d9_cusp_summary"
+        ),
+        "navamsha_combinations": {
+            "status": combos.get("status"),
+            "houses": combos.get("houses"),
+            "combinations": concise_combos,
+            "signed_favourite_total": combos.get(
+                "signed_favourite_total"
+            ),
+            "indication": combos.get("indication"),
+            "unavailable_planets": combos.get(
+                "unavailable_planets",
+                [],
+            ),
+            "error": combos.get("error"),
+        },
+        "d1_cusp_contacts": concise_d1_contacts,
+        "d1_summary": layer.get("d1_summary"),
+        "d9_summary": layer.get("d9_summary"),
+        "d1_d9_relationship": layer.get(
+            "d1_d9_relationship"
+        ),
+        "double_whammy": layer.get("double_whammy"),
+        "signed_points": layer.get("signed_points"),
+        "unavailable_d9_bodies": layer.get(
+            "unavailable_d9_bodies",
+            [],
+        ),
+        "optional_body_coverage_status": layer.get(
+            "optional_body_coverage_status"
+        ),
+        "research_or_undefined_d9_contacts": [
+            {
+                "body": item.get("body"),
+                "cusp": item.get("cusp"),
+                "reason": item.get(
+                    "book_effect",
+                    {},
+                ).get("note"),
+            }
+            for item in layer.get(
+                "research_or_undefined_d9_contacts",
+                [],
+            )
+        ],
+        "completeness": layer.get("completeness"),
+        "pdf_pages": layer.get("pdf_pages"),
+        "points_applied": layer.get("points_applied"),
+        "error": layer.get("error"),
+    }, list_limit=20, string_limit=160)
+
+
 def compact_stolen_cusps_layer(
     layer: dict[str, Any],
 ) -> dict[str, Any]:
@@ -7651,6 +7896,11 @@ def action_compact_v2(
         "stolen_cusps": action_compact_stolen(
             compacted.get("stolen_cusps", {})
         ),
+        "navamsha_interpretation": (
+            compact_navamsha_interpretation_layer(
+                compacted.get("navamsha_interpretation", {})
+            )
+        ),
         "nakshatra_taras": action_compact_taras(
             compacted.get("nakshatra_taras", {})
         ),
@@ -7745,7 +7995,32 @@ def enforce_action_response_limit(
     if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
         return payload
 
-    # 4. Planet syllables are only secondary resonance evidence; the exact
+    # 4. D1 cusp rows are already represented by the D1 summary and the
+    # original cusp/stolen-cusp layers. Keep only the closest rows if needed.
+    nav_layer = payload.get(
+        "navamsha_interpretation",
+        {},
+    )
+    d1_rows = nav_layer.get("d1_cusp_contacts", [])
+
+    if isinstance(d1_rows, list) and len(d1_rows) > 6:
+        nav_layer["d1_cusp_contacts"] = (
+            d1_rows[:6]
+            + [{
+                "items_omitted_from_transport": (
+                    len(d1_rows) - 6
+                ),
+                "full_calculation_performed": True,
+            }]
+        )
+        payload["response_compaction"][
+            "secondary_d1_d9_rows_trimmed"
+        ] = True
+
+    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+        return payload
+
+    # 5. Planet syllables are only secondary resonance evidence; the exact
     # House 10 name test and all actual resonance matches stay present.
     payload.get(
         "navamsha_name_sounds",
@@ -7759,7 +8034,7 @@ def enforce_action_response_limit(
     if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
         return payload
 
-    # 5. Preserve the KP main comparison and first/seventh cusp evidence; the
+    # 6. Preserve the KP main comparison and first/seventh cusp evidence; the
     # full pointer array was calculated but is omitted from transport.
     payload.get(
         "kp_sublords",
@@ -7773,7 +8048,7 @@ def enforce_action_response_limit(
     if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
         return payload
 
-    # 6. Final bounded pass.
+    # 7. Final bounded pass.
     bounded = compact_recursive(
         payload,
         list_limit=6,
@@ -7794,7 +8069,7 @@ def enforce_action_response_limit(
     if bounded_size <= ACTION_RESPONSE_TARGET_CHARACTERS:
         return bounded
 
-    # 7. Hard transport ceiling. Every layer and every result summary remains,
+    # 8. Hard transport ceiling. Every layer and every result summary remains,
     # while repeated secondary arrays are represented by counts.
     for key in (
         "contextual_or_research_contacts",
@@ -7889,6 +8164,14 @@ def emergency_action_response(
                 "tier1_combinations",
                 {},
             ).get("status"),
+            "assignment": compacted.get(
+                "tier1_combinations",
+                {},
+            ).get("assignment"),
+            "ascendant": compacted.get(
+                "tier1_combinations",
+                {},
+            ).get("ascendant"),
             "victory_houses": compacted.get(
                 "tier1_combinations",
                 {},
@@ -8016,6 +8299,48 @@ def emergency_action_response(
                 {},
             ).get("error"),
         },
+        "navamsha_interpretation": {
+            "status": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("status"),
+            "d9_cusp_contacts": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("d9_cusp_contacts", []),
+            "navamsha_combinations": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("navamsha_combinations"),
+            "d1_summary": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("d1_summary"),
+            "d9_summary": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("d9_summary"),
+            "d1_d9_relationship": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("d1_d9_relationship"),
+            "double_whammy": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("double_whammy"),
+            "signed_points": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("signed_points"),
+            "completeness": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("completeness"),
+            "error": compacted.get(
+                "navamsha_interpretation",
+                {},
+            ).get("error"),
+        },
         "nakshatra_taras": {
             "status": tara.get("status"),
             "orb_policy": tara.get("orb_policy"),
@@ -8135,6 +8460,11 @@ def compact_action_response(
         ),
         "stolen_cusps": compact_stolen_cusps_layer(
             response.get("stolen_cusps", {})
+        ),
+        "navamsha_interpretation": (
+            compact_navamsha_interpretation_layer(
+                response.get("navamsha_interpretation", {})
+            )
         ),
         "nakshatra_taras": compact_tara_layer(
             response.get("nakshatra_taras", {})
@@ -9995,6 +10325,1601 @@ def calculate_tier1_combinations(
     }
 
 
+def opposite_contest_side(side: str | None) -> str | None:
+    if side == "Favourite":
+        return "Underdog"
+
+    if side == "Underdog":
+        return "Favourite"
+
+    return None
+
+
+def d9_house_for_longitude(
+    d9_longitude: float,
+    d9_lagna_longitude: float,
+) -> int:
+    """Place a D9 longitude in a whole-sign Navamsha house."""
+
+    return whole_sign_house_for_longitude(
+        d9_longitude,
+        d9_lagna_longitude,
+    )
+
+
+def d9_cusp_effect(
+    body_name: str,
+    cusp_name: str,
+    *,
+    motion: str | None = None,
+) -> dict[str, Any]:
+    """
+    Apply Table 5.3 and the adjacent Chapter 5 text to one D9 1/7 contact.
+
+    This function returns direction and the book's point range. It does not
+    fabricate one exact point value inside the 14-18 or 12-15 ranges.
+    """
+
+    represented_side = (
+        "Favourite"
+        if cusp_name == "D9Lagna"
+        else "Underdog"
+    )
+    opposing_side = opposite_contest_side(represented_side)
+    normalised_motion = (
+        motion.strip().lower()
+        if isinstance(motion, str)
+        else None
+    )
+
+    direction = "Uncertain"
+    effect = "Research/undefined"
+    supports = None
+    rule_status = "Not defined by book"
+    reliability = "Unavailable"
+    note = None
+
+    if body_name == "Sun":
+        direction = "Harms cusp side"
+        effect = "Burns the team; cautious and often low-scoring."
+        supports = opposing_side
+        rule_status = "Book-defined"
+        reliability = "Moderate"
+    elif body_name == "Moon":
+        direction = "Harms cusp side"
+        effect = "Lazy or unstable influence."
+        supports = opposing_side
+        rule_status = "Book-defined with research caution"
+        reliability = "Research caution"
+    elif body_name == "Mars":
+        direction = "Harms cusp side"
+        effect = "Frustration, anger and self-undoing."
+        supports = opposing_side
+        rule_status = "Book-defined"
+        reliability = "Strong"
+    elif body_name == "Rahu":
+        direction = "Supports cusp side"
+        effect = "Ambition and desire to win."
+        supports = represented_side
+        rule_status = "Book-defined"
+        reliability = "Reduced shadow-graha force"
+    elif body_name == "Jupiter":
+        direction = "Supports cusp side"
+        effect = "Grace, luck and a positive attitude."
+        supports = represented_side
+        rule_status = "Book-defined"
+        reliability = "Strong"
+    elif body_name == "Saturn":
+        direction = "Harms cusp side"
+        effect = "Restricts, slows and depresses the team."
+        supports = opposing_side
+        rule_status = "Book-defined"
+        reliability = "Strong"
+    elif body_name == "Mercury":
+        direction = "Supports cusp side"
+        effect = "Skill, speed and cleverness."
+        supports = represented_side
+        rule_status = "Book-defined"
+        reliability = "Strong"
+    elif body_name == "Ketu":
+        direction = "Harms cusp side"
+        effect = "Confusion and unusual circumstances leading to defeat."
+        supports = opposing_side
+        rule_status = "Book-defined"
+        reliability = "Reduced shadow-graha force"
+    elif body_name == "Venus":
+        direction = "Harms cusp side"
+        effect = "Laziness, complacency and inattention."
+        supports = opposing_side
+        rule_status = "Book-defined"
+        reliability = "Milder negative"
+    elif body_name == "Uranus":
+        if normalised_motion == "direct":
+            direction = "Supports cusp side"
+            effect = "Galvanizing positive current."
+            supports = represented_side
+            rule_status = "Book-defined"
+            reliability = "Research-sensitive outer planet"
+        elif normalised_motion == "retrograde":
+            direction = "Harms cusp side"
+            effect = "Retrograde current reverses the normal boost."
+            supports = opposing_side
+            rule_status = "Book-defined"
+            reliability = "Research-sensitive outer planet"
+        else:
+            direction = "Uncertain"
+            effect = "Stationary or unknown Uranus is not a clean signal."
+            supports = None
+            rule_status = "Book caution"
+            reliability = "Uncertain/kutila"
+    elif body_name == "Neptune":
+        if normalised_motion == "retrograde":
+            direction = "Supports cusp side"
+            effect = "Retrograde Neptune can inspire and push ahead."
+            supports = represented_side
+            rule_status = "Book-defined"
+            reliability = "Research-sensitive outer planet"
+        elif normalised_motion == "direct":
+            direction = "Harms cusp side"
+            effect = "Sleep, smoke and confusion."
+            supports = opposing_side
+            rule_status = "Book-defined"
+            reliability = "Research-sensitive outer planet"
+        else:
+            direction = "Uncertain"
+            effect = "Stationary or unknown Neptune is not a clean signal."
+            supports = None
+            rule_status = "Book caution"
+            reliability = "Uncertain/kutila"
+    elif body_name == "Pluto":
+        direction = "Harms cusp side"
+        effect = "Heaviness, intensity and misfortune."
+        supports = opposing_side
+        rule_status = "Book-defined with research caution"
+        reliability = "Research-sensitive outer planet"
+    elif body_name == "Upaketu":
+        direction = "Harms cusp side"
+        effect = "Acts like Ketu and spoils the represented team's luck."
+        supports = opposing_side
+        rule_status = "Book-defined"
+        reliability = "Invisible upagraha"
+    elif body_name == "Gulika":
+        direction = "Harms cusp side"
+        effect = "Indicates defeat for the represented side."
+        supports = opposing_side
+        rule_status = "Book-defined"
+        reliability = "Invisible upagraha"
+    elif body_name == "Chiron":
+        if normalised_motion == "retrograde":
+            direction = "Harms cusp side"
+            effect = (
+                "Retrograde Chiron is negative when a very tight D1 "
+                "contact transfers into D9."
+            )
+            supports = opposing_side
+            rule_status = "Book-defined double-whammy example"
+            reliability = "Transfer-only rule"
+        else:
+            note = (
+                "Chapter 5 does not give a standalone direct-Chiron D9 "
+                "cusp rule; do not infer one from Chapter 4."
+            )
+    elif body_name == "Ceres":
+        note = (
+            "Chapter 5 does not define a standalone Ceres D9 cusp effect."
+        )
+
+    invisible = body_name in D9_INVISIBLE_CUSP_BODIES
+    point_range = [12, 15] if invisible else [14, 18]
+
+    return {
+        "body": body_name,
+        "cusp": cusp_name,
+        "represented_side": represented_side,
+        "direction": direction,
+        "supports": supports,
+        "effect": effect,
+        "rule_status": rule_status,
+        "reliability": reliability,
+        "motion": motion,
+        "tier": 3,
+        "book_point_range": point_range,
+        "exact_points_applied": False,
+        "exact_point_reason": (
+            "The book gives a range and says orb tightness and planetary "
+            "quality require judgment; no exact value is invented."
+        ),
+        "pdf_pages": [112, 113, 114, 115, 116, 173],
+        "note": note,
+    }
+
+
+def d1_classical_cusp_effect(
+    body_name: str,
+    cusp_name: str,
+) -> dict[str, Any]:
+    """Apply the explicit Chapter 4 classical-planet cusp rule."""
+
+    metadata = SENSITIVE_CUSP_DETAILS.get(cusp_name)
+
+    if not metadata:
+        return {
+            "body": body_name,
+            "cusp": cusp_name,
+            "direction": "Undefined",
+            "supports": None,
+            "rule_status": "Cusp is outside the six primary axes.",
+        }
+
+    side = metadata["side"]
+    axis = metadata["axis"]
+    opposing_side = opposite_contest_side(side)
+    direction = "Uncertain"
+    supports = None
+    rule_status = "Not defined by book"
+    effect = "No automatic interpretation."
+
+    if body_name == "Sun":
+        direction = "Harms cusp side"
+        supports = opposing_side
+        rule_status = "Book-defined"
+        effect = "Burns every contacted cusp."
+    elif body_name == "Moon":
+        direction = "Harms cusp side"
+        supports = opposing_side
+        rule_status = "Book-defined with research caution"
+        effect = "Lazy and lacklustre influence."
+    elif body_name == "Mars":
+        if axis in {"1/7", "6/12"}:
+            direction = "Supports cusp side"
+            supports = side
+            rule_status = "Book-defined"
+            effect = "Galvanizes the team."
+        else:
+            direction = "Harms cusp side"
+            supports = opposing_side
+            rule_status = "Book-defined with research caution"
+            effect = "Mars appears negative on the 4/10 axis."
+    elif body_name == "Rahu":
+        direction = "Supports cusp side"
+        supports = side
+        rule_status = "Book-defined"
+        effect = "Force and ambition, but weaker than visible planets."
+    elif body_name == "Jupiter":
+        direction = "Supports cusp side"
+        supports = side
+        rule_status = "Book-defined"
+        effect = "Grants favour and victory."
+    elif body_name == "Saturn":
+        if axis == "1/7":
+            direction = "Harms cusp side"
+            supports = opposing_side
+            rule_status = "Book-defined"
+            effect = "Slows and handicaps the represented team."
+        else:
+            direction = "Supports cusp side"
+            supports = side
+            rule_status = "Book-defined"
+            effect = "Supports the 6/12 and 4/10 axes."
+    elif body_name == "Mercury":
+        if axis == "6/12":
+            direction = "Supports cusp side"
+            supports = side
+            rule_status = "Book-defined with research caution"
+            effect = "May be positive on the 6/12 axis."
+        else:
+            direction = "Uncertain"
+            supports = None
+            rule_status = "Book says further research is needed"
+            effect = "Judge Mercury through house rulership; not automatic."
+    elif body_name == "Ketu":
+        direction = "Harms cusp side"
+        supports = opposing_side
+        rule_status = "Book-defined"
+        effect = "Unilaterally negative on a cusp."
+    elif body_name == "Venus":
+        direction = "Supports cusp side"
+        supports = side
+        rule_status = "Book-defined"
+        effect = "Positive but mild influence."
+
+    return {
+        "body": body_name,
+        "cusp": cusp_name,
+        "axis": axis,
+        "represented_side": side,
+        "direction": direction,
+        "supports": supports,
+        "effect": effect,
+        "rule_status": rule_status,
+        "tier": 2,
+        "book_point_range": [7, 9],
+        "exact_points_applied": False,
+        "pdf_pages": [63, 64, 66, 67, 68, 72, 73],
+    }
+
+
+def d1_contact_effect(
+    body_name: str,
+    cusp_name: str,
+    *,
+    motion: str | None = None,
+    category: str = "Classical planet",
+) -> dict[str, Any]:
+    """Unify classical, outer and special-point Chapter 4 cusp effects."""
+
+    if category == "Outer planet":
+        effect = outer_contact_effect(
+            body_name,
+            cusp_name,
+            motion or "Unknown",
+        )
+        supports = None
+
+        if effect.get("direction") == "Supports":
+            supports = effect.get("represented_side")
+        elif effect.get("direction") == "Harms":
+            supports = opposite_contest_side(
+                effect.get("represented_side")
+            )
+
+        return {
+            **effect,
+            "supports": supports,
+            "tier": 2,
+            "book_point_range": [7, 7],
+            "exact_points_applied": False,
+            "pdf_pages": [68, 69, 70, 72, 73],
+        }
+
+    if category == "Special point":
+        effect = special_point_rashi_effect(
+            body_name,
+            cusp_name,
+        )
+        return {
+            **effect,
+            "body": body_name,
+            "tier": 2,
+            "book_point_range": [7, 7],
+            "exact_points_applied": False,
+            "pdf_pages": [68, 72, 73],
+        }
+
+    return d1_classical_cusp_effect(
+        body_name,
+        cusp_name,
+    )
+
+
+def collect_d9_axis_contacts(
+    navamsha_cusps: dict[str, Any],
+    outer_planets: dict[str, Any],
+    special_points: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Collect exact D9 1/7 contacts from every available body."""
+
+    if navamsha_cusps.get("status") not in {"Pass", "Partial"}:
+        return [], [{
+            "body": "All",
+            "reason": "Exact D9 geometry is unavailable.",
+        }]
+
+    lagna = navamsha_cusps.get("lagna", {})
+    seventh = navamsha_cusps.get("seventh_cusp", {})
+    lagna_longitude = lagna.get("d9_sidereal_longitude")
+    seventh_longitude = seventh.get("d9_sidereal_longitude")
+
+    if not isinstance(lagna_longitude, (int, float)):
+        return [], [{
+            "body": "All",
+            "reason": "D9 Lagna longitude is unavailable.",
+        }]
+
+    if not isinstance(seventh_longitude, (int, float)):
+        return [], [{
+            "body": "All",
+            "reason": "D9 seventh-cusp longitude is unavailable.",
+        }]
+
+    contacts: list[dict[str, Any]] = []
+    unavailable: list[dict[str, Any]] = []
+
+    for raw in navamsha_cusps.get("qualifying_contacts", []):
+        planet = raw.get("planet")
+        cusp = raw.get("cusp")
+
+        if not planet or cusp not in {"D9Lagna", "D9House7"}:
+            continue
+
+        effect = d9_cusp_effect(
+            planet,
+            cusp,
+        )
+        contacts.append({
+            "body": planet,
+            "category": "Classical planet",
+            "cusp": cusp,
+            "side": raw.get("side"),
+            "d9_longitude": raw.get(
+                "planet_d9_longitude"
+            ),
+            "cusp_d9_longitude": raw.get(
+                "cusp_d9_longitude"
+            ),
+            "angular_distance": raw.get(
+                "angular_distance"
+            ),
+            "orb_limit": raw.get("orb_limit"),
+            "rank_on_cusp": raw.get(
+                "rank_on_cusp"
+            ),
+            "book_effect": effect,
+        })
+
+    for body_name, body in outer_planets.get(
+        "bodies",
+        {},
+    ).items():
+        if body.get("status") != "Pass":
+            unavailable.append({
+                "body": body_name,
+                "category": "Outer planet",
+                "reason": body.get(
+                    "error",
+                    "Exact outer-body position is unavailable.",
+                ),
+            })
+            continue
+
+        d9_position = body.get("d9_position_raw", {})
+        d9_longitude = d9_position.get(
+            "d9_sidereal_longitude"
+        )
+
+        if not isinstance(d9_longitude, (int, float)):
+            unavailable.append({
+                "body": body_name,
+                "category": "Outer planet",
+                "reason": "Exact D9 longitude is unavailable.",
+            })
+            continue
+
+        for cusp_name, cusp_longitude in (
+            ("D9Lagna", lagna_longitude),
+            ("D9House7", seventh_longitude),
+        ):
+            distance = angular_distance(
+                float(d9_longitude),
+                float(cusp_longitude),
+            )
+
+            if distance > OUTER_CUSP_ORB_DEGREES + 1e-9:
+                continue
+
+            effect = d9_cusp_effect(
+                body_name,
+                cusp_name,
+                motion=body.get("motion"),
+            )
+            contacts.append({
+                "body": body_name,
+                "category": "Outer planet",
+                "cusp": cusp_name,
+                "side": (
+                    "Favourite"
+                    if cusp_name == "D9Lagna"
+                    else "Underdog"
+                ),
+                "d9_longitude": round(
+                    float(d9_longitude),
+                    8,
+                ),
+                "cusp_d9_longitude": round(
+                    float(cusp_longitude),
+                    8,
+                ),
+                "angular_distance": round(distance, 8),
+                "orb_limit": OUTER_CUSP_ORB_DEGREES,
+                "motion": body.get("motion"),
+                "book_effect": effect,
+            })
+
+    for raw in special_points.get(
+        "qualifying_d9_contacts",
+        [],
+    ):
+        point = raw.get("point")
+        cusp = raw.get("cusp")
+
+        if not point or cusp not in {"D9Lagna", "D9House7"}:
+            continue
+
+        effect = d9_cusp_effect(
+            point,
+            cusp,
+        )
+        contacts.append({
+            "body": point,
+            "category": "Special point",
+            "cusp": cusp,
+            "side": (
+                "Favourite"
+                if cusp == "D9Lagna"
+                else "Underdog"
+            ),
+            "d9_longitude": raw.get(
+                "point_d9_longitude"
+            ),
+            "cusp_d9_longitude": raw.get(
+                "cusp_d9_longitude"
+            ),
+            "angular_distance": raw.get(
+                "angular_distance"
+            ),
+            "orb_limit": raw.get("orb_limit"),
+            "book_effect": effect,
+        })
+
+    contacts.sort(
+        key=lambda item: (
+            0 if item["cusp"] == "D9Lagna" else 1,
+            float(item.get("angular_distance") or 999),
+            PLANET_ORDER.get(item["body"], 999),
+            item["body"],
+        )
+    )
+
+    return contacts, unavailable
+
+
+def calculate_d9_combinations(
+    navamsha_cusps: dict[str, Any],
+) -> dict[str, Any]:
+    """Detect the Chapter 5 combinations in D9 House 1 and House 7."""
+
+    if navamsha_cusps.get("status") not in {"Pass", "Partial"}:
+        return {
+            "status": "Unavailable",
+            "method": "Chapter5NavamshaCombinations",
+            "book_tier": 1,
+            "houses": {},
+            "combinations": [],
+            "signed_favourite_total": 0.0,
+            "error": "Exact D9 geometry is unavailable.",
+        }
+
+    lagna = navamsha_cusps.get("lagna", {})
+    lagna_longitude = lagna.get("d9_sidereal_longitude")
+
+    if not isinstance(lagna_longitude, (int, float)):
+        return {
+            "status": "Unavailable",
+            "method": "Chapter5NavamshaCombinations",
+            "book_tier": 1,
+            "houses": {},
+            "combinations": [],
+            "signed_favourite_total": 0.0,
+            "error": "D9 Lagna longitude is unavailable.",
+        }
+
+    occupancy: dict[int, list[str]] = {
+        1: [],
+        7: [],
+    }
+    unavailable_planets: list[str] = []
+
+    for planet_name in D9_COMBINATION_ALLOWED_PLANETS:
+        position = navamsha_cusps.get(
+            "planets",
+            {},
+        ).get(planet_name)
+
+        if not isinstance(position, dict):
+            unavailable_planets.append(planet_name)
+            continue
+
+        longitude = position.get("d9_sidereal_longitude")
+
+        if not isinstance(longitude, (int, float)):
+            unavailable_planets.append(planet_name)
+            continue
+
+        house = d9_house_for_longitude(
+            float(longitude),
+            float(lagna_longitude),
+        )
+
+        if house in occupancy:
+            occupancy[house].append(planet_name)
+
+    for planet_list in occupancy.values():
+        planet_list.sort(
+            key=lambda name: PLANET_ORDER.get(name, 999)
+        )
+
+    combinations: list[dict[str, Any]] = []
+    signed_total = 0.0
+
+    for house_number, planet_list in occupancy.items():
+        side = (
+            "Favourite"
+            if house_number == 1
+            else "Underdog"
+        )
+        opposing_side = opposite_contest_side(side)
+
+        for first_index, first_name in enumerate(planet_list):
+            for second_name in planet_list[first_index + 1:]:
+                pair = frozenset((first_name, second_name))
+                rule = D9_COMBINATION_TABLE.get(pair)
+                research_rule = D9_RESEARCH_COMBINATIONS.get(pair)
+                selected_rule = rule or research_rule
+
+                if selected_rule:
+                    effect = selected_rule["effect"]
+                    supports = (
+                        side
+                        if effect == "Win"
+                        else opposing_side
+                    )
+                    points = float(
+                        selected_rule["automatic_points"]
+                    )
+                    signed_points = (
+                        points
+                        if supports == "Favourite"
+                        else -points
+                    )
+                    signed_total += signed_points
+
+                    combinations.append({
+                        "planets": sorted(
+                            pair,
+                            key=lambda name: (
+                                PLANET_ORDER.get(name, 999),
+                                name,
+                            ),
+                        ),
+                        "d9_house": f"House{house_number}",
+                        "represented_side": side,
+                        "effect_for_represented_side": effect,
+                        "supports": supports,
+                        "rule_grade": selected_rule[
+                            "rule_grade"
+                        ],
+                        "book_points": points,
+                        "signed_favourite_points": round(
+                            signed_points,
+                            2,
+                        ),
+                        "points_applied": points > 0,
+                        "pdf_pages": selected_rule[
+                            "pdf_pages"
+                        ],
+                    })
+                    continue
+
+                # General textual tendencies are reported but not scored.
+                if "Sun" in pair:
+                    effect = "Loss tendency"
+                    supports = opposing_side
+                    tendency = "General Sun-combination tendency"
+                elif "Moon" in pair:
+                    effect = "Win tendency"
+                    supports = side
+                    tendency = "General Moon-combination tendency"
+                else:
+                    continue
+
+                combinations.append({
+                    "planets": sorted(
+                        pair,
+                        key=lambda name: (
+                            PLANET_ORDER.get(name, 999),
+                            name,
+                        ),
+                    ),
+                    "d9_house": f"House{house_number}",
+                    "represented_side": side,
+                    "effect_for_represented_side": effect,
+                    "supports": supports,
+                    "rule_grade": tendency,
+                    "book_points": 0.0,
+                    "signed_favourite_points": 0.0,
+                    "points_applied": False,
+                    "manual_review_required": True,
+                    "pdf_pages": [124],
+                })
+
+    side_summaries: dict[str, Any] = {}
+
+    for side, house_number in (
+        ("Favourite", 1),
+        ("Underdog", 7),
+    ):
+        relevant = [
+            item
+            for item in combinations
+            if item["d9_house"] == f"House{house_number}"
+        ]
+        applied = [
+            item
+            for item in relevant
+            if item.get("points_applied")
+        ]
+
+        side_summaries[side] = {
+            "house": f"House{house_number}",
+            "occupants": occupancy[house_number],
+            "combination_count": len(relevant),
+            "scored_combination_count": len(applied),
+            "supports_favourite_count": sum(
+                1
+                for item in relevant
+                if item.get("supports") == "Favourite"
+            ),
+            "supports_underdog_count": sum(
+                1
+                for item in relevant
+                if item.get("supports") == "Underdog"
+            ),
+        }
+
+    if signed_total > 0:
+        indication = "Favourite"
+    elif signed_total < 0:
+        indication = "Underdog"
+    elif combinations:
+        indication = "Balanced or conflicting combinations"
+    else:
+        indication = "No listed combination"
+
+    return {
+        "status": (
+            "Pass"
+            if not unavailable_planets
+            else "Partial"
+        ),
+        "method": "Chapter5NavamshaCombinations",
+        "book_chapter": 5,
+        "book_tier": 1,
+        "house_system": "D9 whole-sign House1 and House7",
+        "invisible_body_policy": (
+            "Rahu and Ketu are included. Other invisible bodies "
+            "are excluded from the combination technique."
+        ),
+        "houses": side_summaries,
+        "combinations": combinations,
+        "signed_favourite_total": round(
+            signed_total,
+            2,
+        ),
+        "indication": indication,
+        "overlapping_pair_warning": (
+            "When three or more planets share a D9 house, pairwise "
+            "combinations can overlap. The response lists every pair "
+            "instead of silently collapsing contradictory testimony."
+        ),
+        "unavailable_planets": sorted(
+            set(unavailable_planets),
+            key=lambda name: PLANET_ORDER.get(name, 999),
+        ),
+        "pdf_pages": [124, 126, 127, 173],
+        "error": (
+            None
+            if not unavailable_planets
+            else "One or more requested D9 planet positions were unavailable."
+        ),
+    }
+
+
+def stolen_contact_lookup(
+    stolen_cusps: dict[str, Any],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    lookup: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for item in stolen_cusps.get(
+        "qualifying_contacts",
+        [],
+    ):
+        body = item.get("body")
+        cusp = item.get("cusp")
+
+        if body and cusp:
+            lookup[(body, cusp)] = item
+
+    return lookup
+
+
+def interpret_stolen_contact(
+    effect: dict[str, Any],
+    stolen: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Apply the Chapter 4 stolen-cusp transformation to one body effect."""
+
+    if not stolen:
+        return {
+            **effect,
+            "stolen_cusp_applied": False,
+            "contact_strength": "Normal",
+        }
+
+    stolen_effect = stolen.get("book_effect", {})
+    stolen_type = stolen.get("stolen_type")
+    effective_side = stolen_effect.get(
+        "effective_represented_side"
+    )
+
+    if stolen_type == "Power-to-neutral":
+        return {
+            **effect,
+            "supports_before_stolen_cusp": effect.get("supports"),
+            "supports": None,
+            "stolen_cusp_applied": True,
+            "stolen_type": stolen_type,
+            "contact_strength": "Significantly reduced",
+            "transformation": "Weakened",
+            "automatic_decision_use": False,
+        }
+
+    if stolen_type in {
+        "Power-to-power",
+        "Neutral-to-power",
+    } and effective_side:
+        direction = effect.get("direction")
+
+        if direction in {
+            "Supports cusp side",
+            "Supports",
+        }:
+            supports = effective_side
+        elif direction in {
+            "Harms cusp side",
+            "Harms",
+        }:
+            supports = opposite_contest_side(
+                effective_side
+            )
+        else:
+            supports = None
+
+        return {
+            **effect,
+            "supports_before_stolen_cusp": effect.get("supports"),
+            "supports": supports,
+            "stolen_cusp_applied": True,
+            "stolen_type": stolen_type,
+            "contact_strength": "Transferred",
+            "effective_represented_side": effective_side,
+            "effective_power_house": stolen_effect.get(
+                "effective_power_house"
+            ),
+            "transformation": stolen_effect.get(
+                "transformation"
+            ),
+        }
+
+    return {
+        **effect,
+        "stolen_cusp_applied": True,
+        "stolen_type": stolen_type,
+        "contact_strength": "Unscored",
+    }
+
+
+def collect_d1_directional_contacts(
+    planet_cusp_contacts: dict[str, Any],
+    outer_planets: dict[str, Any],
+    special_points: dict[str, Any],
+    stolen_cusps: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Interpret all available Chapter 4 D1 cusp contacts."""
+
+    lookup = stolen_contact_lookup(stolen_cusps)
+    contacts: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for raw in planet_cusp_contacts.get(
+        "qualifying_contacts",
+        [],
+    ):
+        body = raw.get("planet")
+        cusp = raw.get("cusp")
+
+        if not body or cusp not in SENSITIVE_CUSP_DETAILS:
+            continue
+
+        effect = d1_contact_effect(
+            body,
+            cusp,
+            category="Classical planet",
+        )
+        effect = interpret_stolen_contact(
+            effect,
+            lookup.get((body, cusp)),
+        )
+        contacts.append({
+            "body": body,
+            "category": "Classical planet",
+            "cusp": cusp,
+            "axis": raw.get("axis"),
+            "represented_side": raw.get("side"),
+            "angular_distance": raw.get(
+                "angular_distance"
+            ),
+            "orb_limit": raw.get("orb_limit"),
+            "book_effect": effect,
+        })
+        seen.add((body, cusp))
+
+    for raw in outer_planets.get(
+        "qualifying_contacts",
+        [],
+    ):
+        body = raw.get("body")
+        cusp = raw.get("cusp")
+
+        if not body or cusp not in SENSITIVE_CUSP_DETAILS:
+            continue
+
+        motion = raw.get("motion")
+        effect = d1_contact_effect(
+            body,
+            cusp,
+            motion=motion,
+            category="Outer planet",
+        )
+        effect = interpret_stolen_contact(
+            effect,
+            lookup.get((body, cusp)),
+        )
+        contacts.append({
+            "body": body,
+            "category": "Outer planet",
+            "cusp": cusp,
+            "axis": raw.get("axis"),
+            "represented_side": raw.get("side"),
+            "angular_distance": raw.get(
+                "angular_distance"
+            ),
+            "orb_limit": raw.get("orb_limit"),
+            "motion": motion,
+            "book_effect": effect,
+        })
+        seen.add((body, cusp))
+
+    for raw in special_points.get(
+        "qualifying_rashi_contacts",
+        [],
+    ):
+        body = raw.get("point")
+        cusp = raw.get("cusp")
+
+        if not body or cusp not in SENSITIVE_CUSP_DETAILS:
+            continue
+
+        effect = d1_contact_effect(
+            body,
+            cusp,
+            category="Special point",
+        )
+        effect = interpret_stolen_contact(
+            effect,
+            lookup.get((body, cusp)),
+        )
+        contacts.append({
+            "body": body,
+            "category": "Special point",
+            "cusp": cusp,
+            "axis": raw.get("axis"),
+            "represented_side": raw.get("side"),
+            "angular_distance": raw.get(
+                "angular_distance"
+            ),
+            "orb_limit": raw.get("orb_limit"),
+            "book_effect": effect,
+        })
+        seen.add((body, cusp))
+
+    # Add neutral-to-power contacts that are absent from the six-cusp raw
+    # geometry layer. The stolen-cusp result already verified their exact orb.
+    for raw in stolen_cusps.get(
+        "qualifying_contacts",
+        [],
+    ):
+        body = raw.get("body")
+        source_cusp = raw.get("cusp")
+        stolen_type = raw.get("stolen_type")
+
+        if (
+            not body
+            or not source_cusp
+            or (body, source_cusp) in seen
+            or stolen_type != "Neutral-to-power"
+        ):
+            continue
+
+        effective_house = raw.get(
+            "whole_sign_house_number"
+        )
+        effective_cusp = (
+            f"House{effective_house}"
+            if isinstance(effective_house, int)
+            else None
+        )
+
+        if effective_cusp not in SENSITIVE_CUSP_DETAILS:
+            continue
+
+        category = raw.get(
+            "body_category",
+            "Classical planet",
+        )
+        motion = raw.get("body_motion")
+        effect = d1_contact_effect(
+            body,
+            effective_cusp,
+            motion=motion,
+            category=category,
+        )
+        effect = interpret_stolen_contact(
+            effect,
+            raw,
+        )
+
+        contacts.append({
+            "body": body,
+            "category": category,
+            "cusp": source_cusp,
+            "effective_cusp": effective_cusp,
+            "axis": SENSITIVE_CUSP_DETAILS[
+                effective_cusp
+            ]["axis"],
+            "represented_side": SENSITIVE_CUSP_DETAILS[
+                effective_cusp
+            ]["side"],
+            "angular_distance": raw.get(
+                "angular_distance"
+            ),
+            "orb_limit": raw.get("orb_limit"),
+            "motion": motion,
+            "book_effect": effect,
+        })
+
+    contacts.sort(
+        key=lambda item: (
+            float(item.get("angular_distance") or 999),
+            item.get("cusp") or "",
+            item.get("body") or "",
+        )
+    )
+
+    return contacts
+
+
+def directional_summary(
+    indicators: list[dict[str, Any]],
+) -> dict[str, Any]:
+    decisive = [
+        item
+        for item in indicators
+        if item.get("supports") in {
+            "Favourite",
+            "Underdog",
+        }
+    ]
+    favourite_count = sum(
+        1
+        for item in decisive
+        if item.get("supports") == "Favourite"
+    )
+    underdog_count = sum(
+        1
+        for item in decisive
+        if item.get("supports") == "Underdog"
+    )
+
+    if favourite_count and not underdog_count:
+        direction = "Favourite"
+    elif underdog_count and not favourite_count:
+        direction = "Underdog"
+    elif favourite_count and underdog_count:
+        direction = "Mixed"
+    else:
+        direction = "None"
+
+    return {
+        "direction": direction,
+        "favourite_indicator_count": favourite_count,
+        "underdog_indicator_count": underdog_count,
+        "uncertain_or_weakened_count": (
+            len(indicators) - len(decisive)
+        ),
+        "indicator_count": len(indicators),
+    }
+
+
+def tier1_yoga_indicators(
+    tier1_combinations: dict[str, Any],
+) -> list[dict[str, Any]]:
+    indicators: list[dict[str, Any]] = []
+    sides = tier1_combinations.get(
+        "sky_pky",
+        {},
+    ).get("sides", {})
+
+    for side, result in sides.items():
+        sky = result.get("sky", {})
+        pky = result.get("pky", {})
+
+        if sky.get("formed"):
+            indicators.append({
+                "source": "SKY",
+                "tier": 2,
+                "represented_side": side,
+                "supports": side,
+                "condition": sky.get("condition"),
+            })
+
+        if pky.get("formed"):
+            indicators.append({
+                "source": "PKY",
+                "tier": 2,
+                "represented_side": side,
+                "supports": opposite_contest_side(side),
+                "condition": pky.get("condition"),
+            })
+
+    return indicators
+
+
+def find_double_whammy_contacts(
+    d1_contacts: list[dict[str, Any]],
+    d9_contacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Find the same body on corresponding D1 and D9 1/7 cusps."""
+
+    results: list[dict[str, Any]] = []
+
+    for d1 in d1_contacts:
+        d1_cusp = d1.get("cusp")
+
+        if d1_cusp not in {"House1", "House7"}:
+            continue
+
+        expected_d9 = (
+            "D9Lagna"
+            if d1_cusp == "House1"
+            else "D9House7"
+        )
+
+        for d9 in d9_contacts:
+            if (
+                d1.get("body") != d9.get("body")
+                or d9.get("cusp") != expected_d9
+            ):
+                continue
+
+            d1_supports = d1.get(
+                "book_effect",
+                {},
+            ).get("supports")
+            d9_supports = d9.get(
+                "book_effect",
+                {},
+            ).get("supports")
+
+            if (
+                d1_supports
+                and d9_supports
+                and d1_supports == d9_supports
+            ):
+                relationship = "Reinforcing double whammy"
+                supports = d1_supports
+            elif d1_supports and d9_supports:
+                relationship = (
+                    "Same-body D1/D9 contradiction"
+                )
+                supports = None
+            else:
+                relationship = (
+                    "Geometric transfer; effect requires manual review"
+                )
+                supports = d1_supports or d9_supports
+
+            results.append({
+                "body": d1.get("body"),
+                "d1_cusp": d1_cusp,
+                "d1_distance": d1.get(
+                    "angular_distance"
+                ),
+                "d9_cusp": expected_d9,
+                "d9_distance": d9.get(
+                    "angular_distance"
+                ),
+                "d1_supports": d1_supports,
+                "d9_supports": d9_supports,
+                "relationship": relationship,
+                "supports": supports,
+                "pdf_pages": [131, 132],
+                "points_applied": False,
+            })
+
+    return results
+
+
+def strongest_d1_direction(
+    tier1_combinations: dict[str, Any],
+    d1_contacts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    cusp_indicators = []
+
+    for contact in d1_contacts:
+        effect = contact.get("book_effect", {})
+        cusp_indicators.append({
+            "source": "Rashi cusp",
+            "body": contact.get("body"),
+            "cusp": contact.get("cusp"),
+            "tier": 2,
+            "supports": effect.get("supports"),
+            "contact_strength": effect.get(
+                "contact_strength",
+                "Normal",
+            ),
+        })
+
+    yoga_indicators = tier1_yoga_indicators(
+        tier1_combinations
+    )
+    tier2_indicators = cusp_indicators + yoga_indicators
+    tier2_summary = directional_summary(
+        tier2_indicators
+    )
+
+    if tier2_summary["direction"] in {
+        "Favourite",
+        "Underdog",
+        "Mixed",
+    }:
+        return {
+            "direction": tier2_summary["direction"],
+            "deciding_tier": 2,
+            "source": "Rashi cusp and SKY/PKY testimony",
+            "tier2_summary": tier2_summary,
+            "tier1_signed_total": tier1_combinations.get(
+                "automatic_signed_total"
+            ),
+        }
+
+    signed_total = tier1_combinations.get(
+        "automatic_signed_total"
+    )
+
+    if isinstance(signed_total, (int, float)):
+        if signed_total > 0:
+            direction = "Favourite"
+        elif signed_total < 0:
+            direction = "Underdog"
+        else:
+            direction = "Balanced"
+    else:
+        direction = "None"
+
+    return {
+        "direction": direction,
+        "deciding_tier": 1 if direction != "None" else None,
+        "source": "Victory-house signed total",
+        "tier2_summary": tier2_summary,
+        "tier1_signed_total": signed_total,
+    }
+
+
+def strongest_d9_direction(
+    d9_contacts: list[dict[str, Any]],
+    combinations: dict[str, Any],
+) -> dict[str, Any]:
+    cusp_indicators = [
+        {
+            "source": "D9 cusp",
+            "body": contact.get("body"),
+            "cusp": contact.get("cusp"),
+            "tier": 3,
+            "supports": contact.get(
+                "book_effect",
+                {},
+            ).get("supports"),
+        }
+        for contact in d9_contacts
+    ]
+    cusp_summary = directional_summary(
+        cusp_indicators
+    )
+
+    if cusp_summary["direction"] in {
+        "Favourite",
+        "Underdog",
+        "Mixed",
+    }:
+        return {
+            "direction": cusp_summary["direction"],
+            "deciding_tier": 3,
+            "source": "D9 1/7 cusp testimony",
+            "cusp_summary": cusp_summary,
+            "combination_signed_total": combinations.get(
+                "signed_favourite_total"
+            ),
+        }
+
+    combo_total = combinations.get(
+        "signed_favourite_total"
+    )
+
+    if isinstance(combo_total, (int, float)):
+        if combo_total > 0:
+            direction = "Favourite"
+        elif combo_total < 0:
+            direction = "Underdog"
+        elif combinations.get("combinations"):
+            direction = "Balanced"
+        else:
+            direction = "None"
+    else:
+        direction = "None"
+
+    return {
+        "direction": direction,
+        "deciding_tier": 1 if direction != "None" else None,
+        "source": "D9 combinations",
+        "cusp_summary": cusp_summary,
+        "combination_signed_total": combo_total,
+    }
+
+
+def compare_d1_d9_hierarchy(
+    d1_summary: dict[str, Any],
+    d9_summary: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the book's tier hierarchy without flattening all testimony."""
+
+    d1_direction = d1_summary.get("direction")
+    d9_direction = d9_summary.get("direction")
+    d1_tier = d1_summary.get("deciding_tier")
+    d9_tier = d9_summary.get("deciding_tier")
+    sides = {"Favourite", "Underdog"}
+
+    if d9_direction in sides and d1_direction in sides:
+        if d9_direction == d1_direction:
+            relationship = "Reinforcement"
+            hierarchy_direction = d9_direction
+            rule = "D9 confirms the D1 direction."
+        elif d9_tier == 3:
+            relationship = "Tier 3 reversal"
+            hierarchy_direction = d9_direction
+            rule = (
+                "D9 cusp testimony opposes and outranks the lower D1 "
+                "direction."
+            )
+        elif (
+            d9_tier == 1
+            and isinstance(d1_tier, int)
+            and d1_tier > d9_tier
+        ):
+            relationship = (
+                "Contradiction; higher-tier D1 testimony retains priority"
+            )
+            hierarchy_direction = d1_direction
+            rule = (
+                "A Tier 1 D9 combination does not overrule Tier 2 "
+                "rashi testimony."
+            )
+        else:
+            relationship = "Same-tier contradiction"
+            hierarchy_direction = "Balanced"
+            rule = "Neither side receives a hierarchy advantage."
+    elif d9_direction in sides:
+        relationship = "D9 establishes direction"
+        hierarchy_direction = d9_direction
+        rule = "D1 is balanced, absent or mixed."
+    elif d9_direction == "Mixed":
+        relationship = "D9 cancellation"
+        hierarchy_direction = (
+            d1_direction
+            if d1_direction in sides
+            else "Balanced"
+        )
+        rule = "Opposing Tier 3 contacts cancel at the D9 level."
+    elif d1_direction in sides:
+        relationship = "D1 unconfirmed by D9"
+        hierarchy_direction = d1_direction
+        rule = "No decisive D9 testimony is present."
+    elif d1_direction == "Mixed":
+        relationship = "D1 mixed; D9 not decisive"
+        hierarchy_direction = "Balanced"
+        rule = "The chart remains contradictory."
+    else:
+        relationship = "No directional relationship"
+        hierarchy_direction = "Balanced"
+        rule = "Neither chart supplies decisive directional testimony."
+
+    return {
+        "relationship": relationship,
+        "d1_direction": d1_direction,
+        "d1_deciding_tier": d1_tier,
+        "d9_direction": d9_direction,
+        "d9_deciding_tier": d9_tier,
+        "hierarchy_direction": hierarchy_direction,
+        "rule": rule,
+        "pdf_pages": [108, 109, 136, 137, 140],
+        "points_applied": False,
+    }
+
+
+def calculate_navamsha_interpretation(
+    navamsha_cusps: dict[str, Any],
+    tier1_combinations: dict[str, Any],
+    planet_cusp_contacts: dict[str, Any],
+    outer_planets: dict[str, Any],
+    special_points: dict[str, Any],
+    stolen_cusps: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Complete the Chapter 5 contest layer:
+    - D9 1/7 cusp effects
+    - D9 House1/House7 combinations
+    - D1/D9 reinforcement or reversal
+    - same-body double-whammy transfer
+    """
+
+    combinations = calculate_d9_combinations(
+        navamsha_cusps
+    )
+    d9_contacts, unavailable_d9_bodies = (
+        collect_d9_axis_contacts(
+            navamsha_cusps,
+            outer_planets,
+            special_points,
+        )
+    )
+    d1_contacts = collect_d1_directional_contacts(
+        planet_cusp_contacts,
+        outer_planets,
+        special_points,
+        stolen_cusps,
+    )
+    double_whammy = find_double_whammy_contacts(
+        d1_contacts,
+        d9_contacts,
+    )
+    d1_summary = strongest_d1_direction(
+        tier1_combinations,
+        d1_contacts,
+    )
+    d9_summary = strongest_d9_direction(
+        d9_contacts,
+        combinations,
+    )
+    hierarchy = compare_d1_d9_hierarchy(
+        d1_summary,
+        d9_summary,
+    )
+
+    failed_d9_effects = [
+        contact
+        for contact in d9_contacts
+        if contact.get(
+            "book_effect",
+            {},
+        ).get("supports") is None
+    ]
+
+    if navamsha_cusps.get("status") == "Fail":
+        status = "Fail"
+        error = "Exact D9 geometry failed validation."
+    elif navamsha_cusps.get("status") not in {
+        "Pass",
+        "Partial",
+    }:
+        status = "Unavailable"
+        error = "Exact D9 geometry is unavailable."
+    elif combinations.get("status") == "Partial":
+        status = "Partial"
+        error = (
+            "One or more requested classical D9 planet positions were "
+            "unavailable."
+        )
+    else:
+        status = "Pass"
+        error = None
+
+    return {
+        "status": status,
+        "method": "BookLockedChapter5NavamshaInterpretation",
+        "book_chapter": 5,
+        "ayanamsa": "Lahiri",
+        "assignment": {
+            "D9Lagna": "Favourite",
+            "D9House7": "Underdog",
+        },
+        "tier_hierarchy": {
+            "Tier3": "D9 1/7 cusp strength",
+            "Tier2": "Rashi cusp strength and SKY/PKY",
+            "Tier1": "Victory houses and D9 combinations",
+        },
+        "d9_cusp_contacts": d9_contacts,
+        "d9_cusp_summary": directional_summary([
+            {
+                "supports": contact.get(
+                    "book_effect",
+                    {},
+                ).get("supports")
+            }
+            for contact in d9_contacts
+        ]),
+        "navamsha_combinations": combinations,
+        "d1_cusp_contacts": d1_contacts,
+        "d1_summary": d1_summary,
+        "d9_summary": d9_summary,
+        "d1_d9_relationship": hierarchy,
+        "double_whammy": {
+            "detected": bool(double_whammy),
+            "contacts": double_whammy,
+            "definition": (
+                "The same body is within orb of the corresponding D1 "
+                "and D9 1/7 cusps."
+            ),
+            "pdf_pages": [131, 132],
+        },
+        "signed_points": {
+            "navamsha_combination_total": combinations.get(
+                "signed_favourite_total",
+                0.0,
+            ),
+            "d9_cusp_exact_total": None,
+            "d9_cusp_exact_total_reason": (
+                "The book gives 14-18 for visible and 12-15 for "
+                "invisible D9 cusp contacts but leaves the exact value "
+                "to orb and contextual judgment."
+            ),
+        },
+        "unavailable_d9_bodies": unavailable_d9_bodies,
+        "optional_body_coverage_status": (
+            "Pass"
+            if not unavailable_d9_bodies
+            else "Partial"
+        ),
+        "research_or_undefined_d9_contacts": failed_d9_effects,
+        "completeness": {
+            "d9_axis_geometry_available": (
+                navamsha_cusps.get("status")
+                in {"Pass", "Partial"}
+            ),
+            "all_requested_combo_planets_available": (
+                not combinations.get(
+                    "unavailable_planets",
+                    []
+                )
+            ),
+            "d1_d9_hierarchy_completed": True,
+            "double_whammy_checked": True,
+            "exact_d9_cusp_points_mechanical": False,
+        },
+        "pdf_pages": sorted({
+            page
+            for pages in NAVAMSHA_INTERPRETATION_PDF_PAGES.values()
+            for page in pages
+        }),
+        "points_applied": any(
+            item.get("points_applied") is True
+            for item in combinations.get(
+                "combinations",
+                [],
+            )
+        ),
+        "error": error,
+    }
+
+
 # ============================================================
 # CONSISTENCY VALIDATION
 # ============================================================
@@ -10434,6 +12359,7 @@ def health() -> dict[str, Any]:
             "navamsha_name_sounds": True,
             "stolen_cusps": True,
             "tier1_combinations": True,
+            "navamsha_interpretation": True,
         },
         "outer_planet_engine": {
             "name": "pyswisseph",
@@ -10637,6 +12563,17 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         special_points,
     )
 
+    # Chapter 5 interpretation: D9 cusp effects, D9 combinations,
+    # D1/D9 reinforcement or reversal, and double-whammy transfer.
+    navamsha_interpretation = calculate_navamsha_interpretation(
+        navamsha_cusps,
+        tier1_combinations,
+        planet_cusp_contacts,
+        outer_planets,
+        special_points,
+        stolen_cusps,
+    )
+
     # Chapter 8 fixed marker stars. Book-stated rashi degrees only;
     # intentionally excluded from Navamsha.
     nakshatra_taras = calculate_nakshatra_taras(
@@ -10769,6 +12706,7 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         "outer_planets": outer_planets,
         "special_points": special_points,
         "stolen_cusps": stolen_cusps,
+        "navamsha_interpretation": navamsha_interpretation,
         "nakshatra_taras": nakshatra_taras,
         "navamsha_name_sounds": navamsha_name_sounds,
         "houses": houses,
@@ -10817,6 +12755,11 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
                 "Chapter 4 exact Placidus cusps compared with whole-sign "
                 "rashi houses counted from the Lahiri Ascendant. Contacts "
                 "use the proxy's existing visible/invisible body orbs."
+            ),
+            "navamsha_interpretation": (
+                "Chapter 5 D9 1/7 cusp effects, House1/House7 combinations, "
+                "D1/D9 hierarchy and double-whammy transfer calculated from "
+                "the already verified Lahiri D1 and exact D9 geometry."
             ),
             "nakshatra_taras": (
                 "Chapter 8 marker-star contacts calculated against exact "
