@@ -25,7 +25,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.7.0"
+PROXY_VERSION = "1.8.0"
 
 
 # ============================================================
@@ -271,7 +271,8 @@ app = FastAPI(
         "Compact Lahiri event-chart proxy using the official "
         "VedAstro.Python client, paid-key header authentication, "
         "nested planet parameters, exact Placidus cusps, "
-        "planet-to-cusp contacts and strict validation."
+        "planet-to-cusp contacts, exact Navamsha cusp geometry "
+        "and strict validation."
     ),
 )
 
@@ -331,6 +332,33 @@ SENSITIVE_CUSP_DETAILS = {
     "House12": {"axis": "6/12", "side": "Underdog"},
     "House10": {"axis": "10/4", "side": "Favourite"},
     "House4": {"axis": "10/4", "side": "Underdog"},
+}
+
+
+# Gambler's Dharma Chapter 5 exact Navamsha geometry.
+#
+# Each 30-degree rashi sign is divided into nine 3°20' sections. The
+# position inside one 3°20' section is expanded by a factor of nine to
+# obtain the exact degree inside the corresponding D9 sign.
+NAVAMSHA_DIVISIONS_PER_SIGN = 9
+NAVAMSHA_SECTION_DEGREES = 30.0 / NAVAMSHA_DIVISIONS_PER_SIGN
+NAVAMSHA_CUSP_ORB_DEGREES = 2.5
+
+# First D9 sign for each D1 sign, using zero-based zodiac indexes:
+# Fire -> Aries, Earth -> Capricorn, Air -> Libra, Water -> Cancer.
+NAVAMSHA_START_SIGN_INDEX = {
+    0: 0,   # Aries -> Aries
+    1: 9,   # Taurus -> Capricorn
+    2: 6,   # Gemini -> Libra
+    3: 3,   # Cancer -> Cancer
+    4: 0,   # Leo -> Aries
+    5: 9,   # Virgo -> Capricorn
+    6: 6,   # Libra -> Libra
+    7: 3,   # Scorpio -> Cancer
+    8: 0,   # Sagittarius -> Aries
+    9: 9,   # Capricorn -> Capricorn
+    10: 6,  # Aquarius -> Libra
+    11: 3,  # Pisces -> Cancer
 }
 
 
@@ -1171,6 +1199,522 @@ def calculate_planet_cusp_contacts(
     }
 
 
+def sign_name_from_value(value: Any) -> str | None:
+    """Extract one zodiac sign name from an arbitrary serialised value."""
+
+    if isinstance(value, str):
+        lowered = value.lower()
+
+        for sign in ZODIAC_SIGNS:
+            if sign.lower() in lowered:
+                return sign
+
+        return None
+
+    if isinstance(value, dict):
+        for key in ("Name", "name", "SignName", "signName", "ZodiacName"):
+            if key in value:
+                found = sign_name_from_value(value[key])
+                if found:
+                    return found
+
+        for child in value.values():
+            found = sign_name_from_value(child)
+            if found:
+                return found
+
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            found = sign_name_from_value(child)
+            if found:
+                return found
+
+    return None
+
+
+def _find_house_sign_map(value: Any) -> dict[str, str] | None:
+    """Find a House1-House12 sign mapping in VedAstro serialised output."""
+
+    if isinstance(value, dict):
+        normalised_keys = {
+            str(key).lower(): key
+            for key in value
+        }
+
+        if "house1" in normalised_keys:
+            result: dict[str, str] = {}
+
+            for number in range(1, 13):
+                house_name = f"House{number}"
+                actual_key = normalised_keys.get(house_name.lower())
+
+                if actual_key is None:
+                    continue
+
+                sign = sign_name_from_value(value[actual_key])
+
+                if sign:
+                    result[house_name] = sign
+
+            if result:
+                return result
+
+        for child in value.values():
+            found = _find_house_sign_map(child)
+            if found:
+                return found
+
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            found = _find_house_sign_map(child)
+            if found:
+                return found
+
+    return None
+
+
+def parse_vedastro_navamsha_house_signs(
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Parse VedAstro AllHouseNavamshaSigns into a typed sign map."""
+
+    if result.get("status") != "Pass":
+        return {
+            "status": "Unavailable",
+            "method": result.get("method", "AllHouseNavamshaSigns"),
+            "house_signs": {},
+            "error": result.get(
+                "error",
+                "VedAstro Navamsha house-sign calculation failed.",
+            ),
+        }
+
+    house_signs = _find_house_sign_map(unwrap_data(result))
+
+    if not house_signs:
+        return {
+            "status": "Fail",
+            "method": result.get("method", "AllHouseNavamshaSigns"),
+            "house_signs": {},
+            "raw_data": limit_data(unwrap_data(result), 1200),
+            "error": "Could not parse VedAstro Navamsha house signs.",
+        }
+
+    missing = [
+        house
+        for house in ("House1", "House7")
+        if house not in house_signs
+    ]
+
+    return {
+        "status": "Pass" if not missing else "Partial",
+        "method": result.get("method", "AllHouseNavamshaSigns"),
+        "house_signs": house_signs,
+        "missing_required_houses": missing,
+        "error": (
+            None
+            if not missing
+            else "VedAstro D9 House1 or House7 sign is missing."
+        ),
+    }
+
+
+def exact_navamsha_position(
+    d1_sidereal_longitude: float,
+) -> dict[str, Any]:
+    """
+    Convert one exact Lahiri D1 longitude to its exact D9 longitude.
+
+    This implements the Chapter 5 geometry without using the rounded 6.67
+    shortcut: the offset inside a 3°20' Navamsha section is multiplied by
+    exactly nine, expanding that section to a full 30-degree D9 sign.
+    """
+
+    d1_longitude = normalise_degrees(float(d1_sidereal_longitude))
+    d1_sign_index = int(d1_longitude // 30.0)
+    d1_degree_in_sign = d1_longitude - (d1_sign_index * 30.0)
+
+    # Multiplying the D1 degree-in-sign by nine produces nine 30-degree
+    # bands. The band number identifies the Navamsha section and the
+    # remainder is the exact degree inside the D9 sign.
+    expanded = d1_degree_in_sign * NAVAMSHA_DIVISIONS_PER_SIGN
+    navamsha_index = int(expanded // 30.0)
+
+    # Guard against a rare floating-point value such as 8.999999999999/9.
+    navamsha_index = min(max(navamsha_index, 0), 8)
+
+    d9_degree_in_sign = expanded - (navamsha_index * 30.0)
+
+    if d9_degree_in_sign < 0 and abs(d9_degree_in_sign) < 1e-8:
+        d9_degree_in_sign = 0.0
+
+    if d9_degree_in_sign >= 30.0 - 1e-8:
+        d9_degree_in_sign = 0.0
+        navamsha_index = min(navamsha_index + 1, 8)
+
+    start_sign_index = NAVAMSHA_START_SIGN_INDEX[d1_sign_index]
+    d9_sign_index = (
+        start_sign_index + navamsha_index
+    ) % len(ZODIAC_SIGNS)
+    d9_longitude = normalise_degrees(
+        (d9_sign_index * 30.0) + d9_degree_in_sign
+    )
+
+    section_start_degree = (
+        navamsha_index * NAVAMSHA_SECTION_DEGREES
+    )
+    section_end_degree = (
+        section_start_degree + NAVAMSHA_SECTION_DEGREES
+    )
+
+    return {
+        "d1_sidereal_longitude": round(d1_longitude, 8),
+        "d1_sign": ZODIAC_SIGNS[d1_sign_index],
+        "d1_degree_in_sign": round(d1_degree_in_sign, 8),
+        "navamsha_number_in_d1_sign": navamsha_index + 1,
+        "d1_section_start_degree": round(section_start_degree, 8),
+        "d1_section_end_degree": round(section_end_degree, 8),
+        "d9_sidereal_longitude": round(d9_longitude, 8),
+        "d9_sign": ZODIAC_SIGNS[d9_sign_index],
+        "d9_degree_in_sign": round(d9_degree_in_sign, 8),
+    }
+
+
+def calculate_exact_navamsha_cusps(
+    event_time: Time,
+    planets: dict[str, dict[str, Any]],
+    rashi_placidus: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Calculate exact D9 Lagna/7th cusp and requested-planet D9 degrees.
+
+    Exact degrees are derived from the verified Lahiri D1 longitudes using
+    the book's Chapter 5 transformation. Derived D9 signs are independently
+    cross-checked against VedAstro's own D9 planet and house-sign methods.
+    """
+
+    if rashi_placidus.get("status") != "Pass":
+        return {
+            "status": "Unavailable",
+            "method": "ExactChapter5NavamshaGeometry",
+            "ayanamsa": "Lahiri",
+            "error": "Exact D1 Placidus cusps did not pass validation.",
+            "lagna": None,
+            "seventh_cusp": None,
+            "planets": {},
+            "qualifying_contacts": [],
+        }
+
+    d1_cusps = rashi_placidus.get("cusps", {})
+    d1_lagna_longitude = (
+        d1_cusps.get("House1", {}).get("sidereal_longitude")
+    )
+    d1_seventh_longitude = (
+        d1_cusps.get("House7", {}).get("sidereal_longitude")
+    )
+
+    if not isinstance(d1_lagna_longitude, (int, float)):
+        return {
+            "status": "Fail",
+            "method": "ExactChapter5NavamshaGeometry",
+            "ayanamsa": "Lahiri",
+            "error": "D1 House1 exact cusp longitude is missing.",
+            "lagna": None,
+            "seventh_cusp": None,
+            "planets": {},
+            "qualifying_contacts": [],
+        }
+
+    if not isinstance(d1_seventh_longitude, (int, float)):
+        return {
+            "status": "Fail",
+            "method": "ExactChapter5NavamshaGeometry",
+            "ayanamsa": "Lahiri",
+            "error": "D1 House7 exact cusp longitude is missing.",
+            "lagna": None,
+            "seventh_cusp": None,
+            "planets": {},
+            "qualifying_contacts": [],
+        }
+
+    lagna = exact_navamsha_position(float(d1_lagna_longitude))
+    seventh = exact_navamsha_position(float(d1_seventh_longitude))
+
+    lagna = {
+        "cusp": "D9Lagna",
+        "side": "Favourite",
+        "source_d1_cusp": "House1",
+        **lagna,
+    }
+    seventh = {
+        "cusp": "D9House7",
+        "side": "Underdog",
+        "source_d1_cusp": "House7",
+        **seventh,
+    }
+
+    d9_axis_separation = angular_distance(
+        lagna["d9_sidereal_longitude"],
+        seventh["d9_sidereal_longitude"],
+    )
+    axis_status = (
+        "Pass"
+        if abs(d9_axis_separation - 180.0) <= 0.0001
+        else "Fail"
+    )
+
+    raw_house_sign_result = vedastro_call(
+        ["AllHouseNavamshaSigns", "AllHouseNavamshaD9Signs"],
+        event_time,
+    )
+    vedastro_house_signs = parse_vedastro_navamsha_house_signs(
+        raw_house_sign_result
+    )
+
+    house_sign_validation: list[dict[str, Any]] = []
+
+    for cusp, house_name in (
+        (lagna, "House1"),
+        (seventh, "House7"),
+    ):
+        returned_sign = vedastro_house_signs.get(
+            "house_signs",
+            {},
+        ).get(house_name)
+        derived_sign = cusp["d9_sign"]
+
+        if returned_sign:
+            passed = returned_sign == derived_sign
+            validation_status = "Pass" if passed else "Fail"
+        else:
+            passed = None
+            validation_status = "Unavailable"
+
+        house_sign_validation.append({
+            "cusp": cusp["cusp"],
+            "vedastro_house": house_name,
+            "derived_d9_sign": derived_sign,
+            "vedastro_d9_sign": returned_sign,
+            "matches": passed,
+            "status": validation_status,
+        })
+
+    planet_positions: dict[str, dict[str, Any]] = {}
+    planet_sign_validation: list[dict[str, Any]] = []
+    unavailable_planets: list[dict[str, str]] = []
+    all_contacts: list[dict[str, Any]] = []
+
+    for planet_name, planet_result in planets.items():
+        d1_longitude = extract_total_degrees(
+            planet_result.get("sidereal_longitude", {})
+        )
+
+        if d1_longitude is None:
+            unavailable_planets.append({
+                "planet": planet_name,
+                "reason": "Could not parse exact Lahiri D1 longitude.",
+            })
+            continue
+
+        position = exact_navamsha_position(d1_longitude)
+        returned_d9_sign = extract_sign_name(
+            planet_result.get("d9_sign", {})
+        )
+        derived_d9_sign = position["d9_sign"]
+
+        if returned_d9_sign:
+            sign_matches = returned_d9_sign == derived_d9_sign
+            sign_status = "Pass" if sign_matches else "Fail"
+        else:
+            sign_matches = None
+            sign_status = "Unavailable"
+
+        distances = {
+            "D9Lagna": round(
+                angular_distance(
+                    position["d9_sidereal_longitude"],
+                    lagna["d9_sidereal_longitude"],
+                ),
+                8,
+            ),
+            "D9House7": round(
+                angular_distance(
+                    position["d9_sidereal_longitude"],
+                    seventh["d9_sidereal_longitude"],
+                ),
+                8,
+            ),
+        }
+
+        nearest_cusp = min(distances, key=distances.get)
+        nearest_distance = distances[nearest_cusp]
+
+        planet_positions[planet_name] = {
+            "planet": planet_name,
+            **position,
+            "vedastro_d9_sign": returned_d9_sign,
+            "vedastro_sign_match": sign_matches,
+            "distances": distances,
+            "nearest_d9_cusp": nearest_cusp,
+            "nearest_distance": nearest_distance,
+            "orb_limit": NAVAMSHA_CUSP_ORB_DEGREES,
+            "nearest_within_orb": (
+                nearest_distance <= NAVAMSHA_CUSP_ORB_DEGREES + 1e-9
+            ),
+        }
+
+        planet_sign_validation.append({
+            "planet": planet_name,
+            "derived_d9_sign": derived_d9_sign,
+            "vedastro_d9_sign": returned_d9_sign,
+            "matches": sign_matches,
+            "status": sign_status,
+        })
+
+        for cusp_name, cusp_data in (
+            ("D9Lagna", lagna),
+            ("D9House7", seventh),
+        ):
+            distance = distances[cusp_name]
+
+            all_contacts.append({
+                "planet": planet_name,
+                "cusp": cusp_name,
+                "side": cusp_data["side"],
+                "planet_d9_longitude": position[
+                    "d9_sidereal_longitude"
+                ],
+                "cusp_d9_longitude": cusp_data[
+                    "d9_sidereal_longitude"
+                ],
+                "angular_distance": distance,
+                "orb_limit": NAVAMSHA_CUSP_ORB_DEGREES,
+                "within_orb": (
+                    distance <= NAVAMSHA_CUSP_ORB_DEGREES + 1e-9
+                ),
+                "orb_margin": round(
+                    NAVAMSHA_CUSP_ORB_DEGREES - distance,
+                    8,
+                ),
+            })
+
+    qualifying_contacts: list[dict[str, Any]] = []
+    closest_planet_by_cusp: dict[str, dict[str, Any]] = {}
+
+    for cusp_name in ("D9Lagna", "D9House7"):
+        contacts = sorted(
+            (
+                contact
+                for contact in all_contacts
+                if contact["cusp"] == cusp_name
+            ),
+            key=lambda contact: (
+                contact["angular_distance"],
+                contact["planet"],
+            ),
+        )
+
+        if not contacts:
+            continue
+
+        closest = dict(contacts[0])
+        closest["qualifies"] = closest["within_orb"]
+        closest_planet_by_cusp[cusp_name] = closest
+
+        qualifying = [
+            contact
+            for contact in contacts
+            if contact["within_orb"]
+        ]
+
+        for rank, contact in enumerate(qualifying, start=1):
+            ranked = dict(contact)
+            ranked["rank_on_cusp"] = rank
+            ranked["closest_qualifying_contact"] = rank == 1
+            qualifying_contacts.append(ranked)
+
+    failed_validations = [
+        validation
+        for validation in (
+            house_sign_validation + planet_sign_validation
+        )
+        if validation["status"] == "Fail"
+    ]
+    unavailable_validations = [
+        validation
+        for validation in (
+            house_sign_validation + planet_sign_validation
+        )
+        if validation["status"] == "Unavailable"
+    ]
+
+    if axis_status == "Fail" or failed_validations:
+        status = "Fail"
+        error = (
+            "D9 axis or VedAstro D9 sign cross-validation failed."
+        )
+    elif (
+        unavailable_planets
+        or unavailable_validations
+        or vedastro_house_signs.get("status") != "Pass"
+    ):
+        status = "Partial"
+        error = (
+            "Exact D9 geometry was calculated, but one or more "
+            "VedAstro sign cross-checks were unavailable."
+        )
+    else:
+        status = "Pass"
+        error = None
+
+    return {
+        "status": status,
+        "method": "ExactChapter5NavamshaGeometry",
+        "ayanamsa": "Lahiri",
+        "book_layer": "Tier 3 raw Navamsha cusp geometry",
+        "interpretation_applied": False,
+        "degree_method": (
+            "Exact 3°20' section expansion by factor 9; "
+            "no rounded 6.67 shortcut."
+        ),
+        "source": (
+            "Exact Lahiri D1 Placidus cusp and planet longitudes, "
+            "cross-checked against VedAstro D9 signs."
+        ),
+        "orb_policy": {
+            "d9_lagna_and_seventh_cusp_degrees": (
+                NAVAMSHA_CUSP_ORB_DEGREES
+            ),
+            "applies_to_current_requested_bodies": True,
+            "note": (
+                "Chapter 5 applies a 2°30' D9 axis orb. This is "
+                "separate from the tighter D1 invisible-graha orb."
+            ),
+        },
+        "lagna": lagna,
+        "seventh_cusp": seventh,
+        "axis_validation": {
+            "separation_degrees": round(d9_axis_separation, 8),
+            "status": axis_status,
+        },
+        "vedastro_house_signs": vedastro_house_signs,
+        "house_sign_validation": house_sign_validation,
+        "planets": planet_positions,
+        "planet_sign_validation": planet_sign_validation,
+        "qualifying_contacts": sorted(
+            qualifying_contacts,
+            key=lambda contact: (
+                0 if contact["cusp"] == "D9Lagna" else 1,
+                contact["rank_on_cusp"],
+            ),
+        ),
+        "closest_planet_by_cusp": closest_planet_by_cusp,
+        "unavailable_planets": unavailable_planets,
+        "failed_validations": failed_validations,
+        "error": error,
+    }
+
+
 # ============================================================
 # CONSISTENCY VALIDATION
 # ============================================================
@@ -1599,7 +2143,7 @@ def health() -> dict[str, Any]:
         "advanced_layers": {
             "exact_lahiri_placidus_cusps": True,
             "planet_cusp_contacts": True,
-            "navamsha_cusps": False,
+            "navamsha_cusps": True,
             "kp_sublords": False,
         },
         "minimum_call_interval_seconds": VEDASTRO_MIN_INTERVAL_SECONDS,
@@ -1744,6 +2288,14 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         rashi_placidus,
     )
 
+    # Exact Chapter 5 D9 geometry. This is kept separate from the standard
+    # essential chart gate until its live output has been verified.
+    navamsha_cusps = calculate_exact_navamsha_cusps(
+        event_time,
+        planets,
+        rashi_placidus,
+    )
+
     essential_results: list[dict[str, Any]] = [
         core["ayanamsa_degree"],
         core["lagna_sign"],
@@ -1849,6 +2401,7 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         "core": core,
         "rashi_placidus": rashi_placidus,
         "planet_cusp_contacts": planet_cusp_contacts,
+        "navamsha_cusps": navamsha_cusps,
         "houses": houses,
         "planets": planets,
         "provenance": {
@@ -1863,6 +2416,10 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
             "planet_cusp_contacts": (
                 "Internally calculated from exact Lahiri Placidus cusps and "
                 "requested VedAstro sidereal planet longitudes."
+            ),
+            "navamsha_cusps": (
+                "Exact Chapter 5 D9 degrees derived from Lahiri D1 "
+                "longitudes and cross-checked against VedAstro D9 signs."
             ),
             "vedastro_api_key": "stored only on Render",
             "minimum_call_interval_seconds": VEDASTRO_MIN_INTERVAL_SECONDS,
