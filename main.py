@@ -34,7 +34,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.17.0"
+PROXY_VERSION = "1.17.1"
 
 
 # ============================================================
@@ -80,6 +80,17 @@ MAX_RESPONSE_CHARACTERS = int(
 # lower than the server-side maximum to avoid ResponseTooLargeError.
 ACTION_RESPONSE_TARGET_CHARACTERS = int(
     os.getenv("ACTION_RESPONSE_TARGET_CHARACTERS", "36000")
+)
+
+# Leave room for final metadata and JSON serialization differences between
+# local tests and the Custom GPT Action transport.
+ACTION_RESPONSE_SAFETY_MARGIN_CHARACTERS = int(
+    os.getenv("ACTION_RESPONSE_SAFETY_MARGIN_CHARACTERS", "1500")
+)
+ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS = max(
+    24000,
+    ACTION_RESPONSE_TARGET_CHARACTERS
+    - ACTION_RESPONSE_SAFETY_MARGIN_CHARACTERS,
 )
 
 
@@ -6597,32 +6608,117 @@ def compact_navamsha_interpretation_layer(
 def compact_reliability_audit_layer(
     layer: dict[str, Any],
 ) -> dict[str, Any]:
-    """Preserve the complete reliability decision in a compact form."""
+    """
+    Preserve every reliability decision while limiting repeated transport data.
 
-    stationary = layer.get("stationary_kutila", {})
-    concise_stations = []
+    Veto planets and their exact station timing are always retained. Other
+    station rows are summarized by proximity and count.
+    """
 
+    stationary = layer.get("stationary_kutila") or {}
     station_source_rows = (
         stationary.get("swiss_station_search")
         or stationary.get("station_search")
         or []
     )
+    hard_veto_planets = set(
+        stationary.get("hard_veto_planets") or []
+    )
+    warning_planets = set(
+        stationary.get("warning_planets") or []
+    )
 
-    for row in station_source_rows:
-        nearest = row.get("nearest_station")
+    def station_distance(row: dict[str, Any]) -> float:
+        nearest = row.get("nearest_station") or {}
+        value = nearest.get("absolute_days_from_event")
+
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        return 999.0
+
+    ordered_stations = sorted(
+        [
+            row
+            for row in station_source_rows
+            if isinstance(row, dict)
+        ],
+        key=lambda row: (
+            0
+            if (
+                row.get("automatic_veto")
+                or row.get("body") in hard_veto_planets
+            )
+            else 1
+            if (
+                row.get("within_seven_days")
+                or row.get("body") in warning_planets
+            )
+            else 2,
+            station_distance(row),
+            str(row.get("body") or ""),
+        ),
+    )
+
+    retained_stations: list[dict[str, Any]] = []
+    retained_bodies: set[str] = set()
+
+    # Always retain all veto rows.
+    for row in ordered_stations:
+        body = str(row.get("body") or "")
+
+        if (
+            row.get("automatic_veto")
+            or body in hard_veto_planets
+        ):
+            retained_stations.append(row)
+            retained_bodies.add(body)
+
+    # Retain the closest warning/non-veto rows up to six total.
+    for row in ordered_stations:
+        body = str(row.get("body") or "")
+
+        if body in retained_bodies:
+            continue
+
+        if len(retained_stations) >= 6:
+            break
+
+        retained_stations.append(row)
+        retained_bodies.add(body)
+
+    concise_stations: list[dict[str, Any]] = []
+
+    for row in retained_stations:
+        nearest = row.get("nearest_station") or {}
+        concise_nearest = None
+
+        if nearest:
+            concise_nearest = {
+                "local": nearest.get("local"),
+                "signed_days_from_event": nearest.get(
+                    "signed_days_from_event"
+                ),
+                "absolute_days_from_event": nearest.get(
+                    "absolute_days_from_event"
+                ),
+            }
+
         concise_stations.append({
             "body": row.get("body"),
             "status": row.get("status"),
             "event_speed": (
                 row.get("event_speed_degrees_per_day")
-                if row.get("event_speed_degrees_per_day") is not None
+                if row.get("event_speed_degrees_per_day")
+                is not None
                 else row.get("event_speed")
             ),
             "event_motion": row.get("event_motion"),
-            "nearest_station": nearest,
+            "nearest_station": concise_nearest,
             "same_local_date": (
                 row.get("same_local_calendar_date")
-                if row.get("same_local_calendar_date") is not None
+                if row.get("same_local_calendar_date")
+                is not None
                 else row.get("same_local_date")
             ),
             "within_one_day": row.get("within_one_day"),
@@ -6634,38 +6730,170 @@ def compact_reliability_audit_layer(
             ),
             "error": compact_scalar_text(
                 row.get("error"),
-                90,
+                70,
             ),
         })
 
-    eclipses = layer.get("eclipses", {})
-    concise_eclipses = [
-        {
-            key: event.get(key)
-            for key in (
-                "status",
-                "kind",
-                "direction",
-                "type_flags",
-                "major_for_automatic_gate",
-                "maximum_utc",
-                "maximum_local",
-                "signed_days_from_event",
-                "absolute_days_from_event",
-                "error",
-            )
-            if key in event
-        }
-        for event in eclipses.get("events", [])
-    ]
+    omitted_station_count = max(
+        0,
+        len(ordered_stations) - len(retained_stations),
+    )
 
-    karma = layer.get("karma_fixity", {})
+    eclipses = layer.get("eclipses") or {}
+    concise_eclipses = []
+
+    for event in eclipses.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+
+        concise_eclipses.append({
+            "status": event.get("status"),
+            "kind": event.get("kind"),
+            "direction": event.get("direction"),
+            "type_flags": event.get("type_flags"),
+            "major": event.get(
+                "major_for_automatic_gate"
+            ),
+            "maximum_local": event.get(
+                "maximum_local"
+            ),
+            "signed_days": event.get(
+                "signed_days_from_event"
+            ),
+            "absolute_days": event.get(
+                "absolute_days_from_event"
+            ),
+            "error": compact_scalar_text(
+                event.get("error"),
+                70,
+            ),
+        })
+
+    nearest_major = eclipses.get(
+        "nearest_major_eclipse"
+    )
+    concise_nearest_major = None
+
+    if isinstance(nearest_major, dict):
+        concise_nearest_major = {
+            "kind": nearest_major.get("kind"),
+            "direction": nearest_major.get(
+                "direction"
+            ),
+            "type_flags": nearest_major.get(
+                "type_flags"
+            ),
+            "maximum_local": nearest_major.get(
+                "maximum_local"
+            ),
+            "signed_days": nearest_major.get(
+                "signed_days_from_event"
+            ),
+            "absolute_days": nearest_major.get(
+                "absolute_days_from_event"
+            ),
+        }
+
+    sankranti = layer.get("solar_sankranti") or {}
+    concise_sankranti = {
+        "status": sankranti.get("status"),
+        "sign": sankranti.get("sign"),
+        "degree_in_sign": sankranti.get(
+            "degree_in_sign"
+        ),
+        "end_of_sign_29_degrees_or_higher": (
+            sankranti.get(
+                "end_of_sign_29_degrees_or_higher"
+            )
+        ),
+        "beginning_of_sign_under_one_degree": (
+            sankranti.get(
+                "beginning_of_sign_under_one_degree"
+            )
+        ),
+        "hard_veto": sankranti.get("hard_veto"),
+        "hard_veto_reason": compact_scalar_text(
+            sankranti.get("hard_veto_reason"),
+            110,
+        ),
+        "beginning_warning": compact_scalar_text(
+            sankranti.get("beginning_warning"),
+            110,
+        ),
+        "error": compact_scalar_text(
+            sankranti.get("error"),
+            70,
+        ),
+    }
+
+    rise_set = layer.get("sunrise_sunset") or {}
+
+    def concise_solar_event(
+        record: Any,
+    ) -> dict[str, Any] | None:
+        if not isinstance(record, dict):
+            return None
+
+        return {
+            "local": record.get("local"),
+            "signed_minutes": record.get(
+                "signed_minutes_from_event"
+            ),
+            "absolute_minutes": record.get(
+                "absolute_minutes_from_event"
+            ),
+        }
+
+    concise_rise_set = {
+        "status": rise_set.get("status"),
+        "nearest_sunrise": concise_solar_event(
+            rise_set.get("nearest_sunrise")
+        ),
+        "nearest_sunset": concise_solar_event(
+            rise_set.get("nearest_sunset")
+        ),
+        "hard_veto": rise_set.get("hard_veto"),
+        "automatic_window_applied": rise_set.get(
+            "automatic_window_applied"
+        ),
+        "manual_review_required": rise_set.get(
+            "manual_review_required"
+        ),
+        "error": compact_scalar_text(
+            rise_set.get("error"),
+            70,
+        ),
+    }
+
+    karma = layer.get("karma_fixity") or {}
+    concise_evidence = []
+
+    for item in (karma.get("evidence") or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+
+        concise_evidence.append({
+            key: item.get(key)
+            for key in (
+                "source",
+                "tier",
+                "supports",
+                "value",
+                "condition",
+                "body",
+                "cusp",
+                "planets",
+            )
+            if key in item
+        })
 
     return compact_recursive({
         "status": layer.get("status"),
         "hard_veto": layer.get("hard_veto"),
-        "strict_prediction_allowed_by_reliability": layer.get(
-            "strict_prediction_allowed_by_reliability"
+        "strict_prediction_allowed_by_reliability": (
+            layer.get(
+                "strict_prediction_allowed_by_reliability"
+            )
         ),
         "decision": layer.get("decision"),
         "hard_veto_reasons": layer.get(
@@ -6678,43 +6906,75 @@ def compact_reliability_audit_layer(
         ),
         "stationary_kutila": {
             "status": stationary.get("status"),
-            "vedastro_motion_labels": stationary.get(
-                "vedastro_motion_labels",
-                [],
-            ),
+            "vedastro_motion_labels": [
+                row
+                for row in (
+                    stationary.get(
+                        "vedastro_motion_labels"
+                    )
+                    or []
+                )
+                if (
+                    isinstance(row, dict)
+                    and (
+                        row.get("kutila_or_stationary")
+                        or row.get("planet")
+                        in hard_veto_planets
+                        or row.get(
+                            "vedastro_motion_label"
+                        )
+                        not in {
+                            None,
+                            "Direct",
+                            "Retrograde",
+                        }
+                    )
+                )
+            ],
             "station_search": concise_stations,
-            "hard_veto_planets": stationary.get(
-                "hard_veto_planets",
-                [],
+            "station_search_total_count": len(
+                ordered_stations
+            ),
+            "station_rows_omitted_from_transport": (
+                omitted_station_count
+            ),
+            "hard_veto_planets": sorted(
+                hard_veto_planets
             ),
             "hard_veto": stationary.get("hard_veto"),
-            "warning_planets": stationary.get(
-                "warning_planets",
-                [],
+            "warning_planets": sorted(
+                warning_planets
             ),
-            "error": stationary.get("error"),
+            "error": compact_scalar_text(
+                stationary.get("error"),
+                90,
+            ),
         },
         "eclipses": {
             "status": eclipses.get("status"),
             "events": concise_eclipses,
-            "nearest_major_eclipse": eclipses.get(
-                "nearest_major_eclipse"
+            "nearest_major_eclipse": (
+                concise_nearest_major
             ),
-            "avoid_window_days_each_side": eclipses.get(
-                "avoid_window_days_each_side"
+            "avoid_window_days_each_side": (
+                eclipses.get(
+                    "avoid_window_days_each_side"
+                )
             ),
             "hard_veto": eclipses.get("hard_veto"),
-            "error": eclipses.get("error"),
+            "error": compact_scalar_text(
+                eclipses.get("error"),
+                80,
+            ),
         },
-        "solar_sankranti": layer.get(
-            "solar_sankranti"
-        ),
-        "sunrise_sunset": layer.get(
-            "sunrise_sunset"
-        ),
+        "solar_sankranti": concise_sankranti,
+        "sunrise_sunset": concise_rise_set,
         "karma_fixity": {
             "status": karma.get("status"),
-            "evidence": karma.get("evidence", []),
+            "evidence": concise_evidence,
+            "evidence_total_count": len(
+                karma.get("evidence") or []
+            ),
             "counts": karma.get("counts"),
             "rule_of_three_reached": karma.get(
                 "rule_of_three_reached"
@@ -6722,7 +6982,10 @@ def compact_reliability_audit_layer(
             "automatic_karma_classification": None,
             "automatic_classification_allowed": False,
             "manual_classification_required": True,
-            "reason": karma.get("reason"),
+            "reason": compact_scalar_text(
+                karma.get("reason"),
+                120,
+            ),
         },
         "unavailable_sublayers": layer.get(
             "unavailable_sublayers",
@@ -6734,9 +6997,11 @@ def compact_reliability_audit_layer(
         ),
         "pdf_pages": layer.get("pdf_pages"),
         "points_applied": False,
-        "error": layer.get("error"),
-    }, list_limit=16, string_limit=150)
-
+        "error": compact_scalar_text(
+            layer.get("error"),
+            90,
+        ),
+    }, list_limit=12, string_limit=120)
 
 def compact_stolen_cusps_layer(
     layer: dict[str, Any],
@@ -8157,7 +8422,7 @@ def enforce_action_response_limit(
             default=str,
         ))
 
-    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+    if encoded_size() <= ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS:
         return payload
 
     # 1. House aspects are already represented in dedicated geometry layers.
@@ -8168,7 +8433,7 @@ def enforce_action_response_limit(
         "house_aspects_omitted"
     ] = True
 
-    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+    if encoded_size() <= ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS:
         return payload
 
     # 2. Shadbala remains available in the full server calculation but is not
@@ -8181,7 +8446,7 @@ def enforce_action_response_limit(
         "raw_shadbala_omitted"
     ] = True
 
-    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+    if encoded_size() <= ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS:
         return payload
 
     # 3. D9 nearest nonqualifying distances are redundant when the actual
@@ -8199,7 +8464,7 @@ def enforce_action_response_limit(
         "nonqualifying_d9_distances_omitted"
     ] = True
 
-    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+    if encoded_size() <= ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS:
         return payload
 
     # 4. D1 cusp rows are already represented by the D1 summary and the
@@ -8224,7 +8489,7 @@ def enforce_action_response_limit(
             "secondary_d1_d9_rows_trimmed"
         ] = True
 
-    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+    if encoded_size() <= ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS:
         return payload
 
     # 5. Reliability veto summaries remain complete; long non-veto station
@@ -8260,7 +8525,7 @@ def enforce_action_response_limit(
             "nonveto_station_rows_trimmed"
         ] = True
 
-    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+    if encoded_size() <= ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS:
         return payload
 
     # 6. Planet syllables are only secondary resonance evidence; the exact
@@ -8274,7 +8539,7 @@ def enforce_action_response_limit(
         "unmatched_planet_syllables_omitted"
     ] = True
 
-    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+    if encoded_size() <= ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS:
         return payload
 
     # 7. Preserve the KP main comparison and first/seventh cusp evidence; the
@@ -8288,10 +8553,110 @@ def enforce_action_response_limit(
         "kp_pointer_array_omitted_from_transport"
     ] = True
 
-    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+    if encoded_size() <= ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS:
         return payload
 
-    # 8. Final bounded pass.
+    # 8. Final reliability projection. Preserve all veto rows and summarize
+    # non-veto station/eclipses when the payload still exceeds the safety
+    # target.
+    reliability = payload.get("reliability_audit", {})
+    stationary = reliability.get(
+        "stationary_kutila",
+        {},
+    )
+    station_rows = stationary.get(
+        "station_search",
+        [],
+    )
+
+    if isinstance(station_rows, list):
+        decisive_rows = [
+            row
+            for row in station_rows
+            if (
+                isinstance(row, dict)
+                and (
+                    row.get("automatic_veto")
+                    or row.get("body")
+                    in set(
+                        stationary.get(
+                            "hard_veto_planets",
+                            [],
+                        )
+                    )
+                )
+            )
+        ]
+        warning_rows = [
+            row
+            for row in station_rows
+            if (
+                isinstance(row, dict)
+                and row not in decisive_rows
+                and row.get("within_seven_days")
+            )
+        ]
+        ordinary_rows = [
+            row
+            for row in station_rows
+            if (
+                isinstance(row, dict)
+                and row not in decisive_rows
+                and row not in warning_rows
+            )
+        ]
+        retained_rows = (
+            decisive_rows
+            + warning_rows[:2]
+            + ordinary_rows[:1]
+        )
+        omitted = len(station_rows) - len(
+            retained_rows
+        )
+
+        if omitted > 0:
+            retained_rows.append({
+                "nondecisive_station_rows_omitted": (
+                    omitted
+                ),
+                "full_calculation_performed": True,
+            })
+            stationary["station_search"] = (
+                retained_rows
+            )
+            payload["response_compaction"][
+                "reliability_station_rows_decisive_only"
+            ] = True
+
+    eclipses = reliability.get("eclipses", {})
+    eclipse_rows = eclipses.get("events", [])
+
+    if isinstance(eclipse_rows, list) and len(eclipse_rows) > 2:
+        eclipse_rows = sorted(
+            [
+                row
+                for row in eclipse_rows
+                if isinstance(row, dict)
+            ],
+            key=lambda row: (
+                0 if row.get("major") else 1,
+                row.get("absolute_days", 999),
+            ),
+        )
+        eclipses["events"] = eclipse_rows[:2] + [{
+            "eclipse_rows_omitted": (
+                len(eclipse_rows) - 2
+            ),
+            "full_calculation_performed": True,
+        }]
+        payload["response_compaction"][
+            "nonnearest_eclipse_rows_trimmed"
+        ] = True
+
+    if encoded_size() <= ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS:
+        return payload
+
+    # 9. Final bounded pass.
     bounded = compact_recursive(
         payload,
         list_limit=6,
@@ -8309,10 +8674,10 @@ def enforce_action_response_limit(
         default=str,
     ))
 
-    if bounded_size <= ACTION_RESPONSE_TARGET_CHARACTERS:
+    if bounded_size <= ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS:
         return bounded
 
-    # 9. Hard transport ceiling. Every layer and every result summary remains,
+    # 10. Hard transport ceiling. Every layer and every result summary remains,
     # while repeated secondary arrays are represented by counts.
     for key in (
         "contextual_or_research_contacts",
@@ -8899,20 +9264,33 @@ def compact_action_response(
     )
 
     if len(encoded) > ACTION_RESPONSE_TARGET_CHARACTERS:
-        # Final legacy fallback only. It is no longer allowed to precede
-        # compact-v2.
-        compacted = emergency_action_response(
+        # Re-run the deterministic limiter rather than expanding the payload
+        # through the older emergency profile.
+        compacted = enforce_action_response_limit(
             compacted
         )
 
-    final_encoded = json.dumps(
-        compacted,
-        ensure_ascii=False,
-        default=str,
+    compacted.setdefault(
+        "response_compaction",
+        {},
+    )["safety_target_characters"] = (
+        ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS
     )
+
+    # Calculate the serialized size after adding the metadata itself.
     compacted["response_compaction"][
         "final_character_count"
-    ] = len(final_encoded)
+    ] = 0
+
+    for _ in range(3):
+        final_count = len(json.dumps(
+            compacted,
+            ensure_ascii=False,
+            default=str,
+        ))
+        compacted["response_compaction"][
+            "final_character_count"
+        ] = final_count
 
     return compacted
 
@@ -13826,6 +14204,9 @@ def health() -> dict[str, Any]:
         "response_mode": "prediction-grade compact v2",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
+        ),
+        "action_response_safety_target_characters": (
+            ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS
         ),
         "advanced_layers": {
             "exact_lahiri_placidus_cusps": True,
