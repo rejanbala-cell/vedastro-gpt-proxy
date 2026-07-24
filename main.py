@@ -25,7 +25,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.5.1"
+PROXY_VERSION = "1.6.0"
 
 
 # ============================================================
@@ -298,6 +298,21 @@ HOUSES = {
 
 DEFAULT_HOUSES = ["House1", "House7"]
 DEFAULT_PLANETS = ["Sun", "Moon"]
+
+ZODIAC_SIGNS = (
+    "Aries",
+    "Taurus",
+    "Gemini",
+    "Cancer",
+    "Leo",
+    "Virgo",
+    "Libra",
+    "Scorpio",
+    "Sagittarius",
+    "Capricorn",
+    "Aquarius",
+    "Pisces",
+)
 
 
 # ============================================================
@@ -683,6 +698,239 @@ def extract_nakshatra_name(result: dict[str, Any]) -> str | None:
             return canonical
 
     return None
+
+
+
+# ============================================================
+# EXACT PLACIDUS CUSP HELPERS
+# ============================================================
+
+def normalise_degrees(value: float) -> float:
+    """Normalise a longitude into the 0 <= value < 360 range."""
+
+    return float(value) % 360.0
+
+
+def sign_details_from_longitude(longitude: float) -> dict[str, Any]:
+    """Convert a 0-360 sidereal longitude into sign and degree-in-sign."""
+
+    normalised = normalise_degrees(longitude)
+    sign_index = int(normalised // 30.0)
+
+    return {
+        "sign": ZODIAC_SIGNS[sign_index],
+        "degree_in_sign": round(normalised % 30.0, 8),
+    }
+
+
+def angular_distance(first: float, second: float) -> float:
+    """Return the shortest circular distance between two longitudes."""
+
+    difference = abs(normalise_degrees(first) - normalise_degrees(second))
+    return min(difference, 360.0 - difference)
+
+
+def _numeric_from_item(value: Any) -> float | None:
+    """Read one numeric value from a primitive or common Angle JSON shape."""
+
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+
+    if isinstance(value, dict):
+        for key in (
+            "TotalDegrees",
+            "totalDegrees",
+            "Degrees",
+            "degrees",
+            "Value",
+            "value",
+        ):
+            if key in value:
+                parsed = _numeric_from_item(value[key])
+                if parsed is not None:
+                    return parsed
+
+    return None
+
+
+def _find_cusp_sequence(value: Any) -> list[float] | None:
+    """
+    Find the VedAstro cusp array.
+
+    Swiss Ephemeris returns 13 slots: index 0 is unused and indexes 1-12 are
+    House1-House12. Some serializers may remove the unused first slot and
+    return exactly 12 values.
+    """
+
+    if isinstance(value, (list, tuple)):
+        parsed = [_numeric_from_item(item) for item in value]
+
+        if all(item is not None for item in parsed):
+            numbers = [float(item) for item in parsed if item is not None]
+
+            if len(numbers) in {12, 13}:
+                return numbers
+
+        for child in value:
+            found = _find_cusp_sequence(child)
+            if found is not None:
+                return found
+
+    if isinstance(value, dict):
+        # Prefer likely payload keys before scanning every nested value.
+        for preferred_key in (
+            "cusps",
+            "Cusps",
+            "house_cusps",
+            "HouseCusps",
+            "Payload",
+            "payload",
+            "data",
+        ):
+            if preferred_key in value:
+                found = _find_cusp_sequence(value[preferred_key])
+                if found is not None:
+                    return found
+
+        for child in value.values():
+            found = _find_cusp_sequence(child)
+            if found is not None:
+                return found
+
+    return None
+
+
+def parse_placidus_cusps(result: dict[str, Any]) -> dict[str, Any]:
+    """Turn VedAstro's raw cusp array into a typed House1-House12 mapping."""
+
+    if result.get("status") != "Pass":
+        return {
+            "status": "Unavailable",
+            "method": result.get(
+                "method",
+                "GetAllHouseNirayanaMiddleLongitudes",
+            ),
+            "error": result.get("error", "VedAstro cusp calculation failed."),
+            "cusps": {},
+        }
+
+    sequence = _find_cusp_sequence(unwrap_data(result))
+
+    if sequence is None:
+        return {
+            "status": "Fail",
+            "method": result.get(
+                "method",
+                "GetAllHouseNirayanaMiddleLongitudes",
+            ),
+            "error": "Could not parse a 12- or 13-value house cusp array.",
+            "raw_data": limit_data(unwrap_data(result), 1200),
+            "cusps": {},
+        }
+
+    if len(sequence) == 13:
+        # Swiss Ephemeris convention: slot zero is unused.
+        house_values = sequence[1:13]
+        source_array_shape = "13 slots; index 0 discarded"
+    else:
+        house_values = sequence
+        source_array_shape = "12 direct house values"
+
+    if len(house_values) != 12:
+        return {
+            "status": "Fail",
+            "method": result.get(
+                "method",
+                "GetAllHouseNirayanaMiddleLongitudes",
+            ),
+            "error": f"Expected 12 house values, received {len(house_values)}.",
+            "cusps": {},
+        }
+
+    cusps: dict[str, dict[str, Any]] = {}
+
+    for index, raw_longitude in enumerate(house_values, start=1):
+        longitude = normalise_degrees(raw_longitude)
+        sign_details = sign_details_from_longitude(longitude)
+
+        cusps[f"House{index}"] = {
+            "house": f"House{index}",
+            "sidereal_longitude": round(longitude, 8),
+            **sign_details,
+        }
+
+    # Opposite Placidus cusps must be approximately 180 degrees apart.
+    axis_checks = []
+
+    for first_house, opposite_house in (
+        ("House1", "House7"),
+        ("House4", "House10"),
+        ("House6", "House12"),
+    ):
+        separation = angular_distance(
+            cusps[first_house]["sidereal_longitude"],
+            cusps[opposite_house]["sidereal_longitude"],
+        )
+        passed = abs(separation - 180.0) <= 0.02
+
+        axis_checks.append({
+            "axis": f"{first_house}/{opposite_house}",
+            "separation_degrees": round(separation, 8),
+            "status": "Pass" if passed else "Fail",
+        })
+
+    failed_axes = [
+        check for check in axis_checks if check["status"] != "Pass"
+    ]
+
+    return {
+        "status": "Pass" if not failed_axes else "Fail",
+        "method": result.get(
+            "method",
+            "GetAllHouseNirayanaMiddleLongitudes",
+        ),
+        "ayanamsa": "Lahiri",
+        "house_system": "Placidus",
+        "source_array_shape": source_array_shape,
+        "cusps": cusps,
+        "axis_validation": axis_checks,
+        "error": (
+            None
+            if not failed_axes
+            else "One or more opposite cusp axes were not 180 degrees apart."
+        ),
+    }
+
+
+def calculate_rashi_placidus(event_time: Time) -> dict[str, Any]:
+    """
+    Calculate exact Lahiri sidereal Placidus middle/cusp longitudes.
+
+    VedAstro's GetAllHouseNirayanaMiddleLongitudes uses Swiss Ephemeris with
+    house-system code 'P' and returns a 13-slot array whose first slot is unused.
+    """
+
+    raw_result = vedastro_call(
+        "GetAllHouseNirayanaMiddleLongitudes",
+        event_time,
+    )
+
+    parsed = parse_placidus_cusps(raw_result)
+    parsed["raw_calculation"] = {
+        key: value
+        for key, value in raw_result.items()
+        if key != "data"
+    }
+    return parsed
 
 
 # ============================================================
@@ -1110,6 +1358,12 @@ def health() -> dict[str, Any]:
             "x-api-key header with APIKey body fallback"
         ),
         "response_mode": "compact direct calculations",
+        "advanced_layers": {
+            "exact_lahiri_placidus_cusps": True,
+            "planet_cusp_contacts": False,
+            "navamsha_cusps": False,
+            "kp_sublords": False,
+        },
         "minimum_call_interval_seconds": VEDASTRO_MIN_INTERVAL_SECONDS,
         "maximum_attempts_per_method": VEDASTRO_MAX_RETRIES,
         "parallel_workers": VEDASTRO_MAX_WORKERS,
@@ -1181,6 +1435,11 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         core["moon_nakshatra"],
     )
     core["moon_consistency"] = moon_consistency
+
+    # Exact Lahiri sidereal Placidus cusp degrees for Gambler's Dharma Tier 2.
+    # This is intentionally non-essential for the existing standard-chart gate:
+    # a temporary upstream cusp failure must not break the working v1 response.
+    rashi_placidus = calculate_rashi_placidus(event_time)
 
     requested_houses = list(dict.fromkeys(request.houses))
     requested_planets = list(dict.fromkeys(request.planets))
@@ -1343,6 +1602,7 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
             "ayanamsa": "Lahiri",
         },
         "core": core,
+        "rashi_placidus": rashi_placidus,
         "houses": houses,
         "planets": planets,
         "provenance": {
