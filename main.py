@@ -34,7 +34,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.14.1"
+PROXY_VERSION = "1.15.0"
 
 
 # ============================================================
@@ -545,6 +545,73 @@ SIGN_LORDS = {
     "Capricorn": "Saturn",
     "Aquarius": "Saturn",
     "Pisces": "Jupiter",
+}
+
+
+# Gambler's Dharma Chapter 3: victory houses and contest yogas.
+TIER1_FAVOURITE_VICTORY_HOUSES = {1, 3, 6, 10, 11}
+TIER1_UNDERDOG_VICTORY_HOUSES = {4, 5, 7, 9, 12}
+
+TIER1_NATURAL_MALEFICS = {
+    "Sun",
+    "Mars",
+    "Saturn",
+    "Rahu",
+    "Ketu",
+}
+
+# Conservative automatic SKY and victory-house benefics. The Moon is
+# deliberately kept as a separate manual candidate because the author says
+# he normally excludes it from victory-house scoring and its benefic status
+# also depends on phase.
+TIER1_NATURAL_BENEFICS = {
+    "Mercury",
+    "Jupiter",
+    "Venus",
+}
+
+TIER1_CLASSICAL_PKY_MALEFICS = {
+    "Sun",
+    "Mars",
+    "Saturn",
+}
+
+TIER1_NODE_MALEFICS = {
+    "Rahu",
+    "Ketu",
+}
+
+TIER1_PLANETARY_WAR_PLANETS = (
+    "Mercury",
+    "Venus",
+    "Mars",
+    "Jupiter",
+    "Saturn",
+)
+
+TIER1_SWISSEPH_BODY_IDS = {
+    "Mercury": 2,
+    "Venus": 3,
+    "Mars": 4,
+    "Jupiter": 5,
+    "Saturn": 6,
+}
+
+TIER1_DIG_BALA_HOUSES = {
+    "Sun": 10,
+    "Moon": 4,
+    "Mercury": 1,
+    "Venus": 4,
+    "Mars": 10,
+    "Jupiter": 1,
+    "Saturn": 7,
+}
+
+TIER1_PDF_PAGES = {
+    "victory_houses": [54, 55, 62, 63, 64, 65, 66, 173, 174, 175],
+    "sky_pky": [55, 56, 57, 59, 60, 61, 173],
+    "parivartana": [67, 68, 70],
+    "planetary_war": [67, 68, 70],
 }
 
 KP_COLUMN_WEIGHTS = {
@@ -6096,6 +6163,132 @@ def compact_special_points_layer(
     })
 
 
+def compact_tier1_combinations_layer(
+    layer: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve all decision-bearing Chapter 3 testimony compactly."""
+
+    snapshots = {}
+
+    for planet_name, record in layer.get(
+        "planet_snapshots",
+        {},
+    ).items():
+        snapshots[planet_name] = {
+            "status": record.get("status"),
+            "house": record.get("whole_sign_house"),
+            "side": record.get("victory_side"),
+            "retrograde": record.get("retrograde"),
+            "combust": record.get("combust"),
+            "exalted": record.get("exalted"),
+            "debilitated": record.get("debilitated"),
+            "own_sign": record.get("own_sign"),
+            "dig_bala": record.get("dig_bala"),
+            "own_nakshatra": record.get(
+                "own_nakshatra"
+            ),
+            "error": record.get("error"),
+        }
+
+    victory = layer.get("victory_houses", {})
+    sky_pky = layer.get("sky_pky", {})
+    parivartana = layer.get("parivartana", {})
+    war = layer.get("planetary_war", {})
+
+    return compact_recursive({
+        "status": layer.get("status"),
+        "method": layer.get("method"),
+        "book_chapter": layer.get("book_chapter"),
+        "ayanamsa": layer.get("ayanamsa"),
+        "house_system": layer.get("house_system"),
+        "assignment": layer.get("assignment"),
+        "ascendant": layer.get("ascendant"),
+        "planet_snapshots": snapshots,
+        "victory_houses": {
+            "status": victory.get("status"),
+            "ledger": victory.get("ledger", []),
+            "manual_candidates": victory.get(
+                "manual_candidates",
+                [],
+            ),
+            "unavailable_planets": victory.get(
+                "unavailable_planets",
+                [],
+            ),
+            "favourite_points": victory.get(
+                "favourite_points"
+            ),
+            "underdog_points": victory.get(
+                "underdog_points"
+            ),
+            "signed_favourite_total": victory.get(
+                "signed_favourite_total"
+            ),
+            "automatic_point_scope": victory.get(
+                "automatic_point_scope"
+            ),
+        },
+        "sky_pky": {
+            "status": sky_pky.get("status"),
+            "book_tier": sky_pky.get("book_tier"),
+            "sides": sky_pky.get("sides", {}),
+            "points_applied": sky_pky.get(
+                "points_applied"
+            ),
+        },
+        "parivartana": {
+            "status": parivartana.get("status"),
+            "detected": parivartana.get("detected"),
+            "pairs": parivartana.get("pairs", []),
+            "eligible_benefics": parivartana.get(
+                "eligible_benefics",
+                [],
+            ),
+            "points_applied": parivartana.get(
+                "points_applied"
+            ),
+        },
+        "planetary_war": {
+            "status": war.get("status"),
+            "orb_degrees": war.get("orb_degrees"),
+            "relevant_house_lords": war.get(
+                "relevant_house_lords",
+                {},
+            ),
+            "wars": war.get("wars", []),
+            "detected": war.get("detected"),
+            "winner_standard": war.get(
+                "winner_standard"
+            ),
+            "lesser_longitude_fallback_used": (
+                war.get(
+                    "lesser_longitude_fallback_used"
+                )
+            ),
+            "points_applied": war.get(
+                "points_applied"
+            ),
+            "time_error": war.get("time_error"),
+        },
+        "automatic_signed_total": layer.get(
+            "automatic_signed_total"
+        ),
+        "automatic_signed_total_scope": layer.get(
+            "automatic_signed_total_scope"
+        ),
+        "missing_required_planets": layer.get(
+            "missing_required_planets",
+            [],
+        ),
+        "manual_review_items": layer.get(
+            "manual_review_items"
+        ),
+        "pdf_pages": layer.get("pdf_pages"),
+        "points_applied": layer.get("points_applied"),
+        "error": layer.get("error"),
+    }, list_limit=24, string_limit=220)
+
+
 def compact_stolen_cusps_layer(
     layer: dict[str, Any],
 ) -> dict[str, Any]:
@@ -6475,6 +6668,40 @@ def emergency_action_response(
         "rashi_placidus": compacted.get(
             "rashi_placidus"
         ),
+        "tier1_combinations": {
+            "status": compacted.get(
+                "tier1_combinations",
+                {},
+            ).get("status"),
+            "victory_houses": compacted.get(
+                "tier1_combinations",
+                {},
+            ).get("victory_houses"),
+            "sky_pky": compacted.get(
+                "tier1_combinations",
+                {},
+            ).get("sky_pky"),
+            "parivartana": compacted.get(
+                "tier1_combinations",
+                {},
+            ).get("parivartana"),
+            "planetary_war": compacted.get(
+                "tier1_combinations",
+                {},
+            ).get("planetary_war"),
+            "automatic_signed_total": compacted.get(
+                "tier1_combinations",
+                {},
+            ).get("automatic_signed_total"),
+            "missing_required_planets": compacted.get(
+                "tier1_combinations",
+                {},
+            ).get("missing_required_planets", []),
+            "error": compacted.get(
+                "tier1_combinations",
+                {},
+            ).get("error"),
+        },
         "planet_cusp_contacts": {
             "status": compacted.get(
                 "planet_cusp_contacts",
@@ -6669,6 +6896,9 @@ def compact_action_response(
         ),
         "rashi_placidus": compact_rashi_placidus(
             response.get("rashi_placidus", {})
+        ),
+        "tier1_combinations": compact_tier1_combinations_layer(
+            response.get("tier1_combinations", {})
         ),
         "planet_cusp_contacts": compact_recursive(
             response.get("planet_cusp_contacts", {}),
@@ -7410,6 +7640,1156 @@ def calculate_stolen_cusps(
     }
 
 
+def extract_boolean_result(
+    result: dict[str, Any] | None,
+) -> bool | None:
+    """Extract a genuine boolean from a compact VedAstro result."""
+
+    if not isinstance(result, dict):
+        return None
+
+    value = result.get("data")
+
+    def search(candidate: Any) -> bool | None:
+        if isinstance(candidate, bool):
+            return candidate
+
+        if isinstance(candidate, (int, float)):
+            if candidate == 1:
+                return True
+            if candidate == 0:
+                return False
+            return None
+
+        if isinstance(candidate, str):
+            normalised = candidate.strip().lower()
+
+            if normalised in {"true", "yes", "1"}:
+                return True
+            if normalised in {"false", "no", "0"}:
+                return False
+
+            return None
+
+        if isinstance(candidate, dict):
+            for child in candidate.values():
+                found = search(child)
+
+                if found is not None:
+                    return found
+
+        if isinstance(candidate, list):
+            for child in candidate:
+                found = search(child)
+
+                if found is not None:
+                    return found
+
+        return None
+
+    return search(value)
+
+
+def tier1_nakshatra_details(
+    sidereal_longitude: float,
+) -> dict[str, Any]:
+    """Derive the exact Lahiri nakshatra and its Vimshottari lord."""
+
+    normalised = normalise_degrees(sidereal_longitude)
+    span = 360.0 / 27.0
+    index = min(int(normalised // span), 26)
+
+    return {
+        "nakshatra": NAKSHATRA_NAMES[index],
+        "nakshatra_lord": NAKSHATRA_LORDS[index],
+        "own_nakshatra": (
+            NAKSHATRA_LORDS[index]
+        ),
+    }
+
+
+def tier1_side_for_house(
+    house_number: int,
+) -> str | None:
+    if house_number in TIER1_FAVOURITE_VICTORY_HOUSES:
+        return "Favourite"
+
+    if house_number in TIER1_UNDERDOG_VICTORY_HOUSES:
+        return "Underdog"
+
+    return None
+
+
+def tier1_signed_value(
+    side: str,
+    points: float,
+) -> float:
+    return points if side == "Favourite" else -points
+
+
+def tier1_planet_snapshot(
+    planet_name: str,
+    result: dict[str, Any],
+    ascendant_longitude: float,
+) -> dict[str, Any]:
+    """Build one exact D1 whole-sign planet snapshot."""
+
+    longitude = extract_total_degrees(
+        result.get("sidereal_longitude", {})
+    )
+
+    if longitude is None:
+        return {
+            "status": "Unavailable",
+            "planet": planet_name,
+            "error": "Exact sidereal longitude is unavailable.",
+        }
+
+    longitude = normalise_degrees(longitude)
+    sign_details = sign_details_from_longitude(longitude)
+    house_number = whole_sign_house_for_longitude(
+        longitude,
+        ascendant_longitude,
+    )
+    nakshatra = tier1_nakshatra_details(longitude)
+
+    return {
+        "status": "Pass",
+        "planet": planet_name,
+        "sidereal_longitude": round(longitude, 8),
+        **sign_details,
+        "whole_sign_house_number": house_number,
+        "whole_sign_house": f"House{house_number}",
+        "victory_side": tier1_side_for_house(house_number),
+        "natural_class": (
+            "Malefic"
+            if planet_name in TIER1_NATURAL_MALEFICS
+            else (
+                "Benefic"
+                if planet_name in TIER1_NATURAL_BENEFICS
+                else "Moon/manual"
+            )
+        ),
+        "retrograde": extract_boolean_result(
+            result.get("retrograde")
+        ),
+        "combust": extract_boolean_result(
+            result.get("combust")
+        ),
+        "exalted": extract_boolean_result(
+            result.get("exalted")
+        ),
+        "debilitated": extract_boolean_result(
+            result.get("debilitated")
+        ),
+        "own_sign": extract_boolean_result(
+            result.get("own_sign")
+        ),
+        "moolatrikona": extract_boolean_result(
+            result.get("moolatrikona")
+        ),
+        "dig_bala": (
+            TIER1_DIG_BALA_HOUSES.get(planet_name)
+            == house_number
+        ),
+        "nakshatra": nakshatra["nakshatra"],
+        "nakshatra_lord": nakshatra["nakshatra_lord"],
+        "own_nakshatra": (
+            nakshatra["nakshatra_lord"] == planet_name
+        ),
+        "shadbala": compact_calculation_result(
+            result.get("shadbala", {}),
+            90,
+        ),
+    }
+
+
+def calculate_tier1_parivartana(
+    snapshots: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Detect exact classical mutual sign reception."""
+
+    classical = (
+        "Sun",
+        "Moon",
+        "Mars",
+        "Mercury",
+        "Jupiter",
+        "Venus",
+        "Saturn",
+    )
+    pairs: list[dict[str, Any]] = []
+    eligible_benefics: set[str] = set()
+
+    for first_index, first_name in enumerate(classical):
+        first = snapshots.get(first_name, {})
+
+        if first.get("status") != "Pass":
+            continue
+
+        first_sign_lord = SIGN_LORDS.get(first.get("sign"))
+
+        for second_name in classical[first_index + 1:]:
+            second = snapshots.get(second_name, {})
+
+            if second.get("status") != "Pass":
+                continue
+
+            second_sign_lord = SIGN_LORDS.get(
+                second.get("sign")
+            )
+
+            if (
+                first_sign_lord != second_name
+                or second_sign_lord != first_name
+            ):
+                continue
+
+            first_side = first.get("victory_side")
+            second_side = second.get("victory_side")
+            victory_house_relevance = [
+                side
+                for side in (first_side, second_side)
+                if side
+            ]
+
+            pair = {
+                "planets": [first_name, second_name],
+                "first": {
+                    "planet": first_name,
+                    "sign": first.get("sign"),
+                    "sign_lord": first_sign_lord,
+                    "house": first.get("whole_sign_house"),
+                    "victory_side": first_side,
+                },
+                "second": {
+                    "planet": second_name,
+                    "sign": second.get("sign"),
+                    "sign_lord": second_sign_lord,
+                    "house": second.get("whole_sign_house"),
+                    "victory_side": second_side,
+                },
+                "victory_house_relevance": (
+                    victory_house_relevance
+                ),
+                "especially_relevant": bool(
+                    victory_house_relevance
+                ),
+                "book_effect": (
+                    "Mutual reception strengthens both planets. A "
+                    "benefic in the pair becomes eligible for the "
+                    "victory-house technique."
+                ),
+                "tier": "Supplemental to Tier 1",
+                "fixed_points_defined": False,
+                "pdf_pages": TIER1_PDF_PAGES[
+                    "parivartana"
+                ],
+            }
+            pairs.append(pair)
+
+            for planet_name in (first_name, second_name):
+                if planet_name in TIER1_NATURAL_BENEFICS:
+                    eligible_benefics.add(planet_name)
+
+    return {
+        "status": "Pass",
+        "method": "Chapter3Parivartana",
+        "detected": bool(pairs),
+        "pairs": pairs,
+        "eligible_benefics": sorted(eligible_benefics),
+        "fixed_points_defined": False,
+        "points_applied": False,
+        "pdf_pages": TIER1_PDF_PAGES["parivartana"],
+    }
+
+
+def tier1_independent_strength_sources(
+    snapshot: dict[str, Any],
+    parivartana_eligible: bool,
+) -> list[str]:
+    """
+    Return independent strength sources without double-counting Mercury's
+    exaltation and own-sign condition in Virgo as two separate dignities.
+    """
+
+    sources: list[str] = []
+
+    if snapshot.get("exalted") is True:
+        sources.append("exaltation")
+    elif snapshot.get("own_sign") is True:
+        sources.append("own sign")
+    elif snapshot.get("moolatrikona") is True:
+        sources.append("moolatrikona")
+
+    if snapshot.get("retrograde") is True:
+        sources.append("retrogression")
+
+    if snapshot.get("dig_bala") is True:
+        sources.append("dig bala")
+
+    if snapshot.get("own_nakshatra") is True:
+        sources.append("own nakshatra")
+
+    if parivartana_eligible:
+        sources.append("parivartana")
+
+    return sources
+
+
+def calculate_tier1_victory_houses(
+    snapshots: dict[str, dict[str, Any]],
+    parivartana: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the book's conservative signed victory-house point method."""
+
+    parivartana_benefics = set(
+        parivartana.get("eligible_benefics", [])
+    )
+    ledger: list[dict[str, Any]] = []
+    manual_candidates: list[dict[str, Any]] = []
+    unavailable: list[dict[str, Any]] = []
+    favourite_points = 0.0
+    underdog_points = 0.0
+
+    for planet_name, snapshot in snapshots.items():
+        if snapshot.get("status") != "Pass":
+            unavailable.append({
+                "planet": planet_name,
+                "reason": snapshot.get("error"),
+            })
+            continue
+
+        side = snapshot.get("victory_side")
+
+        if not side:
+            continue
+
+        natural_malefic = (
+            planet_name in TIER1_NATURAL_MALEFICS
+        )
+        natural_benefic = (
+            planet_name in TIER1_NATURAL_BENEFICS
+        )
+        parivartana_eligible = (
+            planet_name in parivartana_benefics
+        )
+        strength_sources = (
+            tier1_independent_strength_sources(
+                snapshot,
+                parivartana_eligible,
+            )
+        )
+
+        auto_eligible = natural_malefic
+        eligibility_reason = (
+            "Natural malefic in a victory house."
+            if natural_malefic
+            else None
+        )
+
+        if natural_benefic:
+            exaggerated_sources = [
+                source
+                for source in strength_sources
+                if source in {
+                    "exaltation",
+                    "retrogression",
+                    "parivartana",
+                }
+            ]
+
+            if exaggerated_sources:
+                auto_eligible = True
+                eligibility_reason = (
+                    "Benefic made eligible by "
+                    + ", ".join(exaggerated_sources)
+                    + "."
+                )
+            elif (
+                snapshot.get("own_sign") is True
+                or snapshot.get("own_nakshatra") is True
+                or snapshot.get("dig_bala") is True
+            ):
+                manual_candidates.append({
+                    "planet": planet_name,
+                    "side": side,
+                    "house": snapshot.get(
+                        "whole_sign_house"
+                    ),
+                    "reason": (
+                        "Stable/strong benefic without the stricter "
+                        "automatic exaggerated condition. The book "
+                        "allows judgment but later prefers exaltation "
+                        "or retrogression."
+                    ),
+                    "strength_sources": strength_sources,
+                    "automatic_points": 0.0,
+                })
+
+        if planet_name == "Moon":
+            manual_candidates.append({
+                "planet": "Moon",
+                "side": side,
+                "house": snapshot.get(
+                    "whole_sign_house"
+                ),
+                "reason": (
+                    "The author normally excludes the Moon from "
+                    "automatic victory-house scoring; exceptional "
+                    "phase/strength requires manual judgment."
+                ),
+                "strength_sources": strength_sources,
+                "automatic_points": 0.0,
+            })
+            continue
+
+        if not auto_eligible:
+            continue
+
+        if snapshot.get("debilitated") is True:
+            points = 2.0
+            point_reason = (
+                "Book example value for a debilitated qualifying "
+                "victory-house planet."
+            )
+            bonus_sources: list[str] = []
+        else:
+            points = 2.5
+            point_reason = (
+                "Book base value for an eligible victory-house planet."
+            )
+
+            if natural_benefic:
+                # One exaggerated source makes the benefic eligible.
+                # Additional independent sources add 0.5, capped at the
+                # book's general Tier 1 upper range.
+                eligibility_sources = [
+                    source
+                    for source in strength_sources
+                    if source in {
+                        "exaltation",
+                        "retrogression",
+                        "parivartana",
+                    }
+                ]
+                consumed = (
+                    eligibility_sources[0]
+                    if eligibility_sources
+                    else None
+                )
+                bonus_sources = [
+                    source
+                    for source in strength_sources
+                    if source != consumed
+                ]
+            else:
+                bonus_sources = list(strength_sources)
+
+            points += min(
+                len(bonus_sources) * 0.5,
+                1.5,
+            )
+            points = min(points, 4.0)
+
+            if bonus_sources:
+                point_reason += (
+                    " Additional half-point strength sources: "
+                    + ", ".join(bonus_sources)
+                    + "."
+                )
+
+        if side == "Favourite":
+            favourite_points += points
+        else:
+            underdog_points += points
+
+        ledger.append({
+            "rule": (
+                f"{planet_name} in "
+                f"{snapshot.get('whole_sign_house')}"
+            ),
+            "planet": planet_name,
+            "house": snapshot.get(
+                "whole_sign_house"
+            ),
+            "side": side,
+            "natural_class": snapshot.get(
+                "natural_class"
+            ),
+            "eligibility": eligibility_reason,
+            "strength_sources": strength_sources,
+            "debilitated": snapshot.get(
+                "debilitated"
+            ),
+            "combust": snapshot.get("combust"),
+            "points": round(points, 2),
+            "signed_points": round(
+                tier1_signed_value(side, points),
+                2,
+            ),
+            "point_reason": point_reason,
+            "combustion_adjustment_applied": False,
+            "combustion_note": (
+                "Combustion is reported as instability/affliction. "
+                "No fixed numerical reduction is invented."
+                if snapshot.get("combust") is True
+                else None
+            ),
+            "shadbala": snapshot.get("shadbala"),
+            "pdf_pages": TIER1_PDF_PAGES[
+                "victory_houses"
+            ],
+        })
+
+    favourite_points = round(favourite_points, 2)
+    underdog_points = round(underdog_points, 2)
+
+    return {
+        "status": (
+            "Pass" if not unavailable else "Partial"
+        ),
+        "method": "Chapter3VictoryHouseLedger",
+        "book_tier": 1,
+        "favourite_houses": sorted(
+            TIER1_FAVOURITE_VICTORY_HOUSES
+        ),
+        "underdog_houses": sorted(
+            TIER1_UNDERDOG_VICTORY_HOUSES
+        ),
+        "ledger": ledger,
+        "manual_candidates": manual_candidates,
+        "unavailable_planets": unavailable,
+        "favourite_points": favourite_points,
+        "underdog_points": underdog_points,
+        "signed_favourite_total": round(
+            favourite_points - underdog_points,
+            2,
+        ),
+        "automatic_point_scope": (
+            "Eligible victory-house planets only."
+        ),
+        "sky_pky_included_in_total": False,
+        "supplemental_yogas_included_in_total": False,
+        "pdf_pages": TIER1_PDF_PAGES[
+            "victory_houses"
+        ],
+    }
+
+
+def calculate_tier1_sky_pky(
+    snapshots: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Detect book-locked SKY and PKY around Houses 1 and 7."""
+
+    occupancy: dict[int, list[str]] = {
+        house: [] for house in range(1, 13)
+    }
+
+    for planet_name, snapshot in snapshots.items():
+        if snapshot.get("status") != "Pass":
+            continue
+
+        house = snapshot.get("whole_sign_house_number")
+
+        if isinstance(house, int):
+            occupancy[house].append(planet_name)
+
+    for planets_in_house in occupancy.values():
+        planets_in_house.sort(
+            key=lambda item: PLANET_ORDER.get(item, 99)
+        )
+
+    results: dict[str, Any] = {}
+
+    for target_house, side in (
+        (1, "Favourite"),
+        (7, "Underdog"),
+    ):
+        previous_house = (
+            12 if target_house == 1 else target_house - 1
+        )
+        next_house = (
+            1 if target_house == 12 else target_house + 1
+        )
+
+        previous_planets = occupancy[previous_house]
+        next_planets = occupancy[next_house]
+
+        previous_benefics = [
+            planet
+            for planet in previous_planets
+            if planet in TIER1_NATURAL_BENEFICS
+        ]
+        next_benefics = [
+            planet
+            for planet in next_planets
+            if planet in TIER1_NATURAL_BENEFICS
+        ]
+
+        sky_formed = bool(
+            previous_benefics and next_benefics
+        )
+        sky_mild_marring = sorted({
+            planet
+            for planet in previous_planets + next_planets
+            if planet in {"Sun", "Rahu", "Ketu"}
+        })
+        sky_heavy_marring = sorted({
+            planet
+            for planet in previous_planets + next_planets
+            if planet in {"Mars", "Saturn"}
+        })
+        debilitated_sky_benefics = sorted({
+            planet
+            for planet in previous_benefics + next_benefics
+            if snapshots.get(
+                planet,
+                {},
+            ).get("debilitated") is True
+        })
+
+        if not sky_formed:
+            sky_condition = "Absent"
+        elif sky_heavy_marring:
+            sky_condition = "Heavily afflicted"
+        elif sky_mild_marring or debilitated_sky_benefics:
+            sky_condition = "Diminished"
+        else:
+            sky_condition = "Full"
+
+        previous_classical_malefics = [
+            planet
+            for planet in previous_planets
+            if planet in TIER1_CLASSICAL_PKY_MALEFICS
+        ]
+        next_classical_malefics = [
+            planet
+            for planet in next_planets
+            if planet in TIER1_CLASSICAL_PKY_MALEFICS
+        ]
+        previous_nodes = [
+            planet
+            for planet in previous_planets
+            if planet in TIER1_NODE_MALEFICS
+        ]
+        next_nodes = [
+            planet
+            for planet in next_planets
+            if planet in TIER1_NODE_MALEFICS
+        ]
+
+        pky_formed = bool(
+            previous_classical_malefics
+            and next_classical_malefics
+        )
+        any_malefic_each_side = bool(
+            (
+                previous_classical_malefics
+                or previous_nodes
+            )
+            and (
+                next_classical_malefics
+                or next_nodes
+            )
+        )
+        node_only_partial = bool(
+            any_malefic_each_side and not pky_formed
+        )
+        pky_intensified_by_nodes = bool(
+            pky_formed
+            and (previous_nodes or next_nodes)
+        )
+
+        if pky_formed and pky_intensified_by_nodes:
+            pky_condition = "Full and node-intensified"
+        elif pky_formed:
+            pky_condition = "Full"
+        elif node_only_partial:
+            pky_condition = "Partial node pattern"
+        else:
+            pky_condition = "Absent"
+
+        results[side] = {
+            "side": side,
+            "target_house": f"House{target_house}",
+            "flanking_houses": [
+                f"House{previous_house}",
+                f"House{next_house}",
+            ],
+            "flanking_occupancy": {
+                f"House{previous_house}": (
+                    previous_planets
+                ),
+                f"House{next_house}": next_planets,
+            },
+            "sky": {
+                "formed": sky_formed,
+                "condition": sky_condition,
+                "benefics_previous_side": (
+                    previous_benefics
+                ),
+                "benefics_next_side": next_benefics,
+                "mild_or_shadow_marring": (
+                    sky_mild_marring
+                ),
+                "heavy_marring": sky_heavy_marring,
+                "debilitated_benefics": (
+                    debilitated_sky_benefics
+                ),
+                "book_effect": (
+                    "Protects the represented team and often "
+                    "improves performance beyond expectation."
+                    if sky_formed
+                    else "No full SKY."
+                ),
+                "book_point_guidance": (
+                    "Full SKY/PKY tier is generally 7-9; a "
+                    "heavily afflicted SKY may be only 3-4 or "
+                    "less. Exact value requires chart judgment."
+                ),
+                "automatic_points_applied": False,
+            },
+            "pky": {
+                "formed": pky_formed,
+                "condition": pky_condition,
+                "classical_malefics_previous_side": (
+                    previous_classical_malefics
+                ),
+                "classical_malefics_next_side": (
+                    next_classical_malefics
+                ),
+                "nodes_previous_side": previous_nodes,
+                "nodes_next_side": next_nodes,
+                "node_only_side_is_full_pky": False,
+                "intensified_by_nodes": (
+                    pky_intensified_by_nodes
+                ),
+                "book_effect": (
+                    "Makes the represented team vulnerable; "
+                    "PKY is generally less potent for harm than "
+                    "SKY is for protection."
+                    if pky_formed
+                    else (
+                        "A node-only flank is not treated as a "
+                        "full PKY."
+                        if node_only_partial
+                        else "No full PKY."
+                    )
+                ),
+                "book_point_guidance": (
+                    "Tier 2 range is generally 7-9, but the "
+                    "book does not make PKY mechanically equal "
+                    "to a clean SKY."
+                ),
+                "automatic_points_applied": False,
+            },
+            "cancellation_or_mixed_testimony": (
+                "Both SKY and PKY are present; retain both as "
+                "cumulative contradictory testimony."
+                if sky_formed and pky_formed
+                else None
+            ),
+            "pdf_pages": TIER1_PDF_PAGES["sky_pky"],
+        }
+
+    return {
+        "status": "Pass",
+        "method": "Chapter3SkyPky",
+        "book_tier": 2,
+        "natural_benefics_used": sorted(
+            TIER1_NATURAL_BENEFICS
+        ),
+        "moon_automatically_used_as_sky_benefic": False,
+        "pky_full_formation_policy": (
+            "Each flank must contain Sun, Mars or Saturn. "
+            "Rahu/Ketu can mar or intensify but cannot alone "
+            "supply a full flank."
+        ),
+        "sides": results,
+        "points_applied": False,
+        "pdf_pages": TIER1_PDF_PAGES["sky_pky"],
+    }
+
+
+def tier1_apparent_magnitude(
+    julian_day_ut: float | None,
+    planet_name: str,
+) -> dict[str, Any]:
+    """Calculate apparent magnitude for a planetary-war pair."""
+
+    if (
+        not SWISSEPH_AVAILABLE
+        or julian_day_ut is None
+        or planet_name not in TIER1_SWISSEPH_BODY_IDS
+    ):
+        return {
+            "status": "Unavailable",
+            "planet": planet_name,
+            "magnitude": None,
+            "error": (
+                "Swiss Ephemeris apparent magnitude is unavailable."
+            ),
+        }
+
+    try:
+        attributes = swe.pheno_ut(
+            julian_day_ut,
+            TIER1_SWISSEPH_BODY_IDS[planet_name],
+        )
+        magnitude = float(attributes[4])
+
+        return {
+            "status": "Pass",
+            "planet": planet_name,
+            "magnitude": round(magnitude, 8),
+            "brighter_when": "Lower magnitude",
+            "error": None,
+        }
+    except Exception as error:
+        return {
+            "status": "Unavailable",
+            "planet": planet_name,
+            "magnitude": None,
+            "error": str(error),
+        }
+
+
+def calculate_tier1_planetary_war(
+    std_time: str,
+    ascendant_longitude: float,
+    snapshots: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Detect relevant <1 degree wars and determine the brighter body."""
+
+    ascendant_sign_index = int(
+        normalise_degrees(ascendant_longitude) // 30.0
+    )
+    relevant_house_sides = {
+        1: "Favourite",
+        10: "Favourite",
+        7: "Underdog",
+        4: "Underdog",
+    }
+    lord_roles: dict[str, list[dict[str, Any]]] = {}
+
+    for house_number, side in relevant_house_sides.items():
+        sign_index = (
+            ascendant_sign_index + house_number - 1
+        ) % 12
+        sign_name = ZODIAC_SIGNS[sign_index]
+        lord = SIGN_LORDS[sign_name]
+        lord_roles.setdefault(lord, []).append({
+            "house": f"House{house_number}",
+            "sign": sign_name,
+            "side": side,
+        })
+
+    try:
+        parsed_time = parse_std_time_to_utc(std_time)
+        julian_day_ut = parsed_time.get("julian_day_ut")
+        time_error = None
+    except Exception as error:
+        julian_day_ut = None
+        time_error = str(error)
+
+    wars: list[dict[str, Any]] = []
+    unavailable_planets: list[str] = []
+
+    for index, first_name in enumerate(
+        TIER1_PLANETARY_WAR_PLANETS
+    ):
+        first = snapshots.get(first_name, {})
+
+        if first.get("status") != "Pass":
+            unavailable_planets.append(first_name)
+            continue
+
+        for second_name in (
+            TIER1_PLANETARY_WAR_PLANETS[index + 1:]
+        ):
+            second = snapshots.get(second_name, {})
+
+            if second.get("status") != "Pass":
+                unavailable_planets.append(second_name)
+                continue
+
+            first_relevant = first_name in lord_roles
+            second_relevant = second_name in lord_roles
+
+            if not (first_relevant or second_relevant):
+                continue
+
+            distance = angular_distance(
+                first["sidereal_longitude"],
+                second["sidereal_longitude"],
+            )
+
+            if distance > 1.0 + 1e-9:
+                continue
+
+            first_magnitude = tier1_apparent_magnitude(
+                julian_day_ut,
+                first_name,
+            )
+            second_magnitude = tier1_apparent_magnitude(
+                julian_day_ut,
+                second_name,
+            )
+            winner = None
+            loser = None
+            winner_method = None
+
+            if (
+                first_magnitude.get("status") == "Pass"
+                and second_magnitude.get("status") == "Pass"
+            ):
+                first_value = first_magnitude["magnitude"]
+                second_value = second_magnitude["magnitude"]
+
+                if abs(first_value - second_value) > 1e-9:
+                    winner = (
+                        first_name
+                        if first_value < second_value
+                        else second_name
+                    )
+                    loser = (
+                        second_name
+                        if winner == first_name
+                        else first_name
+                    )
+                    winner_method = (
+                        "Swiss Ephemeris apparent magnitude; "
+                        "lower magnitude is brighter."
+                    )
+
+            first_sides = sorted({
+                role["side"]
+                for role in lord_roles.get(first_name, [])
+            })
+            second_sides = sorted({
+                role["side"]
+                for role in lord_roles.get(second_name, [])
+            })
+            cross_side = bool(
+                first_sides
+                and second_sides
+                and set(first_sides) != set(second_sides)
+            )
+            winner_sides = sorted({
+                role["side"]
+                for role in lord_roles.get(winner, [])
+            }) if winner else []
+            loser_sides = sorted({
+                role["side"]
+                for role in lord_roles.get(loser, [])
+            }) if loser else []
+
+            wars.append({
+                "planets": [first_name, second_name],
+                "angular_distance": round(distance, 8),
+                "within_one_degree": True,
+                "first_roles": lord_roles.get(
+                    first_name,
+                    [],
+                ),
+                "second_roles": lord_roles.get(
+                    second_name,
+                    [],
+                ),
+                "cross_side_war": cross_side,
+                "first_magnitude": first_magnitude,
+                "second_magnitude": second_magnitude,
+                "winner": winner,
+                "loser": loser,
+                "winner_method": winner_method,
+                "winner_represented_sides": winner_sides,
+                "loser_represented_sides": loser_sides,
+                "book_effect": (
+                    "Every relevant ruler in war is destabilized. "
+                    "For a cross-side war, the brighter planet's "
+                    "side receives an edge while the loser's side "
+                    "is tarnished, not automatically defeated."
+                ),
+                "fixed_points_defined": False,
+                "points_applied": False,
+                "pdf_pages": TIER1_PDF_PAGES[
+                    "planetary_war"
+                ],
+            })
+
+    return {
+        "status": (
+            "Pass"
+            if time_error is None
+            else "Partial"
+        ),
+        "method": "Chapter3PlanetaryWar",
+        "orb_degrees": 1.0,
+        "relevant_house_lords": lord_roles,
+        "wars": wars,
+        "detected": bool(wars),
+        "winner_standard": (
+            "Brighter planet, measured by lower apparent magnitude."
+        ),
+        "lesser_longitude_fallback_used": False,
+        "unavailable_planets": sorted(
+            set(unavailable_planets)
+        ),
+        "time_error": time_error,
+        "fixed_points_defined": False,
+        "points_applied": False,
+        "pdf_pages": TIER1_PDF_PAGES[
+            "planetary_war"
+        ],
+    }
+
+
+def calculate_tier1_combinations(
+    std_time: str,
+    rashi_placidus: dict[str, Any],
+    planets: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Calculate Chapter 3 victory houses, SKY/PKY, parivartana and
+    relevant planetary war using exact Lahiri D1 longitudes.
+    """
+
+    if rashi_placidus.get("status") != "Pass":
+        return {
+            "status": "Unavailable",
+            "method": "BookLockedChapter3Tier1Engine",
+            "book_chapter": 3,
+            "ayanamsa": "Lahiri",
+            "error": "Exact Lahiri Ascendant longitude is unavailable.",
+            "victory_houses": {},
+            "sky_pky": {},
+            "parivartana": {},
+            "planetary_war": {},
+        }
+
+    ascendant_longitude = rashi_placidus.get(
+        "cusps",
+        {},
+    ).get(
+        "House1",
+        {},
+    ).get("sidereal_longitude")
+
+    if not isinstance(ascendant_longitude, (int, float)):
+        return {
+            "status": "Unavailable",
+            "method": "BookLockedChapter3Tier1Engine",
+            "book_chapter": 3,
+            "ayanamsa": "Lahiri",
+            "error": "Exact Lahiri Ascendant longitude is unavailable.",
+            "victory_houses": {},
+            "sky_pky": {},
+            "parivartana": {},
+            "planetary_war": {},
+        }
+
+    ascendant_longitude = normalise_degrees(
+        float(ascendant_longitude)
+    )
+    snapshots = {
+        planet_name: tier1_planet_snapshot(
+            planet_name,
+            result,
+            ascendant_longitude,
+        )
+        for planet_name, result in planets.items()
+    }
+    missing_required_planets = [
+        planet_name
+        for planet_name in PLANETS
+        if planet_name not in snapshots
+        or snapshots[planet_name].get("status") != "Pass"
+    ]
+
+    parivartana = calculate_tier1_parivartana(
+        snapshots
+    )
+    victory_houses = calculate_tier1_victory_houses(
+        snapshots,
+        parivartana,
+    )
+    sky_pky = calculate_tier1_sky_pky(snapshots)
+    planetary_war = calculate_tier1_planetary_war(
+        std_time,
+        ascendant_longitude,
+        snapshots,
+    )
+
+    layer_status = (
+        "Pass"
+        if not missing_required_planets
+        and planetary_war.get("status") == "Pass"
+        else "Partial"
+    )
+
+    return {
+        "status": layer_status,
+        "method": "BookLockedChapter3Tier1Engine",
+        "book_chapter": 3,
+        "ayanamsa": "Lahiri",
+        "house_system": "Whole-sign rashi from exact Lahiri Ascendant",
+        "assignment": {
+            "House1": "Favourite",
+            "House7": "Underdog",
+        },
+        "ascendant": {
+            "sidereal_longitude": round(
+                ascendant_longitude,
+                8,
+            ),
+            **sign_details_from_longitude(
+                ascendant_longitude
+            ),
+        },
+        "planet_snapshots": snapshots,
+        "victory_houses": victory_houses,
+        "sky_pky": sky_pky,
+        "parivartana": parivartana,
+        "planetary_war": planetary_war,
+        "automatic_signed_total": (
+            victory_houses.get(
+                "signed_favourite_total"
+            )
+        ),
+        "automatic_signed_total_scope": (
+            "Victory-house planets only. SKY/PKY, parivartana "
+            "and planetary war remain separate because their "
+            "exact numerical adjustment is contextual."
+        ),
+        "missing_required_planets": (
+            missing_required_planets
+        ),
+        "manual_review_items": {
+            "moon_victory_house": (
+                "Reported but not automatically scored."
+            ),
+            "combustion": (
+                "Reported without an invented fixed reduction."
+            ),
+            "shadbala": (
+                "Returned as evidence without an invented threshold."
+            ),
+            "own_sign_or_own_nakshatra_only_benefic": (
+                "Reported as a manual candidate unless another "
+                "exaggerated condition is present."
+            ),
+        },
+        "pdf_pages": sorted({
+            page
+            for pages in TIER1_PDF_PAGES.values()
+            for page in pages
+        }),
+        "points_applied": True,
+        "error": None,
+    }
+
+
 # ============================================================
 # CONSISTENCY VALIDATION
 # ============================================================
@@ -7848,6 +9228,7 @@ def health() -> dict[str, Any]:
             "nakshatra_taras": True,
             "navamsha_name_sounds": True,
             "stolen_cusps": True,
+            "tier1_combinations": True,
         },
         "outer_planet_engine": {
             "name": "pyswisseph",
@@ -7993,6 +9374,15 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         for name in requested_planets
         if name in planets
     }
+
+    # Chapter 3 victory houses, SKY/PKY, parivartana and relevant
+    # planetary war. This uses whole-sign rashi houses from the exact
+    # Lahiri Ascendant and remains non-essential to the standard chart gate.
+    tier1_combinations = calculate_tier1_combinations(
+        request.std_time,
+        rashi_placidus,
+        planets,
+    )
 
     # Exact Tier 2 raw geometry: requested planets against the six sensitive
     # Placidus cusps. This remains non-essential for the standard chart gate.
@@ -8167,6 +9557,7 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         },
         "core": core,
         "rashi_placidus": rashi_placidus,
+        "tier1_combinations": tier1_combinations,
         "planet_cusp_contacts": planet_cusp_contacts,
         "navamsha_cusps": navamsha_cusps,
         "kp_sublords": kp_sublords,
@@ -8185,6 +9576,12 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
             ),
             "planet_parameter_fix": (
                 "Every planet request is sent as a nested Name object."
+            ),
+            "tier1_combinations": (
+                "Chapter 3 victory houses, SKY/PKY, parivartana and "
+                "relevant planetary war calculated from exact Lahiri D1 "
+                "longitudes. Apparent magnitude for planetary war uses "
+                "Swiss Ephemeris when available."
             ),
             "planet_cusp_contacts": (
                 "Internally calculated from exact Lahiri Placidus cusps and "
