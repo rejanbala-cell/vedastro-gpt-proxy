@@ -4,6 +4,8 @@ import json
 import os
 import threading
 import time
+import re
+import unicodedata
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -32,7 +34,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.12.0"
+PROXY_VERSION = "1.13.0"
 
 
 # ============================================================
@@ -334,8 +336,8 @@ app = FastAPI(
         "nested planet parameters, exact Placidus cusps, "
         "planet-to-cusp contacts, exact Navamsha cusp geometry, "
         "Krishnamurti KP sublords, outer-planet geometry, "
-        "Gulika/Upaketu geometry, Chapter 8 nakshatra taras "
-        "and strict validation."
+        "Gulika/Upaketu geometry, Chapter 7 name sounds, "
+        "Chapter 8 nakshatra taras and strict validation."
     ),
 )
 
@@ -661,6 +663,78 @@ TARA_TARGETS = {
 # - research_only / none: no automatic contest interpretation
 #
 # "positions" are absolute sidereal longitudes. "range" is inclusive.
+
+# Gambler's Dharma Chapter 7, Table 7.1.
+#
+# Each D1 sign contains nine 3°20' nama-pada sections. The values below
+# faithfully preserve the book's IAST spellings and slash alternatives.
+NAMA_PADA_SECTION_DEGREES = 30.0 / 9.0
+
+NAMA_PADA_TABLE = {
+    "Aries": (
+        "cu", "ce", "co", "la", "li", "lu", "le", "lo", "a",
+    ),
+    "Taurus": (
+        "i", "u", "e", "o", "va", "vi", "vu", "ve", "vo",
+    ),
+    "Gemini": (
+        "ka", "ki", "ku", "gha", "ṅa/pha", "cha", "ke", "ko", "ha",
+    ),
+    "Cancer": (
+        "hi", "hu", "he", "ho", "ḍa", "ḍi", "ḍu", "ḍe", "ḍo",
+    ),
+    "Leo": (
+        "ma", "mi", "mu", "me", "mo", "ṭa", "ṭi", "ṭu", "ṭe",
+    ),
+    "Virgo": (
+        "ṭo", "pa", "pi", "pu", "ḍa", "ṇa", "ṭha", "pe", "po",
+    ),
+    "Libra": (
+        "ra", "ri", "ru", "re", "ro", "ta", "ti", "tu", "te",
+    ),
+    "Scorpio": (
+        "to", "na", "ni", "nu", "ne", "no", "ya", "yi", "yu",
+    ),
+    "Sagittarius": (
+        "ye", "yo", "ba", "bi", "bu", "dha", "bha", "ḍha", "be",
+    ),
+    "Capricorn": (
+        "bo", "ja/śa", "ji/śi", "ju/śu", "je/śe",
+        "jo/śo", "jha/śa", "ga", "gi",
+    ),
+    "Aquarius": (
+        "gu", "ge", "go", "sa", "si", "su", "se", "so", "da",
+    ),
+    "Pisces": (
+        "di", "du", "kha/jha", "ña", "tha", "de", "do", "ca", "ci",
+    ),
+}
+
+NAMA_PADA_PDF_PAGES = {
+    "chapter_opening": 182,
+    "table_7_1": 184,
+    "main_house10_rule": 185,
+    "third_tier_points_example": 187,
+    "planet_resonance": 189,
+    "sun_research_rule": 190,
+    "compound_name_rule": 191,
+    "diphthong_rule": 192,
+    "nasal_guidance": 194,
+    "summary": 198,
+}
+
+# These substitutions are explicitly described by Chapter 7. They are used
+# only to compare caller-confirmed sounds. They are never used to invent a
+# pronunciation from a raw participant name.
+NAMA_PADA_BOOK_SUBSTITUTIONS = {
+    "w_to_v": True,
+    "f_to_pha_or_pa": True,
+    "z_to_jha": True,
+    "e_to_ai_diphthong": True,
+    "o_to_au_diphthong": True,
+    "short_long_vowels_equivalent": True,
+}
+
 TARA_CATALOG = (
     {
         "nakshatra": "Ashvini",
@@ -1061,6 +1135,37 @@ class LocationInput(BaseModel):
     latitude: float = Field(ge=-90, le=90)
 
 
+class ParticipantNameInput(BaseModel):
+    name: str = Field(
+        min_length=1,
+        max_length=200,
+        description=(
+            "Verified official participant or team name. The raw name is "
+            "not automatically treated as a confirmed Sanskrit sound."
+        ),
+    )
+    confirmed_opening_sounds: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description=(
+            "Caller-reviewed opening sounds for the initial syllables of "
+            "the participant's compound name, already expressed in a "
+            "book-compatible approximation, for example ['sa', 'di', 'pa']."
+        ),
+    )
+
+
+class ParticipantsInput(BaseModel):
+    favourite: ParticipantNameInput | None = Field(
+        default=None,
+        description="Genuine market favourite assigned to House 1.",
+    )
+    underdog: ParticipantNameInput | None = Field(
+        default=None,
+        description="Genuine market underdog assigned to House 7.",
+    )
+
+
 class EventChartInput(BaseModel):
     event_id: str | None = None
     std_time: str = Field(
@@ -1073,6 +1178,13 @@ class EventChartInput(BaseModel):
     )
     planets: list[str] = Field(
         default_factory=lambda: DEFAULT_PLANETS.copy()
+    )
+    participants: ParticipantsInput | None = Field(
+        default=None,
+        description=(
+            "Optional favourite/underdog names and caller-confirmed "
+            "opening sounds for Chapter 7 nama-pada comparison."
+        ),
     )
 
 
@@ -4861,6 +4973,527 @@ def calculate_nakshatra_taras(
     }
 
 
+def nama_pada_for_longitude(
+    sidereal_longitude: float,
+) -> dict[str, Any]:
+    """Return the exact Table 7.1 syllable for one Lahiri D1 longitude."""
+
+    longitude = normalise_degrees(float(sidereal_longitude))
+    sign_index = int(longitude // 30.0)
+    sign_name = ZODIAC_SIGNS[sign_index]
+    degree_in_sign = longitude - (sign_index * 30.0)
+
+    pada_index = int(
+        degree_in_sign // NAMA_PADA_SECTION_DEGREES
+    )
+    pada_index = min(max(pada_index, 0), 8)
+
+    start_degree = pada_index * NAMA_PADA_SECTION_DEGREES
+    end_degree = start_degree + NAMA_PADA_SECTION_DEGREES
+    syllable = NAMA_PADA_TABLE[sign_name][pada_index]
+    syllable_options = [
+        item.strip()
+        for item in syllable.split("/")
+        if item.strip()
+    ]
+
+    return {
+        "sidereal_longitude": round(longitude, 8),
+        "sign": sign_name,
+        "degree_in_sign": round(degree_in_sign, 8),
+        "navamsha_number_in_sign": pada_index + 1,
+        "segment_start_degree": round(start_degree, 8),
+        "segment_end_degree": round(end_degree, 8),
+        "segment_width_degrees": round(
+            NAMA_PADA_SECTION_DEGREES,
+            8,
+        ),
+        "table_7_1_syllable": syllable,
+        "syllable_options_iast": syllable_options,
+    }
+
+
+def normalize_confirmed_name_sound(value: str) -> str:
+    """
+    Normalize a caller-confirmed sound without deriving pronunciation from a
+    raw name.
+    """
+
+    raw = str(value).strip().lower()
+
+    # Preserve the phonetic meaning of IAST characters before stripping
+    # combining marks.
+    replacements = {
+        "ś": "sh",
+        "ṣ": "sh",
+        "ṅ": "ng",
+        "ñ": "ny",
+        "ṭ": "t",
+        "ḍ": "d",
+        "ṇ": "n",
+        "ṛ": "r",
+        "ḷ": "l",
+    }
+
+    for source, target in replacements.items():
+        raw = raw.replace(source, target)
+
+    decomposed = unicodedata.normalize("NFKD", raw)
+    without_marks = "".join(
+        character
+        for character in decomposed
+        if not unicodedata.combining(character)
+    )
+
+    return re.sub(r"[^a-z]", "", without_marks)
+
+
+def nama_pada_sound_aliases(
+    syllable_value: str,
+) -> list[str]:
+    """
+    Build only book-supported comparison aliases for a Table 7.1 syllable.
+
+    The closure includes v/w, pa-or-pha/f, jha/z, e/ai and o/au. It also
+    includes the standard English approximation of Sanskrit c as ch.
+    """
+
+    seeds = {
+        normalize_confirmed_name_sound(item)
+        for item in str(syllable_value).split("/")
+        if normalize_confirmed_name_sound(item)
+    }
+    aliases = set(seeds)
+
+    changed = True
+
+    while changed:
+        changed = False
+
+        for sound in list(aliases):
+            additions = set()
+
+            if sound.startswith("v"):
+                additions.add("w" + sound[1:])
+            if sound.startswith("w"):
+                additions.add("v" + sound[1:])
+
+            if sound.startswith("ph"):
+                additions.add("p" + sound[2:])
+                additions.add("f" + sound[2:])
+            elif sound.startswith("p"):
+                additions.add("ph" + sound[1:])
+                additions.add("f" + sound[1:])
+            elif sound.startswith("f"):
+                additions.add("p" + sound[1:])
+                additions.add("ph" + sound[1:])
+
+            if sound.startswith("jh"):
+                additions.add("z" + sound[2:])
+            elif sound.startswith("z"):
+                additions.add("jh" + sound[1:])
+
+            if sound.startswith("c"):
+                additions.add("ch" + sound[1:])
+            elif sound.startswith("ch"):
+                additions.add("c" + sound[2:])
+
+            if sound.endswith("e"):
+                additions.add(sound[:-1] + "ai")
+            elif sound.endswith("ai"):
+                additions.add(sound[:-2] + "e")
+
+            if sound.endswith("o"):
+                additions.add(sound[:-1] + "au")
+            elif sound.endswith("au"):
+                additions.add(sound[:-2] + "o")
+
+            additions = {
+                item
+                for item in additions
+                if item and len(item) <= 12
+            }
+
+            new_items = additions - aliases
+
+            if new_items:
+                aliases.update(new_items)
+                changed = True
+
+    return sorted(aliases)
+
+
+def raw_name_word_audit(name: str) -> list[dict[str, Any]]:
+    """
+    Return raw name words for human review.
+
+    No word is converted into a decision-grade Sanskrit sound here.
+    """
+
+    words = re.findall(
+        r"[A-Za-zÀ-ÖØ-öø-ÿĀ-ž]+",
+        str(name),
+    )
+
+    return [
+        {
+            "word": word,
+            "orthographic_normalization": (
+                normalize_confirmed_name_sound(word)
+            ),
+            "used_as_confirmed_sound": False,
+        }
+        for word in words
+    ]
+
+
+def participant_sound_record(
+    side: str,
+    participant: ParticipantNameInput | None,
+) -> dict[str, Any]:
+    """Prepare one participant's explicit sound evidence."""
+
+    if participant is None:
+        return {
+            "status": "Unavailable",
+            "side": side,
+            "name": None,
+            "raw_name_words": [],
+            "confirmed_opening_sounds": [],
+            "normalized_confirmed_sounds": [],
+            "error": "Participant input was not supplied.",
+        }
+
+    confirmed = [
+        {
+            "index": index,
+            "supplied_sound": sound,
+            "normalized_sound": normalize_confirmed_name_sound(
+                sound
+            ),
+        }
+        for index, sound in enumerate(
+            participant.confirmed_opening_sounds
+        )
+        if normalize_confirmed_name_sound(sound)
+    ]
+
+    return {
+        "status": "Pass" if confirmed else "NeedsSoundReview",
+        "side": side,
+        "name": participant.name,
+        "raw_name_words": raw_name_word_audit(
+            participant.name
+        ),
+        "confirmed_opening_sounds": list(
+            participant.confirmed_opening_sounds
+        ),
+        "normalized_confirmed_sounds": confirmed,
+        "raw_name_used_for_matching": False,
+        "error": (
+            None
+            if confirmed
+            else (
+                "No caller-confirmed opening sounds were supplied. "
+                "Raw spelling is retained for review but is not scored."
+            )
+        ),
+    }
+
+
+def match_participant_to_nama_pada(
+    participant_record: dict[str, Any],
+    pada: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare explicit sound evidence with one exact Table 7.1 pada."""
+
+    aliases = nama_pada_sound_aliases(
+        pada["table_7_1_syllable"]
+    )
+    matches = []
+
+    for sound in participant_record.get(
+        "normalized_confirmed_sounds",
+        [],
+    ):
+        if sound["normalized_sound"] in aliases:
+            matches.append({
+                **sound,
+                "matched_alias": sound["normalized_sound"],
+                "table_syllable": pada[
+                    "table_7_1_syllable"
+                ],
+            })
+
+    return {
+        "participant_status": participant_record["status"],
+        "side": participant_record["side"],
+        "name": participant_record["name"],
+        "table_syllable": pada["table_7_1_syllable"],
+        "book_supported_aliases": aliases,
+        "matches": matches,
+        "match_count": len(matches),
+        "matched": bool(matches),
+        "multiple_name_part_exposure": len(matches) >= 2,
+        "decision_grade": (
+            participant_record["status"] == "Pass"
+            and bool(matches)
+        ),
+    }
+
+
+def calculate_navamsha_name_sounds(
+    participants: ParticipantsInput | None,
+    rashi_placidus: dict[str, Any],
+    planets: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Calculate Chapter 7 nama-pada syllables and participant-name matches.
+
+    The principal sports rule uses the exact D1 House 10 cusp. Planetary
+    syllables are returned as secondary resonance evidence. Raw participant
+    spelling is never silently treated as a confirmed pronunciation.
+    """
+
+    if rashi_placidus.get("status") != "Pass":
+        return {
+            "status": "Unavailable",
+            "method": "BookLockedChapter7NamaPada",
+            "ayanamsa": "Lahiri",
+            "error": "Exact Lahiri Placidus cusps are unavailable.",
+        }
+
+    house10_longitude = rashi_placidus.get(
+        "cusps",
+        {},
+    ).get(
+        "House10",
+        {},
+    ).get("sidereal_longitude")
+
+    if not isinstance(house10_longitude, (int, float)):
+        return {
+            "status": "Unavailable",
+            "method": "BookLockedChapter7NamaPada",
+            "ayanamsa": "Lahiri",
+            "error": "Exact House 10 cusp longitude is unavailable.",
+        }
+
+    favourite_input = (
+        participants.favourite
+        if participants
+        else None
+    )
+    underdog_input = (
+        participants.underdog
+        if participants
+        else None
+    )
+
+    participant_records = {
+        "Favourite": participant_sound_record(
+            "Favourite",
+            favourite_input,
+        ),
+        "Underdog": participant_sound_record(
+            "Underdog",
+            underdog_input,
+        ),
+    }
+
+    house10_pada = nama_pada_for_longitude(
+        float(house10_longitude)
+    )
+    house10_matches = {
+        side: match_participant_to_nama_pada(
+            record,
+            house10_pada,
+        )
+        for side, record in participant_records.items()
+    }
+
+    matched_sides = [
+        side
+        for side, result in house10_matches.items()
+        if result["decision_grade"]
+    ]
+
+    if matched_sides == ["Favourite"]:
+        main_indication = "Favourite"
+        main_note = (
+            "The exact House 10 nama-pada matches the favourite's "
+            "caller-confirmed opening sound."
+        )
+    elif matched_sides == ["Underdog"]:
+        main_indication = "Underdog"
+        main_note = (
+            "The exact House 10 nama-pada matches the underdog's "
+            "caller-confirmed opening sound."
+        )
+    elif len(matched_sides) == 2:
+        main_indication = "Both / cancellation"
+        main_note = (
+            "Both participants have caller-confirmed sounds matching "
+            "the House 10 nama-pada. No automatic winner is assigned."
+        )
+    else:
+        main_indication = "None"
+        main_note = (
+            "No decision-grade participant sound matches the exact "
+            "House 10 nama-pada."
+        )
+
+    maximum_exposure_sides = [
+        side
+        for side, result in house10_matches.items()
+        if result["decision_grade"]
+        and result["multiple_name_part_exposure"]
+    ]
+
+    planet_syllables: dict[str, dict[str, Any]] = {}
+    planet_matches = []
+
+    for planet_name, planet_result in planets.items():
+        longitude = extract_total_degrees(
+            planet_result.get("sidereal_longitude", {})
+        )
+
+        if longitude is None:
+            planet_syllables[planet_name] = {
+                "status": "Unavailable",
+                "planet": planet_name,
+                "error": "Exact sidereal longitude is unavailable.",
+            }
+            continue
+
+        pada = nama_pada_for_longitude(longitude)
+        planet_house = house_number_for_longitude(
+            longitude,
+            rashi_placidus["cusps"],
+        )
+        side_matches = {
+            side: match_participant_to_nama_pada(
+                record,
+                pada,
+            )
+            for side, record in participant_records.items()
+        }
+
+        planet_syllables[planet_name] = {
+            "status": "Pass",
+            "planet": planet_name,
+            "placidus_house": planet_house,
+            **pada,
+            "participant_matches": side_matches,
+        }
+
+        for side, match_result in side_matches.items():
+            if not match_result["decision_grade"]:
+                continue
+
+            planet_matches.append({
+                "planet": planet_name,
+                "placidus_house": planet_house,
+                "participant_side": side,
+                "participant_name": match_result["name"],
+                "table_syllable": pada[
+                    "table_7_1_syllable"
+                ],
+                "matched_sounds": match_result["matches"],
+                "book_strength_guidance": (
+                    "Sun syllable resonance may be first- or "
+                    "second-tier, subject to the whole chart."
+                    if planet_name == "Sun"
+                    else (
+                        "Planetary name resonance is qualitative "
+                        "'buzz'; Chapter 7 does not assign a fixed "
+                        "automatic point value here."
+                    )
+                ),
+                "points_applied": False,
+            })
+
+    participant_readiness = {
+        side: record["status"]
+        for side, record in participant_records.items()
+    }
+    both_sides_confirmed = all(
+        status == "Pass"
+        for status in participant_readiness.values()
+    )
+
+    if both_sides_confirmed:
+        status = "Pass"
+        error = None
+    else:
+        status = "Partial"
+        error = (
+            "Exact Table 7.1 syllables were calculated, but both "
+            "participants do not yet have caller-confirmed opening sounds."
+        )
+
+    return {
+        "status": status,
+        "method": "BookLockedChapter7NamaPada",
+        "book_chapter": 7,
+        "book_layer": "Navamsha syllables / nama pada",
+        "ayanamsa": "Lahiri",
+        "source_chart": "Exact D1 rashi longitude divided into 3°20' sections",
+        "interpretation_applied": (
+            "Only caller-confirmed sounds are used for participant matching."
+        ),
+        "raw_name_pronunciation_inferred": False,
+        "table_7_1": {
+            "section_width_degrees": round(
+                NAMA_PADA_SECTION_DEGREES,
+                8,
+            ),
+            "total_sections": 108,
+            "pdf_pages": NAMA_PADA_PDF_PAGES,
+        },
+        "book_sound_rules": {
+            **NAMA_PADA_BOOK_SUBSTITUTIONS,
+            "raw_spelling_alone_is_decision_grade": False,
+        },
+        "participants": participant_records,
+        "house10_main_test": {
+            "status": (
+                "Pass"
+                if both_sides_confirmed
+                else "Partial"
+            ),
+            "cusp": "House10",
+            "tier": 3,
+            "book_point_range_if_manually_applied": [
+                14,
+                18,
+            ],
+            "exact_pada": house10_pada,
+            "participant_matches": house10_matches,
+            "matched_sides": matched_sides,
+            "indication": main_indication,
+            "note": main_note,
+            "maximum_exposure_sides": (
+                maximum_exposure_sides
+            ),
+            "maximum_exposure_note": (
+                "Matching more than one initial name part may justify "
+                "the upper end of the third-tier range, but this layer "
+                "does not assign an automatic exact score."
+                if maximum_exposure_sides
+                else None
+            ),
+            "points_applied": False,
+        },
+        "planet_syllables": planet_syllables,
+        "planet_resonance_matches": planet_matches,
+        "participant_readiness": participant_readiness,
+        "name_comparison_allowed": both_sides_confirmed,
+        "points_applied": False,
+        "error": error,
+    }
+
+
 # ============================================================
 # CONSISTENCY VALIDATION
 # ============================================================
@@ -5294,6 +5927,7 @@ def health() -> dict[str, Any]:
             "outer_planets": SWISSEPH_AVAILABLE,
             "gulika_upaketu": True,
             "nakshatra_taras": True,
+            "navamsha_name_sounds": True,
         },
         "outer_planet_engine": {
             "name": "pyswisseph",
@@ -5487,6 +6121,14 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         planets,
     )
 
+    # Chapter 7 exact nama-pada syllables. Participant matching is enabled
+    # only when caller-confirmed opening sounds are supplied.
+    navamsha_name_sounds = calculate_navamsha_name_sounds(
+        request.participants,
+        rashi_placidus,
+        planets,
+    )
+
     essential_results: list[dict[str, Any]] = [
         core["ayanamsa_degree"],
         core["lagna_sign"],
@@ -5588,6 +6230,11 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
             "std_time": request.std_time,
             "location": request.location.model_dump(),
             "ayanamsa": "Lahiri",
+            "participants": (
+                request.participants.model_dump()
+                if request.participants
+                else None
+            ),
         },
         "core": core,
         "rashi_placidus": rashi_placidus,
@@ -5597,6 +6244,7 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         "outer_planets": outer_planets,
         "special_points": special_points,
         "nakshatra_taras": nakshatra_taras,
+        "navamsha_name_sounds": navamsha_name_sounds,
         "houses": houses,
         "planets": planets,
         "provenance": {
@@ -5637,6 +6285,12 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
                 "Chapter 8 marker-star contacts calculated against exact "
                 "Lahiri rashi cusps and house-lord longitudes using the "
                 "book's stated sidereal degrees and strict one-degree orb."
+            ),
+            "navamsha_name_sounds": (
+                "Chapter 7 Table 7.1 syllables calculated from exact "
+                "Lahiri D1 longitudes. Participant matching uses only "
+                "caller-confirmed opening sounds; raw names are not "
+                "silently converted into Sanskrit pronunciation."
             ),
             "vedastro_api_key": "stored only on Render",
             "minimum_call_interval_seconds": VEDASTRO_MIN_INTERVAL_SECONDS,
