@@ -6,7 +6,7 @@ import threading
 import time
 import re
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from enum import Enum
@@ -34,7 +34,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.16.1"
+PROXY_VERSION = "1.17.0"
 
 
 # ============================================================
@@ -727,6 +727,42 @@ D9_INVISIBLE_CUSP_BODIES = {
     "Gulika",
     "Upaketu",
 }
+
+
+# Gambler's Dharma reliability and sandhi audit.
+#
+# Printed PDF pages:
+# - 38: do not wager when planets are kutila/stationary
+# - 41-43: fixed, mixed and nonfixed karma; rule of three
+# - 47: understand major sandhis and avoid prediction
+# - 232-234: sunrise/sunset, eclipses, solar ingress and stationary planets
+RELIABILITY_AUDIT_PDF_PAGES = [
+    38,
+    41,
+    42,
+    43,
+    47,
+    232,
+    233,
+    234,
+]
+
+RELIABILITY_SWISS_BODY_IDS = {
+    "Mercury": 2,
+    "Venus": 3,
+    "Mars": 4,
+    "Jupiter": 5,
+    "Saturn": 6,
+    "Uranus": 7,
+    "Neptune": 8,
+    "Pluto": 9,
+    "Chiron": 15,
+    "Ceres": 17,
+}
+
+RELIABILITY_STATION_SEARCH_DAYS = 8.0
+RELIABILITY_STATION_SCAN_STEP_DAYS = 0.5
+RELIABILITY_ECLIPSE_AVOID_DAYS = 3.0
 
 KP_COLUMN_WEIGHTS = {
     "A": 1.0,
@@ -6558,6 +6594,150 @@ def compact_navamsha_interpretation_layer(
     }, list_limit=20, string_limit=160)
 
 
+def compact_reliability_audit_layer(
+    layer: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve the complete reliability decision in a compact form."""
+
+    stationary = layer.get("stationary_kutila", {})
+    concise_stations = []
+
+    station_source_rows = (
+        stationary.get("swiss_station_search")
+        or stationary.get("station_search")
+        or []
+    )
+
+    for row in station_source_rows:
+        nearest = row.get("nearest_station")
+        concise_stations.append({
+            "body": row.get("body"),
+            "status": row.get("status"),
+            "event_speed": (
+                row.get("event_speed_degrees_per_day")
+                if row.get("event_speed_degrees_per_day") is not None
+                else row.get("event_speed")
+            ),
+            "event_motion": row.get("event_motion"),
+            "nearest_station": nearest,
+            "same_local_date": (
+                row.get("same_local_calendar_date")
+                if row.get("same_local_calendar_date") is not None
+                else row.get("same_local_date")
+            ),
+            "within_one_day": row.get("within_one_day"),
+            "within_seven_days": row.get(
+                "within_seven_days"
+            ),
+            "automatic_veto": row.get(
+                "automatic_veto"
+            ),
+            "error": compact_scalar_text(
+                row.get("error"),
+                90,
+            ),
+        })
+
+    eclipses = layer.get("eclipses", {})
+    concise_eclipses = [
+        {
+            key: event.get(key)
+            for key in (
+                "status",
+                "kind",
+                "direction",
+                "type_flags",
+                "major_for_automatic_gate",
+                "maximum_utc",
+                "maximum_local",
+                "signed_days_from_event",
+                "absolute_days_from_event",
+                "error",
+            )
+            if key in event
+        }
+        for event in eclipses.get("events", [])
+    ]
+
+    karma = layer.get("karma_fixity", {})
+
+    return compact_recursive({
+        "status": layer.get("status"),
+        "hard_veto": layer.get("hard_veto"),
+        "strict_prediction_allowed_by_reliability": layer.get(
+            "strict_prediction_allowed_by_reliability"
+        ),
+        "decision": layer.get("decision"),
+        "hard_veto_reasons": layer.get(
+            "hard_veto_reasons",
+            [],
+        ),
+        "warning_reasons": layer.get(
+            "warning_reasons",
+            [],
+        ),
+        "stationary_kutila": {
+            "status": stationary.get("status"),
+            "vedastro_motion_labels": stationary.get(
+                "vedastro_motion_labels",
+                [],
+            ),
+            "station_search": concise_stations,
+            "hard_veto_planets": stationary.get(
+                "hard_veto_planets",
+                [],
+            ),
+            "hard_veto": stationary.get("hard_veto"),
+            "warning_planets": stationary.get(
+                "warning_planets",
+                [],
+            ),
+            "error": stationary.get("error"),
+        },
+        "eclipses": {
+            "status": eclipses.get("status"),
+            "events": concise_eclipses,
+            "nearest_major_eclipse": eclipses.get(
+                "nearest_major_eclipse"
+            ),
+            "avoid_window_days_each_side": eclipses.get(
+                "avoid_window_days_each_side"
+            ),
+            "hard_veto": eclipses.get("hard_veto"),
+            "error": eclipses.get("error"),
+        },
+        "solar_sankranti": layer.get(
+            "solar_sankranti"
+        ),
+        "sunrise_sunset": layer.get(
+            "sunrise_sunset"
+        ),
+        "karma_fixity": {
+            "status": karma.get("status"),
+            "evidence": karma.get("evidence", []),
+            "counts": karma.get("counts"),
+            "rule_of_three_reached": karma.get(
+                "rule_of_three_reached"
+            ),
+            "automatic_karma_classification": None,
+            "automatic_classification_allowed": False,
+            "manual_classification_required": True,
+            "reason": karma.get("reason"),
+        },
+        "unavailable_sublayers": layer.get(
+            "unavailable_sublayers",
+            [],
+        ),
+        "partial_sublayers": layer.get(
+            "partial_sublayers",
+            [],
+        ),
+        "pdf_pages": layer.get("pdf_pages"),
+        "points_applied": False,
+        "error": layer.get("error"),
+    }, list_limit=16, string_limit=150)
+
+
 def compact_stolen_cusps_layer(
     layer: dict[str, Any],
 ) -> dict[str, Any]:
@@ -7925,6 +8105,9 @@ def action_compact_v2(
                 compacted.get("navamsha_interpretation", {})
             )
         ),
+        "reliability_audit": compact_reliability_audit_layer(
+            compacted.get("reliability_audit", {})
+        ),
         "nakshatra_taras": action_compact_taras(
             compacted.get("nakshatra_taras", {})
         ),
@@ -8044,7 +8227,43 @@ def enforce_action_response_limit(
     if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
         return payload
 
-    # 5. Planet syllables are only secondary resonance evidence; the exact
+    # 5. Reliability veto summaries remain complete; long non-veto station
+    # rows may be represented by the closest six bodies when hard trimming.
+    reliability = payload.get("reliability_audit", {})
+    station_rows = reliability.get(
+        "stationary_kutila",
+        {},
+    ).get("station_search", [])
+
+    if isinstance(station_rows, list) and len(station_rows) > 6:
+        station_rows = sorted(
+            station_rows,
+            key=lambda item: (
+                0 if item.get("automatic_veto") else 1,
+                (
+                    item.get("nearest_station") or {}
+                ).get(
+                    "absolute_days_from_event",
+                    999,
+                ),
+            ),
+        )
+        reliability["stationary_kutila"][
+            "station_search"
+        ] = station_rows[:6] + [{
+            "items_omitted_from_transport": (
+                len(station_rows) - 6
+            ),
+            "full_calculation_performed": True,
+        }]
+        payload["response_compaction"][
+            "nonveto_station_rows_trimmed"
+        ] = True
+
+    if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
+        return payload
+
+    # 6. Planet syllables are only secondary resonance evidence; the exact
     # House 10 name test and all actual resonance matches stay present.
     payload.get(
         "navamsha_name_sounds",
@@ -8058,7 +8277,7 @@ def enforce_action_response_limit(
     if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
         return payload
 
-    # 6. Preserve the KP main comparison and first/seventh cusp evidence; the
+    # 7. Preserve the KP main comparison and first/seventh cusp evidence; the
     # full pointer array was calculated but is omitted from transport.
     payload.get(
         "kp_sublords",
@@ -8072,7 +8291,7 @@ def enforce_action_response_limit(
     if encoded_size() <= ACTION_RESPONSE_TARGET_CHARACTERS:
         return payload
 
-    # 7. Final bounded pass.
+    # 8. Final bounded pass.
     bounded = compact_recursive(
         payload,
         list_limit=6,
@@ -8093,7 +8312,7 @@ def enforce_action_response_limit(
     if bounded_size <= ACTION_RESPONSE_TARGET_CHARACTERS:
         return bounded
 
-    # 8. Hard transport ceiling. Every layer and every result summary remains,
+    # 9. Hard transport ceiling. Every layer and every result summary remains,
     # while repeated secondary arrays are represented by counts.
     for key in (
         "contextual_or_research_contacts",
@@ -8401,6 +8620,60 @@ def emergency_action_response(
                 {},
             ).get("error"),
         },
+        "reliability_audit": {
+            "status": compacted.get(
+                "reliability_audit",
+                {},
+            ).get("status"),
+            "hard_veto": compacted.get(
+                "reliability_audit",
+                {},
+            ).get("hard_veto"),
+            "strict_prediction_allowed_by_reliability": compacted.get(
+                "reliability_audit",
+                {},
+            ).get("strict_prediction_allowed_by_reliability"),
+            "decision": compacted.get(
+                "reliability_audit",
+                {},
+            ).get("decision"),
+            "hard_veto_reasons": compacted.get(
+                "reliability_audit",
+                {},
+            ).get("hard_veto_reasons", []),
+            "warning_reasons": compacted.get(
+                "reliability_audit",
+                {},
+            ).get("warning_reasons", []),
+            "stationary_kutila": compacted.get(
+                "reliability_audit",
+                {},
+            ).get("stationary_kutila"),
+            "eclipses": compacted.get(
+                "reliability_audit",
+                {},
+            ).get("eclipses"),
+            "solar_sankranti": compacted.get(
+                "reliability_audit",
+                {},
+            ).get("solar_sankranti"),
+            "sunrise_sunset": compacted.get(
+                "reliability_audit",
+                {},
+            ).get("sunrise_sunset"),
+            "karma_fixity": compacted.get(
+                "reliability_audit",
+                {},
+            ).get("karma_fixity"),
+            "pdf_pages": compacted.get(
+                "reliability_audit",
+                {},
+            ).get("pdf_pages"),
+            "error": compacted.get(
+                "reliability_audit",
+                {},
+            ).get("error"),
+        },
         "nakshatra_taras": {
             "status": tara.get("status"),
             "orb_policy": tara.get("orb_policy"),
@@ -8525,6 +8798,9 @@ def compact_action_response(
             compact_navamsha_interpretation_layer(
                 response.get("navamsha_interpretation", {})
             )
+        ),
+        "reliability_audit": compact_reliability_audit_layer(
+            response.get("reliability_audit", {})
         ),
         "nakshatra_taras": compact_tara_layer(
             response.get("nakshatra_taras", {})
@@ -11985,6 +12261,1144 @@ def calculate_navamsha_interpretation(
     }
 
 
+def extract_motion_label(
+    planet_result: dict[str, Any] | None,
+) -> str | None:
+    """Extract VedAstro's exact motion label without guessing."""
+
+    if not isinstance(planet_result, dict):
+        return None
+
+    motion_result = planet_result.get("motion")
+
+    if not isinstance(motion_result, dict):
+        return None
+
+    data = unwrap_data(motion_result)
+
+    if isinstance(data, str):
+        return data.strip() or None
+
+    label = find_named_value(
+        data,
+        (
+            "Name",
+            "MotionName",
+            "PlanetMotionName",
+            "Value",
+        ),
+    )
+
+    return label.strip() if label else None
+
+
+def motion_label_is_kutila(
+    label: str | None,
+) -> bool:
+    if not label:
+        return False
+
+    normalised = (
+        label.lower()
+        .replace("-", " ")
+        .replace("_", " ")
+        .strip()
+    )
+
+    return any(
+        token in normalised
+        for token in (
+            "vikala",
+            "kutila",
+            "stationary",
+            "station",
+        )
+    )
+
+
+def julian_day_to_utc_datetime(
+    julian_day_ut: float,
+) -> datetime:
+    year, month, day, decimal_hour = swe.revjul(
+        julian_day_ut,
+        swe.GREG_CAL,
+    )
+    hour = int(decimal_hour)
+    minute_float = (decimal_hour - hour) * 60.0
+    minute = int(minute_float)
+    second_float = (minute_float - minute) * 60.0
+    second = int(second_float)
+    microsecond = int(
+        round((second_float - second) * 1_000_000)
+    )
+
+    if microsecond >= 1_000_000:
+        second += 1
+        microsecond -= 1_000_000
+
+    return datetime(
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        microsecond,
+        tzinfo=timezone.utc,
+    )
+
+
+def swiss_speed_longitude(
+    julian_day_ut: float,
+    body_id: int,
+) -> tuple[float, str]:
+    """Return exact geocentric apparent longitude speed in degrees/day."""
+
+    if not SWISSEPH_AVAILABLE:
+        raise RuntimeError("pyswisseph is unavailable.")
+
+    flags = swe.FLG_SWIEPH | swe.FLG_SPEED
+
+    with SWISSEPH_LOCK:
+        if SWISSEPH_EPHE_PATH:
+            swe.set_ephe_path(SWISSEPH_EPHE_PATH)
+
+        position, return_flags = swe.calc_ut(
+            julian_day_ut,
+            body_id,
+            flags,
+        )
+
+    return (
+        float(position[3]),
+        swisseph_ephemeris_mode(return_flags),
+    )
+
+
+def bisect_station_time(
+    body_id: int,
+    left_jd: float,
+    right_jd: float,
+    left_speed: float,
+    right_speed: float,
+) -> float:
+    """Find a speed-zero crossing inside one bracket."""
+
+    left = left_jd
+    right = right_jd
+    f_left = left_speed
+    f_right = right_speed
+
+    for _ in range(55):
+        middle = (left + right) / 2.0
+        f_middle, _ = swiss_speed_longitude(
+            middle,
+            body_id,
+        )
+
+        if abs(f_middle) < 1e-11:
+            return middle
+
+        if f_left * f_middle <= 0:
+            right = middle
+            f_right = f_middle
+        else:
+            left = middle
+            f_left = f_middle
+
+    return (left + right) / 2.0
+
+
+def nearest_station_for_body(
+    body_name: str,
+    body_id: int,
+    event_jd: float,
+    local_timezone: Any,
+) -> dict[str, Any]:
+    """
+    Find exact speed-zero crossings within the book's broad one-to-seven-day
+    discussion plus one day of search margin.
+
+    The code does not invent a planet-specific kutila window. It reports the
+    exact station time, same-local-date status, and one-/seven-day proximity.
+    """
+
+    try:
+        event_speed, source_mode = swiss_speed_longitude(
+            event_jd,
+            body_id,
+        )
+    except Exception as error:
+        return {
+            "status": "Unavailable",
+            "body": body_name,
+            "error": str(error),
+        }
+
+    start = event_jd - RELIABILITY_STATION_SEARCH_DAYS
+    end = event_jd + RELIABILITY_STATION_SEARCH_DAYS
+    step = RELIABILITY_STATION_SCAN_STEP_DAYS
+    roots: list[float] = []
+
+    try:
+        previous_jd = start
+        previous_speed, _ = swiss_speed_longitude(
+            previous_jd,
+            body_id,
+        )
+        current_jd = start + step
+
+        while current_jd <= end + 1e-9:
+            current_speed, _ = swiss_speed_longitude(
+                current_jd,
+                body_id,
+            )
+
+            if abs(previous_speed) < 1e-11:
+                roots.append(previous_jd)
+            elif abs(current_speed) < 1e-11:
+                roots.append(current_jd)
+            elif previous_speed * current_speed < 0:
+                roots.append(
+                    bisect_station_time(
+                        body_id,
+                        previous_jd,
+                        current_jd,
+                        previous_speed,
+                        current_speed,
+                    )
+                )
+
+            previous_jd = current_jd
+            previous_speed = current_speed
+            current_jd += step
+    except Exception as error:
+        return {
+            "status": "Partial",
+            "body": body_name,
+            "event_speed_degrees_per_day": round(
+                event_speed,
+                10,
+            ),
+            "ephemeris_mode": source_mode,
+            "error": str(error),
+        }
+
+    unique_roots: list[float] = []
+
+    for root in sorted(roots):
+        if (
+            not unique_roots
+            or abs(root - unique_roots[-1]) > 0.01
+        ):
+            unique_roots.append(root)
+
+    if not unique_roots:
+        return {
+            "status": "Pass",
+            "body": body_name,
+            "event_speed_degrees_per_day": round(
+                event_speed,
+                10,
+            ),
+            "event_motion": (
+                "Retrograde"
+                if event_speed < 0
+                else "Direct"
+                if event_speed > 0
+                else "Exactly stationary"
+            ),
+            "ephemeris_mode": source_mode,
+            "nearest_station": None,
+            "station_found_within_search_window": False,
+            "same_local_calendar_date": False,
+            "within_one_day": False,
+            "within_seven_days": False,
+            "automatic_veto": False,
+            "error": None,
+        }
+
+    nearest = min(
+        unique_roots,
+        key=lambda value: abs(value - event_jd),
+    )
+    delta_days = nearest - event_jd
+    station_utc = julian_day_to_utc_datetime(nearest)
+    station_local = station_utc.astimezone(local_timezone)
+    event_local = julian_day_to_utc_datetime(
+        event_jd
+    ).astimezone(local_timezone)
+    same_local_date = (
+        station_local.date() == event_local.date()
+    )
+
+    return {
+        "status": "Pass",
+        "body": body_name,
+        "event_speed_degrees_per_day": round(
+            event_speed,
+            10,
+        ),
+        "event_motion": (
+            "Retrograde"
+            if event_speed < 0
+            else "Direct"
+            if event_speed > 0
+            else "Exactly stationary"
+        ),
+        "ephemeris_mode": source_mode,
+        "nearest_station": {
+            "julian_day_ut": round(nearest, 8),
+            "utc": station_utc.isoformat(),
+            "local": station_local.isoformat(),
+            "signed_days_from_event": round(
+                delta_days,
+                8,
+            ),
+            "absolute_days_from_event": round(
+                abs(delta_days),
+                8,
+            ),
+        },
+        "station_found_within_search_window": True,
+        "same_local_calendar_date": same_local_date,
+        "within_one_day": abs(delta_days) <= 1.0,
+        "within_seven_days": abs(delta_days) <= 7.0,
+        "automatic_veto": same_local_date,
+        "automatic_veto_basis": (
+            "The exact station falls on the event's local calendar date."
+            if same_local_date
+            else None
+        ),
+        "error": None,
+    }
+
+
+def calculate_stationary_audit(
+    std_time: str,
+    planets: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    parsed = parse_std_time_to_utc(std_time)
+    event_jd = parsed.get("julian_day_ut")
+    local_datetime = datetime.fromisoformat(
+        parsed["local_datetime"]
+    )
+    source_labels: list[dict[str, Any]] = []
+    hard_veto_labels: list[str] = []
+
+    for planet_name, result in planets.items():
+        label = extract_motion_label(result)
+        is_kutila = motion_label_is_kutila(label)
+
+        source_labels.append({
+            "planet": planet_name,
+            "vedastro_motion_label": label,
+            "kutila_or_stationary": is_kutila,
+        })
+
+        if is_kutila:
+            hard_veto_labels.append(planet_name)
+
+    if not SWISSEPH_AVAILABLE or event_jd is None:
+        return {
+            "status": "Partial",
+            "method": "VedAstro motion labels plus Swiss speed-zero search",
+            "vedastro_motion_labels": source_labels,
+            "swiss_station_search": [],
+            "hard_veto_planets": sorted(
+                set(hard_veto_labels),
+                key=lambda name: PLANET_ORDER.get(name, 999),
+            ),
+            "hard_veto": bool(hard_veto_labels),
+            "warning_planets": [],
+            "error": "Swiss Ephemeris station search is unavailable.",
+        }
+
+    station_rows: list[dict[str, Any]] = []
+
+    for body_name, body_id in (
+        RELIABILITY_SWISS_BODY_IDS.items()
+    ):
+        station_rows.append(
+            nearest_station_for_body(
+                body_name,
+                body_id,
+                float(event_jd),
+                local_datetime.tzinfo,
+            )
+        )
+
+    same_date_planets = [
+        row["body"]
+        for row in station_rows
+        if row.get("same_local_calendar_date")
+    ]
+    hard_veto_planets = sorted(
+        set(hard_veto_labels + same_date_planets),
+        key=lambda name: (
+            PLANET_ORDER.get(
+                name,
+                100 + OUTER_BODY_ORDER.index(name)
+                if name in OUTER_BODY_ORDER
+                else 999,
+            )
+        ),
+    )
+    warning_planets = [
+        row["body"]
+        for row in station_rows
+        if row.get("within_seven_days")
+        and row["body"] not in hard_veto_planets
+    ]
+    unavailable = [
+        row
+        for row in station_rows
+        if row.get("status") not in {"Pass"}
+    ]
+
+    return {
+        "status": "Pass" if not unavailable else "Partial",
+        "method": "VedAstro motion labels plus Swiss speed-zero search",
+        "book_rule": (
+            "Do not wager when planets are kutila/stationary. The exact "
+            "station day is especially to be avoided."
+        ),
+        "vedastro_motion_labels": source_labels,
+        "swiss_station_search": station_rows,
+        "hard_veto_planets": hard_veto_planets,
+        "hard_veto": bool(hard_veto_planets),
+        "warning_planets": warning_planets,
+        "one_to_seven_day_window_note": (
+            "The book gives a broad one-to-seven-day range but no exact "
+            "planet-by-planet allocation. Proximity is reported; only an "
+            "explicit VedAstro kutila/stationary label or the exact local "
+            "station date is automatically vetoed."
+        ),
+        "unavailable_bodies": unavailable,
+        "pdf_pages": [38, 232, 233],
+        "error": None if not unavailable else (
+            "One or more optional body station searches were unavailable."
+        ),
+    }
+
+
+def eclipse_flag_labels(
+    flag: int,
+    *,
+    solar: bool,
+) -> list[str]:
+    labels: list[str] = []
+    candidates = [
+        ("Total", getattr(swe, "ECL_TOTAL", 0)),
+        ("Partial", getattr(swe, "ECL_PARTIAL", 0)),
+        ("Annular", getattr(swe, "ECL_ANNULAR", 0)),
+        (
+            "Hybrid",
+            getattr(
+                swe,
+                "ECL_ANNULAR_TOTAL",
+                getattr(swe, "ECL_HYBRID", 0),
+            ),
+        ),
+        ("Central", getattr(swe, "ECL_CENTRAL", 0)),
+        (
+            "Noncentral",
+            getattr(swe, "ECL_NONCENTRAL", 0),
+        ),
+    ]
+
+    if not solar:
+        candidates.append(
+            (
+                "Penumbral",
+                getattr(swe, "ECL_PENUMBRAL", 0),
+            )
+        )
+
+    for label, bit in candidates:
+        if bit and flag & bit:
+            labels.append(label)
+
+    return labels or ["Unspecified"]
+
+
+def calculate_one_eclipse(
+    event_jd: float,
+    local_timezone: Any,
+    *,
+    solar: bool,
+    backwards: bool,
+) -> dict[str, Any]:
+    try:
+        with SWISSEPH_LOCK:
+            if SWISSEPH_EPHE_PATH:
+                swe.set_ephe_path(SWISSEPH_EPHE_PATH)
+
+            if solar:
+                flag, times = swe.sol_eclipse_when_glob(
+                    event_jd,
+                    swe.FLG_SWIEPH,
+                    0,
+                    backwards,
+                )
+            else:
+                flag, times = swe.lun_eclipse_when(
+                    event_jd,
+                    swe.FLG_SWIEPH,
+                    0,
+                    backwards,
+                )
+
+        maximum_jd = float(times[0])
+        maximum_utc = julian_day_to_utc_datetime(
+            maximum_jd
+        )
+        maximum_local = maximum_utc.astimezone(
+            local_timezone
+        )
+        labels = eclipse_flag_labels(
+            int(flag),
+            solar=solar,
+        )
+        major = solar or "Penumbral" not in labels
+
+        return {
+            "status": "Pass",
+            "kind": "Solar" if solar else "Lunar",
+            "direction": (
+                "Previous" if backwards else "Next"
+            ),
+            "type_flags": labels,
+            "major_for_automatic_gate": major,
+            "maximum_julian_day_ut": round(
+                maximum_jd,
+                8,
+            ),
+            "maximum_utc": maximum_utc.isoformat(),
+            "maximum_local": maximum_local.isoformat(),
+            "signed_days_from_event": round(
+                maximum_jd - event_jd,
+                8,
+            ),
+            "absolute_days_from_event": round(
+                abs(maximum_jd - event_jd),
+                8,
+            ),
+            "error": None,
+        }
+    except Exception as error:
+        return {
+            "status": "Unavailable",
+            "kind": "Solar" if solar else "Lunar",
+            "direction": (
+                "Previous" if backwards else "Next"
+            ),
+            "error": str(error),
+        }
+
+
+def calculate_eclipse_audit(
+    std_time: str,
+) -> dict[str, Any]:
+    parsed = parse_std_time_to_utc(std_time)
+    event_jd = parsed.get("julian_day_ut")
+    local_datetime = datetime.fromisoformat(
+        parsed["local_datetime"]
+    )
+
+    if not SWISSEPH_AVAILABLE or event_jd is None:
+        return {
+            "status": "Unavailable",
+            "events": [],
+            "hard_veto": False,
+            "error": "Swiss Ephemeris eclipse calculations are unavailable.",
+        }
+
+    events = [
+        calculate_one_eclipse(
+            float(event_jd),
+            local_datetime.tzinfo,
+            solar=True,
+            backwards=True,
+        ),
+        calculate_one_eclipse(
+            float(event_jd),
+            local_datetime.tzinfo,
+            solar=True,
+            backwards=False,
+        ),
+        calculate_one_eclipse(
+            float(event_jd),
+            local_datetime.tzinfo,
+            solar=False,
+            backwards=True,
+        ),
+        calculate_one_eclipse(
+            float(event_jd),
+            local_datetime.tzinfo,
+            solar=False,
+            backwards=False,
+        ),
+    ]
+    available = [
+        event
+        for event in events
+        if event.get("status") == "Pass"
+    ]
+    major = [
+        event
+        for event in available
+        if event.get("major_for_automatic_gate")
+    ]
+    nearest_major = (
+        min(
+            major,
+            key=lambda item: item[
+                "absolute_days_from_event"
+            ],
+        )
+        if major
+        else None
+    )
+    hard_veto = bool(
+        nearest_major
+        and nearest_major["absolute_days_from_event"]
+        <= RELIABILITY_ECLIPSE_AVOID_DAYS
+    )
+
+    return {
+        "status": (
+            "Pass"
+            if len(available) == 4
+            else "Partial"
+        ),
+        "method": "Swiss Ephemeris global eclipse maxima",
+        "events": events,
+        "nearest_major_eclipse": nearest_major,
+        "avoid_window_days_each_side": (
+            RELIABILITY_ECLIPSE_AVOID_DAYS
+        ),
+        "hard_veto": hard_veto,
+        "hard_veto_reason": (
+            "The event is within three days of a major eclipse."
+            if hard_veto
+            else None
+        ),
+        "penumbral_lunar_policy": (
+            "Penumbral-only lunar eclipses are reported but not "
+            "automatically treated as the book's 'major eclipse'."
+        ),
+        "pdf_pages": [232, 233, 234],
+        "error": (
+            None
+            if len(available) == 4
+            else "One or more eclipse searches were unavailable."
+        ),
+    }
+
+
+def calculate_solar_sankranti_audit(
+    planets: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    sun = planets.get("Sun", {})
+    longitude = extract_total_degrees(
+        sun.get("sidereal_longitude", {})
+    )
+
+    if longitude is None:
+        return {
+            "status": "Unavailable",
+            "hard_veto": False,
+            "error": "Exact sidereal Sun longitude is unavailable.",
+        }
+
+    longitude = normalise_degrees(longitude)
+    details = sign_details_from_longitude(longitude)
+    degree = float(details["degree_in_sign"])
+    end_of_sign = degree >= 29.0
+    beginning_candidate = degree < 1.0
+
+    return {
+        "status": "Pass",
+        "sidereal_longitude": round(longitude, 8),
+        "sign": details["sign"],
+        "degree_in_sign": round(degree, 8),
+        "end_of_sign_29_degrees_or_higher": end_of_sign,
+        "beginning_of_sign_under_one_degree": beginning_candidate,
+        "hard_veto": end_of_sign,
+        "hard_veto_reason": (
+            "The sidereal Sun is at 29 degrees or higher, the book's "
+            "explicit solar-sankranti rule of thumb."
+            if end_of_sign
+            else None
+        ),
+        "beginning_warning": (
+            "The book also warns about the beginning of a sign but gives "
+            "no exact beginning-side cutoff. This is reported for manual "
+            "review and is not automatically vetoed."
+            if beginning_candidate
+            else None
+        ),
+        "pdf_pages": [232],
+        "error": None,
+    }
+
+
+def collect_rise_set_events(
+    event_jd: float,
+    longitude: float,
+    latitude: float,
+    *,
+    rise: bool,
+) -> list[float]:
+    events: list[float] = []
+    start = event_jd - 1.5
+    rsmi = swe.CALC_RISE if rise else swe.CALC_SET
+
+    for _ in range(5):
+        with SWISSEPH_LOCK:
+            if SWISSEPH_EPHE_PATH:
+                swe.set_ephe_path(SWISSEPH_EPHE_PATH)
+
+            result, times = swe.rise_trans(
+                start,
+                swe.SUN,
+                rsmi,
+                (longitude, latitude, 0.0),
+                0.0,
+                0.0,
+                swe.FLG_SWIEPH,
+            )
+
+        if result == -2:
+            break
+
+        found = float(times[0])
+
+        if found > event_jd + 1.5:
+            break
+
+        events.append(found)
+        start = found + 0.01
+
+    return events
+
+
+def nearest_rise_set_record(
+    event_jd: float,
+    local_timezone: Any,
+    events: list[float],
+    label: str,
+) -> dict[str, Any] | None:
+    if not events:
+        return None
+
+    nearest = min(
+        events,
+        key=lambda value: abs(value - event_jd),
+    )
+    utc = julian_day_to_utc_datetime(nearest)
+    local = utc.astimezone(local_timezone)
+    signed_minutes = (
+        nearest - event_jd
+    ) * 24.0 * 60.0
+
+    return {
+        "event": label,
+        "julian_day_ut": round(nearest, 8),
+        "utc": utc.isoformat(),
+        "local": local.isoformat(),
+        "signed_minutes_from_event": round(
+            signed_minutes,
+            4,
+        ),
+        "absolute_minutes_from_event": round(
+            abs(signed_minutes),
+            4,
+        ),
+    }
+
+
+def calculate_sunrise_sunset_audit(
+    std_time: str,
+    location: Any,
+) -> dict[str, Any]:
+    parsed = parse_std_time_to_utc(std_time)
+    event_jd = parsed.get("julian_day_ut")
+    local_datetime = datetime.fromisoformat(
+        parsed["local_datetime"]
+    )
+
+    if not SWISSEPH_AVAILABLE or event_jd is None:
+        return {
+            "status": "Unavailable",
+            "hard_veto": False,
+            "error": "Swiss Ephemeris rise/set calculations are unavailable.",
+        }
+
+    try:
+        rises = collect_rise_set_events(
+            float(event_jd),
+            float(location.longitude),
+            float(location.latitude),
+            rise=True,
+        )
+        sets = collect_rise_set_events(
+            float(event_jd),
+            float(location.longitude),
+            float(location.latitude),
+            rise=False,
+        )
+        nearest_rise = nearest_rise_set_record(
+            float(event_jd),
+            local_datetime.tzinfo,
+            rises,
+            "Sunrise",
+        )
+        nearest_set = nearest_rise_set_record(
+            float(event_jd),
+            local_datetime.tzinfo,
+            sets,
+            "Sunset",
+        )
+    except Exception as error:
+        return {
+            "status": "Unavailable",
+            "hard_veto": False,
+            "error": str(error),
+        }
+
+    return {
+        "status": (
+            "Pass"
+            if nearest_rise and nearest_set
+            else "Partial"
+        ),
+        "nearest_sunrise": nearest_rise,
+        "nearest_sunset": nearest_set,
+        "hard_veto": False,
+        "automatic_window_applied": False,
+        "manual_review_required": True,
+        "manual_review_reason": (
+            "The book says not to predict at sunrise or sunset but does "
+            "not provide a numerical time window. Exact distances are "
+            "returned without inventing one."
+        ),
+        "pdf_pages": [232],
+        "error": (
+            None
+            if nearest_rise and nearest_set
+            else "A rise or set event was unavailable at this latitude."
+        ),
+    }
+
+
+def calculate_karma_fixity_evidence(
+    tier1_combinations: dict[str, Any],
+    navamsha_interpretation: dict[str, Any],
+    kp_sublords: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Gather independent directional testimony for a manual karma audit.
+
+    The book defines fixed/mixed/nonfixed karma qualitatively and gives the
+    rule of three, but it does not provide a complete mechanical classifier.
+    """
+
+    evidence: list[dict[str, Any]] = []
+
+    tier1_total = tier1_combinations.get(
+        "automatic_signed_total"
+    )
+
+    if isinstance(tier1_total, (int, float)):
+        if tier1_total > 0:
+            evidence.append({
+                "source": "Victory-house signed total",
+                "tier": 1,
+                "supports": "Favourite",
+                "value": tier1_total,
+            })
+        elif tier1_total < 0:
+            evidence.append({
+                "source": "Victory-house signed total",
+                "tier": 1,
+                "supports": "Underdog",
+                "value": tier1_total,
+            })
+
+    for side, result in tier1_combinations.get(
+        "sky_pky",
+        {},
+    ).get("sides", {}).items():
+        sky = result.get("sky", {})
+        pky = result.get("pky", {})
+
+        if sky.get("formed"):
+            evidence.append({
+                "source": f"{side} SKY",
+                "tier": 2,
+                "supports": side,
+                "condition": sky.get("condition"),
+            })
+
+        if pky.get("formed"):
+            evidence.append({
+                "source": f"{side} PKY",
+                "tier": 2,
+                "supports": opposite_contest_side(side),
+                "condition": pky.get("condition"),
+            })
+
+    for contact in navamsha_interpretation.get(
+        "d1_cusp_contacts",
+        [],
+    ):
+        supports = contact.get(
+            "book_effect",
+            {},
+        ).get("supports") or contact.get("supports")
+
+        if supports in {"Favourite", "Underdog"}:
+            evidence.append({
+                "source": "D1 cusp contact",
+                "tier": 2,
+                "supports": supports,
+                "body": contact.get("body"),
+                "cusp": contact.get("cusp"),
+            })
+
+    for contact in navamsha_interpretation.get(
+        "d9_cusp_contacts",
+        [],
+    ):
+        supports = contact.get(
+            "book_effect",
+            {},
+        ).get("supports") or contact.get("supports")
+
+        if supports in {"Favourite", "Underdog"}:
+            evidence.append({
+                "source": "D9 cusp contact",
+                "tier": 3,
+                "supports": supports,
+                "body": contact.get("body"),
+                "cusp": contact.get("cusp"),
+            })
+
+    combos = navamsha_interpretation.get(
+        "navamsha_combinations",
+        {},
+    )
+
+    for combo in combos.get("combinations", []) or []:
+        if (
+            combo.get("points_applied")
+            and combo.get("supports")
+            in {"Favourite", "Underdog"}
+        ):
+            evidence.append({
+                "source": "D9 combination",
+                "tier": 1,
+                "supports": combo.get("supports"),
+                "planets": combo.get("planets"),
+            })
+
+    kp = kp_sublords.get(
+        "main_sublord_comparison",
+        {},
+    )
+    kp_indication = kp.get("indication")
+
+    if kp_indication in {"Favourite", "Underdog"}:
+        evidence.append({
+            "source": "KP main sublord comparison",
+            "tier": 2,
+            "supports": kp_indication,
+            "value": kp.get(
+                "signed_favourite_differential"
+            ),
+        })
+
+    counts = {
+        side: {
+            "total": sum(
+                1
+                for item in evidence
+                if item["supports"] == side
+            ),
+            "tier3": sum(
+                1
+                for item in evidence
+                if item["supports"] == side
+                and item.get("tier") == 3
+            ),
+            "tier2": sum(
+                1
+                for item in evidence
+                if item["supports"] == side
+                and item.get("tier") == 2
+            ),
+            "tier1": sum(
+                1
+                for item in evidence
+                if item["supports"] == side
+                and item.get("tier") == 1
+            ),
+        }
+        for side in ("Favourite", "Underdog")
+    }
+
+    return {
+        "status": "Pass",
+        "method": "Book rule-of-three evidence ledger",
+        "evidence": evidence,
+        "counts": counts,
+        "rule_of_three_reached": {
+            side: counts[side]["total"] >= 3
+            for side in ("Favourite", "Underdog")
+        },
+        "automatic_karma_classification": None,
+        "automatic_classification_allowed": False,
+        "manual_classification_required": True,
+        "reason": (
+            "The book defines fixed, mixed and nonfixed karma and recommends "
+            "repeated testimony, but it does not provide a complete numerical "
+            "algorithm that can be applied without judgment."
+        ),
+        "pdf_pages": [41, 42, 43],
+    }
+
+
+def calculate_reliability_audit(
+    std_time: str,
+    location: Any,
+    planets: dict[str, dict[str, Any]],
+    tier1_combinations: dict[str, Any],
+    navamsha_interpretation: dict[str, Any],
+    kp_sublords: dict[str, Any],
+) -> dict[str, Any]:
+    """Calculate the book-locked prediction-reliability gate."""
+
+    stationary = calculate_stationary_audit(
+        std_time,
+        planets,
+    )
+    eclipses = calculate_eclipse_audit(std_time)
+    sankranti = calculate_solar_sankranti_audit(
+        planets
+    )
+    sunrise_sunset = calculate_sunrise_sunset_audit(
+        std_time,
+        location,
+    )
+    karma = calculate_karma_fixity_evidence(
+        tier1_combinations,
+        navamsha_interpretation,
+        kp_sublords,
+    )
+
+    hard_veto_reasons: list[str] = []
+
+    if stationary.get("hard_veto"):
+        planets_text = ", ".join(
+            stationary.get("hard_veto_planets", [])
+        )
+        hard_veto_reasons.append(
+            "Kutila/stationary planet veto"
+            + (f": {planets_text}" if planets_text else "")
+        )
+
+    if eclipses.get("hard_veto"):
+        hard_veto_reasons.append(
+            "Within three days of a major eclipse"
+        )
+
+    if sankranti.get("hard_veto"):
+        hard_veto_reasons.append(
+            "Sidereal Sun at 29 degrees or higher"
+        )
+
+    warning_reasons: list[str] = []
+
+    if stationary.get("warning_planets"):
+        warning_reasons.append(
+            "Planetary station within the book's broad seven-day "
+            "discussion: "
+            + ", ".join(stationary["warning_planets"])
+        )
+
+    if sankranti.get(
+        "beginning_of_sign_under_one_degree"
+    ):
+        warning_reasons.append(
+            "Sun is near the beginning of a sidereal sign; the book "
+            "gives no exact beginning-side cutoff."
+        )
+
+    if sunrise_sunset.get("manual_review_required"):
+        warning_reasons.append(
+            "Sunrise/sunset distance requires manual review because "
+            "the book gives no numerical window."
+        )
+
+    sublayers = {
+        "stationary_kutila": stationary,
+        "eclipses": eclipses,
+        "solar_sankranti": sankranti,
+        "sunrise_sunset": sunrise_sunset,
+        "karma_fixity": karma,
+    }
+    unavailable = [
+        name
+        for name, layer in sublayers.items()
+        if layer.get("status") == "Unavailable"
+    ]
+    partial = [
+        name
+        for name, layer in sublayers.items()
+        if layer.get("status") == "Partial"
+    ]
+    hard_veto = bool(hard_veto_reasons)
+
+    return {
+        "status": (
+            "Pass"
+            if not unavailable and not partial
+            else "Partial"
+        ),
+        "method": "BookLockedReliabilityAndSandhiAudit",
+        "book_chapters": [2, 9],
+        "hard_veto": hard_veto,
+        "strict_prediction_allowed_by_reliability": (
+            not hard_veto
+        ),
+        "decision": (
+            "Avoid"
+            if hard_veto
+            else "Proceed with manual sandhi review"
+            if warning_reasons
+            else "No automatic reliability veto"
+        ),
+        "hard_veto_reasons": hard_veto_reasons,
+        "warning_reasons": warning_reasons,
+        "stationary_kutila": stationary,
+        "eclipses": eclipses,
+        "solar_sankranti": sankranti,
+        "sunrise_sunset": sunrise_sunset,
+        "karma_fixity": karma,
+        "unavailable_sublayers": unavailable,
+        "partial_sublayers": partial,
+        "pdf_pages": RELIABILITY_AUDIT_PDF_PAGES,
+        "points_applied": False,
+        "error": (
+            None
+            if not unavailable
+            else "One or more essential reliability sublayers are unavailable."
+        ),
+    }
+
+
 # ============================================================
 # CONSISTENCY VALIDATION
 # ============================================================
@@ -12425,6 +13839,7 @@ def health() -> dict[str, Any]:
             "stolen_cusps": True,
             "tier1_combinations": True,
             "navamsha_interpretation": True,
+            "reliability_audit": True,
         },
         "outer_planet_engine": {
             "name": "pyswisseph",
@@ -12639,6 +14054,17 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         stolen_cusps,
     )
 
+    # Chapters 2 and 9: kutila/stationary veto, eclipse sandhi,
+    # solar ingress, sunrise/sunset timing and karma-fixity evidence.
+    reliability_audit = calculate_reliability_audit(
+        request.std_time,
+        request.location,
+        planets,
+        tier1_combinations,
+        navamsha_interpretation,
+        kp_sublords,
+    )
+
     # Chapter 8 fixed marker stars. Book-stated rashi degrees only;
     # intentionally excluded from Navamsha.
     nakshatra_taras = calculate_nakshatra_taras(
@@ -12745,10 +14171,17 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         if result.get("status") != "Pass"
     ]
 
-    strict_prediction_allowed = not essential_failures
+    chart_validation_passed = not essential_failures
+    strict_prediction_allowed = (
+        chart_validation_passed
+        and reliability_audit.get(
+            "strict_prediction_allowed_by_reliability",
+            False,
+        )
+    )
 
     response: dict[str, Any] = {
-        "status": "Pass" if strict_prediction_allowed else "Fail",
+        "status": "Pass" if chart_validation_passed else "Fail",
         "strict_prediction_allowed": strict_prediction_allowed,
         "essential_failures": essential_failures,
         "event": {
@@ -12772,6 +14205,7 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         "special_points": special_points,
         "stolen_cusps": stolen_cusps,
         "navamsha_interpretation": navamsha_interpretation,
+        "reliability_audit": reliability_audit,
         "nakshatra_taras": nakshatra_taras,
         "navamsha_name_sounds": navamsha_name_sounds,
         "houses": houses,
@@ -12825,6 +14259,13 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
                 "Chapter 5 D9 1/7 cusp effects, House1/House7 combinations, "
                 "D1/D9 hierarchy and double-whammy transfer calculated from "
                 "the already verified Lahiri D1 and exact D9 geometry."
+            ),
+            "reliability_audit": (
+                "Chapters 2 and 9 reliability gate using VedAstro motion "
+                "labels plus Swiss Ephemeris speed-zero, eclipse and "
+                "rise/set calculations. Karma fixity remains a transparent "
+                "manual evidence audit because the book gives no complete "
+                "mechanical classifier."
             ),
             "nakshatra_taras": (
                 "Chapter 8 marker-star contacts calculated against exact "
