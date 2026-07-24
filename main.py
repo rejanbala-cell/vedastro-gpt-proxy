@@ -5,6 +5,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from enum import Enum
 from typing import Any, Callable
 
@@ -25,7 +26,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.8.1"
+PROXY_VERSION = "1.9.0"
 
 
 # ============================================================
@@ -91,6 +92,40 @@ if VEDASTRO_MAX_WORKERS < 1:
 # Calculate.api_key internally. The patched request method below also sends
 # the paid key explicitly using the official x-api-key header.
 Calculate.SetAPIKey(VEDASTRO_API_KEY)
+
+# The generated VedAstro client stores ayanamsa globally, but this proxy
+# serves concurrent requests. A thread-local payload override keeps the
+# standard chart on Lahiri while allowing an isolated Krishnamurti KP layer.
+_AYANAMSHA_CONTEXT = threading.local()
+DEFAULT_REQUEST_AYANAMSHA = "LAHIRI"
+
+
+def active_request_ayanamsa() -> str:
+    return str(
+        getattr(
+            _AYANAMSHA_CONTEXT,
+            "name",
+            DEFAULT_REQUEST_AYANAMSHA,
+        )
+    ).upper()
+
+
+@contextmanager
+def use_request_ayanamsa(name: str):
+    previous = getattr(_AYANAMSHA_CONTEXT, "name", None)
+    _AYANAMSHA_CONTEXT.name = str(name).upper()
+
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                delattr(_AYANAMSHA_CONTEXT, "name")
+            except AttributeError:
+                pass
+        else:
+            _AYANAMSHA_CONTEXT.name = previous
+
 
 PLANET_LITERAL_NAMES = {
     "Sun",
@@ -170,7 +205,7 @@ def make_request_fixed(
     Important fixes:
     - paid subscriber key is sent in x-api-key on every request;
     - APIKey remains in the body as a backwards-compatible fallback;
-    - Lahiri is forced on every calculation;
+    - Lahiri is the default, with a thread-local KP override;
     - planet parameters use the nested {"Name": "Moon"} shape.
     """
 
@@ -179,7 +214,7 @@ def make_request_fixed(
         for key, value in dict(params).items()
     }
 
-    payload["Ayanamsa"] = "LAHIRI"
+    payload["Ayanamsa"] = active_request_ayanamsa()
 
     # Header is the current recommended authentication method. The body field
     # remains because older VedAstro server/client paths also recognise it.
@@ -271,8 +306,8 @@ app = FastAPI(
         "Compact Lahiri event-chart proxy using the official "
         "VedAstro.Python client, paid-key header authentication, "
         "nested planet parameters, exact Placidus cusps, "
-        "planet-to-cusp contacts, exact Navamsha cusp geometry "
-        "and strict validation."
+        "planet-to-cusp contacts, exact Navamsha cusp geometry, "
+        "Krishnamurti KP sublords and strict validation."
     ),
 )
 
@@ -359,6 +394,118 @@ NAVAMSHA_START_SIGN_INDEX = {
     9: 9,   # Capricorn -> Capricorn
     10: 6,  # Aquarius -> Libra
     11: 3,  # Pisces -> Cancer
+}
+
+
+# Gambler's Dharma Chapter 6 / Krishnamurti Paddhati.
+KP_AYANAMSHA_NAME = "KRISHNAMURTI"
+
+VIMSHOTTARI_SEQUENCE = (
+    "Ketu",
+    "Venus",
+    "Sun",
+    "Moon",
+    "Mars",
+    "Rahu",
+    "Jupiter",
+    "Saturn",
+    "Mercury",
+)
+
+VIMSHOTTARI_YEARS = {
+    "Ketu": 7,
+    "Venus": 20,
+    "Sun": 6,
+    "Moon": 10,
+    "Mars": 7,
+    "Rahu": 18,
+    "Jupiter": 16,
+    "Saturn": 19,
+    "Mercury": 17,
+}
+
+NAKSHATRA_NAMES = (
+    "Ashwini",
+    "Bharani",
+    "Krittika",
+    "Rohini",
+    "Mrigashirsha",
+    "Ardra",
+    "Punarvasu",
+    "Pushya",
+    "Ashlesha",
+    "Magha",
+    "Purva Phalguni",
+    "Uttara Phalguni",
+    "Hasta",
+    "Chitra",
+    "Swati",
+    "Vishakha",
+    "Anuradha",
+    "Jyeshtha",
+    "Mula",
+    "Purva Ashadha",
+    "Uttara Ashadha",
+    "Shravana",
+    "Dhanishta",
+    "Shatabhisha",
+    "Purva Bhadrapada",
+    "Uttara Bhadrapada",
+    "Revati",
+)
+
+NAKSHATRA_LORDS = tuple(
+    VIMSHOTTARI_SEQUENCE[index % 9]
+    for index in range(27)
+)
+
+SIGN_LORDS = {
+    "Aries": "Mars",
+    "Taurus": "Venus",
+    "Gemini": "Mercury",
+    "Cancer": "Moon",
+    "Leo": "Sun",
+    "Virgo": "Mercury",
+    "Libra": "Venus",
+    "Scorpio": "Mars",
+    "Sagittarius": "Jupiter",
+    "Capricorn": "Saturn",
+    "Aquarius": "Saturn",
+    "Pisces": "Jupiter",
+}
+
+KP_COLUMN_WEIGHTS = {
+    "A": 1.0,
+    "B": 2.0,
+    "C": 3.0,
+    "D": 4.0,
+}
+
+KP_HOUSE_VALUES = {
+    1: 1.0,
+    2: 0.5,
+    3: 1.0,
+    4: -1.0,
+    5: -1.0,
+    6: 1.0,
+    7: -1.0,
+    8: -1.0,
+    9: -1.0,
+    10: 1.0,
+    11: 1.0,
+    12: -1.0,
+}
+
+KP_FAVOURITE_ARRAY_HOUSES = {1, 3, 6, 10, 11}
+KP_UNDERDOG_ARRAY_HOUSES = {4, 5, 7, 9, 12}
+KP_NEUTRAL_ARRAY_HOUSES = {2, 8}
+
+KP_WEAK_FAVOURITE_ARRAY_HOUSES = {1, 3, 6, 8, 10, 11}
+KP_WEAK_UNDERDOG_ARRAY_HOUSES = {2, 4, 5, 7, 9, 12}
+
+PLANET_ORDER = {
+    name: index
+    for index, name in enumerate(PLANETS)
 }
 
 
@@ -566,6 +713,25 @@ def vedastro_call(
         "attempts": attempts_made,
         "error": final_error or "Unknown VedAstro error",
     }
+
+
+def vedastro_call_for_ayanamsa(
+    ayanamsa_name: str,
+    method_names: str | list[str],
+    *args: Any,
+    required: bool = False,
+) -> dict[str, Any]:
+    """Run one generated-client call with an isolated payload ayanamsa."""
+
+    with use_request_ayanamsa(ayanamsa_name):
+        result = vedastro_call(
+            method_names,
+            *args,
+            required=required,
+        )
+
+    result["ayanamsa_requested"] = str(ayanamsa_name)
+    return result
 
 
 # ============================================================
@@ -1744,6 +1910,699 @@ def calculate_exact_navamsha_cusps(
     }
 
 
+def kp_nakshatra_and_sublord(
+    sidereal_longitude: float,
+) -> dict[str, Any]:
+    """
+    Calculate the KP nakshatra lord and sublord from one exact
+    Krishnamurti sidereal longitude.
+
+    Each 13°20' nakshatra is divided in Vimshottari proportions. The
+    sublord sequence begins with the nakshatra lord and then follows the
+    standard nine-planet Vimshottari order.
+    """
+
+    longitude = normalise_degrees(float(sidereal_longitude))
+    nakshatra_size = 360.0 / 27.0
+    index = int(longitude // nakshatra_size)
+    index = min(max(index, 0), 26)
+
+    nakshatra_start = index * nakshatra_size
+    offset = longitude - nakshatra_start
+    nakshatra_lord = NAKSHATRA_LORDS[index]
+
+    lord_start_index = VIMSHOTTARI_SEQUENCE.index(nakshatra_lord)
+    ordered_sublords = (
+        VIMSHOTTARI_SEQUENCE[lord_start_index:]
+        + VIMSHOTTARI_SEQUENCE[:lord_start_index]
+    )
+
+    cumulative = 0.0
+    selected_sublord = ordered_sublords[-1]
+    sub_start = 0.0
+    sub_end = nakshatra_size
+
+    for sublord in ordered_sublords:
+        span = (
+            nakshatra_size
+            * VIMSHOTTARI_YEARS[sublord]
+            / 120.0
+        )
+        next_cumulative = cumulative + span
+
+        if (
+            offset < next_cumulative - 1e-10
+            or sublord == ordered_sublords[-1]
+        ):
+            selected_sublord = sublord
+            sub_start = cumulative
+            sub_end = next_cumulative
+            break
+
+        cumulative = next_cumulative
+
+    return {
+        "sidereal_longitude": round(longitude, 8),
+        **sign_details_from_longitude(longitude),
+        "nakshatra_index": index + 1,
+        "nakshatra": NAKSHATRA_NAMES[index],
+        "nakshatra_lord": nakshatra_lord,
+        "offset_in_nakshatra": round(offset, 8),
+        "sublord": selected_sublord,
+        "sublord_segment_start_longitude": round(
+            normalise_degrees(nakshatra_start + sub_start),
+            8,
+        ),
+        "sublord_segment_end_longitude": round(
+            normalise_degrees(nakshatra_start + sub_end),
+            8,
+        ),
+    }
+
+
+def house_number_for_longitude(
+    sidereal_longitude: float,
+    cusps: dict[str, dict[str, Any]],
+) -> int | None:
+    """Place a planet in one exact cyclic Placidus house interval."""
+
+    longitude = normalise_degrees(float(sidereal_longitude))
+
+    for house_number in range(1, 13):
+        next_house_number = 1 if house_number == 12 else house_number + 1
+
+        start_value = cusps.get(
+            f"House{house_number}",
+            {},
+        ).get("sidereal_longitude")
+        end_value = cusps.get(
+            f"House{next_house_number}",
+            {},
+        ).get("sidereal_longitude")
+
+        if not isinstance(start_value, (int, float)):
+            return None
+
+        if not isinstance(end_value, (int, float)):
+            return None
+
+        start = normalise_degrees(float(start_value))
+        end = normalise_degrees(float(end_value))
+        arc = (end - start) % 360.0
+        offset = (longitude - start) % 360.0
+
+        if offset < arc - 1e-9 or abs(offset) <= 1e-9:
+            return house_number
+
+    return None
+
+
+def sort_planet_names(names: set[str] | list[str]) -> list[str]:
+    return sorted(
+        set(names),
+        key=lambda name: (
+            PLANET_ORDER.get(name, 999),
+            name,
+        ),
+    )
+
+
+def calculate_kp_planet_position(
+    planet_name: str,
+    event_time: Time,
+) -> dict[str, Any]:
+    """Calculate one exact planet longitude using KP ayanamsha."""
+
+    result = vedastro_call_for_ayanamsa(
+        KP_AYANAMSHA_NAME,
+        "PlanetNirayanaLongitude",
+        PLANETS[planet_name],
+        event_time,
+    )
+    longitude = extract_total_degrees(result)
+
+    if result.get("status") != "Pass" or longitude is None:
+        return {
+            "status": "Fail",
+            "planet": planet_name,
+            "longitude_result": result,
+            "error": "Could not obtain exact KP sidereal longitude.",
+        }
+
+    details = kp_nakshatra_and_sublord(longitude)
+
+    return {
+        "status": "Pass",
+        "planet": planet_name,
+        "ayanamsa": "Krishnamurti",
+        **details,
+        "longitude_result": {
+            key: value
+            for key, value in result.items()
+            if key != "data"
+        },
+    }
+
+
+def build_kp_significator_matrix(
+    cusps: dict[str, dict[str, Any]],
+    planet_positions: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """
+    Build Chapter 6 columns A-D for all twelve houses.
+
+    A: lord of the sign containing the cusp
+    B: planets tenanting a nakshatra of the cusp lord
+    C: planets residing in the Placidus house
+    D: planets tenanting a nakshatra of a house resident
+    """
+
+    matrix: dict[str, dict[str, Any]] = {}
+
+    for house_number in range(1, 13):
+        house_name = f"House{house_number}"
+        cusp = cusps[house_name]
+        cusp_sign = cusp["sign"]
+        cusp_lord = SIGN_LORDS[cusp_sign]
+
+        residents = sort_planet_names([
+            planet_name
+            for planet_name, position in planet_positions.items()
+            if position.get("house") == house_number
+        ])
+
+        column_b = sort_planet_names([
+            planet_name
+            for planet_name, position in planet_positions.items()
+            if position.get("nakshatra_lord") == cusp_lord
+        ])
+
+        resident_lords = set(residents)
+        column_d = sort_planet_names([
+            planet_name
+            for planet_name, position in planet_positions.items()
+            if position.get("nakshatra_lord") in resident_lords
+        ])
+
+        matrix[house_name] = {
+            "house": house_name,
+            "house_number": house_number,
+            "cusp_longitude": cusp["sidereal_longitude"],
+            "cusp_sign": cusp_sign,
+            "column_A_cusp_sign_lord": [cusp_lord],
+            "column_B_planets_in_cusp_lord_stars": column_b,
+            "column_C_house_residents": residents,
+            "column_D_planets_in_resident_stars": column_d,
+            "columns": {
+                "A": [cusp_lord],
+                "B": column_b,
+                "C": residents,
+                "D": column_d,
+            },
+        }
+
+    return matrix
+
+
+def kp_effective_column_weights(
+    row: dict[str, Any],
+) -> tuple[dict[str, float], str]:
+    """
+    Apply the exact sparse-row rules stated in Chapter 6.
+
+    - Standard A/B/C/D weights are 1/2/3/4.
+    - If the complete row has only one planet-column membership, it gets 4.
+    - If A and B are the only populated columns, use A=2 and B=4.
+    """
+
+    columns = row["columns"]
+    populated = [
+        column
+        for column in ("A", "B", "C", "D")
+        if columns[column]
+    ]
+    membership_count = sum(
+        len(columns[column])
+        for column in ("A", "B", "C", "D")
+    )
+
+    if membership_count == 1:
+        only_column = populated[0]
+        weights = dict(KP_COLUMN_WEIGHTS)
+        weights[only_column] = 4.0
+        return weights, f"single-membership {only_column}=4"
+
+    if set(populated) == {"A", "B"}:
+        weights = dict(KP_COLUMN_WEIGHTS)
+        weights["A"] = 2.0
+        weights["B"] = 4.0
+        return weights, "sparse A/B rule: A=2, B=4"
+
+    return dict(KP_COLUMN_WEIGHTS), "standard A=1, B=2, C=3, D=4"
+
+
+def score_kp_sublord(
+    sublord: str,
+    matrix: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Score one 1st/7th cusp sublord across the Chapter 6 matrix."""
+
+    breakdown: list[dict[str, Any]] = []
+    total = 0.0
+
+    for house_number in range(1, 13):
+        house_name = f"House{house_number}"
+        row = matrix[house_name]
+        weights, weight_mode = kp_effective_column_weights(row)
+        house_value = KP_HOUSE_VALUES[house_number]
+
+        contributions = []
+
+        for column in ("A", "B", "C", "D"):
+            if sublord not in row["columns"][column]:
+                continue
+
+            raw_weight = weights[column]
+            points = raw_weight * house_value
+            total += points
+
+            contributions.append({
+                "column": column,
+                "weight": raw_weight,
+                "house_value": house_value,
+                "points": round(points, 8),
+            })
+
+        if contributions:
+            breakdown.append({
+                "house": house_name,
+                "house_number": house_number,
+                "weight_mode": weight_mode,
+                "contributions": contributions,
+                "house_total": round(
+                    sum(
+                        item["points"]
+                        for item in contributions
+                    ),
+                    8,
+                ),
+            })
+
+    return {
+        "sublord": sublord,
+        "score": round(total, 8),
+        "breakdown": breakdown,
+    }
+
+
+def compare_kp_cusp_sublords(
+    cusp_sublords: dict[str, dict[str, Any]],
+    matrix: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare the Lagna and seventh-cusp sublords using Chapter 6."""
+
+    lagna_sublord = cusp_sublords["House1"]["sublord"]
+    seventh_sublord = cusp_sublords["House7"]["sublord"]
+
+    lagna_score = score_kp_sublord(lagna_sublord, matrix)
+    seventh_score = score_kp_sublord(seventh_sublord, matrix)
+
+    same_sublord = lagna_sublord == seventh_sublord
+
+    if same_sublord:
+        signed_differential = lagna_score["score"]
+        differential_rule = (
+            "Same 1st/7th sublord: use that planet's score as the "
+            "favourite differential."
+        )
+    else:
+        signed_differential = (
+            lagna_score["score"] - seventh_score["score"]
+        )
+        differential_rule = (
+            "Favourite differential = Lagna-sublord score minus "
+            "seventh-cusp-sublord score."
+        )
+
+    if signed_differential > 3:
+        indication = "Favourite"
+    elif signed_differential < -3:
+        indication = "Underdog"
+    else:
+        indication = "Balanced / virtually draw"
+
+    return {
+        "lagna_sublord": lagna_score,
+        "seventh_cusp_sublord": seventh_score,
+        "same_sublord": same_sublord,
+        "differential_rule": differential_rule,
+        "signed_favourite_differential": round(
+            signed_differential,
+            8,
+        ),
+        "three_point_close_threshold": True,
+        "indication": indication,
+    }
+
+
+def detect_kp_sublord_array(
+    cusp_sublords: dict[str, dict[str, Any]],
+    planet_positions: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Detect the full and weaker Chapter 6 sublord-array patterns."""
+
+    pointers: dict[str, dict[str, Any]] = {}
+    unavailable = []
+
+    for house_number in range(1, 13):
+        house_name = f"House{house_number}"
+        sublord = cusp_sublords[house_name]["sublord"]
+        position = planet_positions.get(sublord)
+        occupied_house = (
+            position.get("house")
+            if position
+            else None
+        )
+
+        if occupied_house is None:
+            unavailable.append({
+                "cusp": house_name,
+                "sublord": sublord,
+                "reason": "Sublord planet house is unavailable.",
+            })
+
+        pointers[house_name] = {
+            "cusp": house_name,
+            "sublord": sublord,
+            "sublord_planet_house": occupied_house,
+        }
+
+    if unavailable:
+        return {
+            "status": "Partial",
+            "pointers": pointers,
+            "full_array": None,
+            "weaker_1_7_10_array": None,
+            "unavailable": unavailable,
+            "points_applied": False,
+        }
+
+    occupied_houses = [
+        item["sublord_planet_house"]
+        for item in pointers.values()
+    ]
+
+    favourite_full = all(
+        house in (
+            KP_FAVOURITE_ARRAY_HOUSES
+            | KP_NEUTRAL_ARRAY_HOUSES
+        )
+        for house in occupied_houses
+    ) and any(
+        house in KP_FAVOURITE_ARRAY_HOUSES
+        for house in occupied_houses
+    )
+
+    underdog_full = all(
+        house in (
+            KP_UNDERDOG_ARRAY_HOUSES
+            | KP_NEUTRAL_ARRAY_HOUSES
+        )
+        for house in occupied_houses
+    ) and any(
+        house in KP_UNDERDOG_ARRAY_HOUSES
+        for house in occupied_houses
+    )
+
+    if favourite_full and not underdog_full:
+        full_side = "Favourite"
+    elif underdog_full and not favourite_full:
+        full_side = "Underdog"
+    else:
+        full_side = None
+
+    key_houses = [
+        pointers["House1"]["sublord_planet_house"],
+        pointers["House7"]["sublord_planet_house"],
+        pointers["House10"]["sublord_planet_house"],
+    ]
+
+    weak_favourite = all(
+        house in KP_WEAK_FAVOURITE_ARRAY_HOUSES
+        for house in key_houses
+    )
+    weak_underdog = all(
+        house in KP_WEAK_UNDERDOG_ARRAY_HOUSES
+        for house in key_houses
+    )
+
+    if weak_favourite and not weak_underdog:
+        weak_side = "Favourite"
+    elif weak_underdog and not weak_favourite:
+        weak_side = "Underdog"
+    else:
+        weak_side = None
+
+    return {
+        "status": "Pass",
+        "pointers": pointers,
+        "full_array": {
+            "detected": full_side is not None,
+            "side": full_side,
+            "favourite_houses": sorted(
+                KP_FAVOURITE_ARRAY_HOUSES
+            ),
+            "underdog_houses": sorted(
+                KP_UNDERDOG_ARRAY_HOUSES
+            ),
+            "neutral_houses": sorted(
+                KP_NEUTRAL_ARRAY_HOUSES
+            ),
+            "book_tier": 2,
+            "book_point_range_if_applied": [7, 9],
+        },
+        "weaker_1_7_10_array": {
+            "detected": weak_side is not None,
+            "side": weak_side,
+            "cusp_sublords_checked": [
+                "House1",
+                "House7",
+                "House10",
+            ],
+            "sublord_planet_houses": key_houses,
+            "book_tier": 1,
+        },
+        "points_applied": False,
+        "points_note": (
+            "Array detection is returned separately. No automatic "
+            "array points are added by the astronomy layer."
+        ),
+        "unavailable": [],
+    }
+
+
+def calculate_kp_sublords(
+    event_time: Time,
+    requested_planets: list[str],
+) -> dict[str, Any]:
+    """
+    Calculate the book-compliant Krishnamurti KP sublord layer.
+
+    Standard event-chart calculations remain Lahiri. Only this block sends
+    KRISHNAMURTI in the upstream payload.
+    """
+
+    required_planets = list(PLANETS)
+    missing_requested_planets = [
+        planet
+        for planet in required_planets
+        if planet not in requested_planets
+    ]
+
+    ayanamsa_degree = vedastro_call_for_ayanamsa(
+        KP_AYANAMSHA_NAME,
+        "AyanamsaDegree",
+        event_time,
+    )
+
+    raw_cusps = vedastro_call_for_ayanamsa(
+        KP_AYANAMSHA_NAME,
+        "GetAllHouseNirayanaMiddleLongitudes",
+        event_time,
+    )
+    parsed_cusps = parse_placidus_cusps(raw_cusps)
+
+    if parsed_cusps.get("status") == "Pass":
+        parsed_cusps["ayanamsa"] = "Krishnamurti"
+        parsed_cusps["requested_payload_ayanamsa"] = (
+            KP_AYANAMSHA_NAME
+        )
+
+    planet_positions: dict[str, dict[str, Any]] = {}
+
+    with ThreadPoolExecutor(
+        max_workers=min(VEDASTRO_MAX_WORKERS, len(required_planets))
+    ) as executor:
+        futures = {
+            executor.submit(
+                calculate_kp_planet_position,
+                planet_name,
+                event_time,
+            ): planet_name
+            for planet_name in required_planets
+        }
+
+        for future in as_completed(futures):
+            planet_name = futures[future]
+
+            try:
+                planet_positions[planet_name] = future.result()
+            except Exception as error:
+                planet_positions[planet_name] = {
+                    "status": "Fail",
+                    "planet": planet_name,
+                    "error": str(error),
+                }
+
+    planet_positions = {
+        planet_name: planet_positions[planet_name]
+        for planet_name in required_planets
+    }
+
+    failed_planets = [
+        result
+        for result in planet_positions.values()
+        if result.get("status") != "Pass"
+    ]
+
+    if (
+        ayanamsa_degree.get("status") != "Pass"
+        or parsed_cusps.get("status") != "Pass"
+        or failed_planets
+    ):
+        return {
+            "status": "Fail",
+            "method": "KrishnamurtiKPSublords",
+            "ayanamsa": "Krishnamurti",
+            "requested_payload_ayanamsa": KP_AYANAMSHA_NAME,
+            "ayanamsa_degree": ayanamsa_degree,
+            "cusps": parsed_cusps,
+            "planet_positions": planet_positions,
+            "failed_planets": failed_planets,
+            "missing_requested_planets": missing_requested_planets,
+            "error": (
+                "The KP ayanamsa, cusp or planet-longitude "
+                "calculation failed."
+            ),
+        }
+
+    cusp_map = parsed_cusps["cusps"]
+
+    for planet_name, position in planet_positions.items():
+        position["house"] = house_number_for_longitude(
+            position["sidereal_longitude"],
+            cusp_map,
+        )
+
+    missing_houses = [
+        planet_name
+        for planet_name, position in planet_positions.items()
+        if position.get("house") is None
+    ]
+
+    cusp_sublords = {}
+
+    for house_number in range(1, 13):
+        house_name = f"House{house_number}"
+        cusp = cusp_map[house_name]
+        kp_details = kp_nakshatra_and_sublord(
+            cusp["sidereal_longitude"]
+        )
+
+        cusp_sublords[house_name] = {
+            "house": house_name,
+            "cusp_longitude": cusp["sidereal_longitude"],
+            "cusp_sign": cusp["sign"],
+            "cusp_sign_lord": SIGN_LORDS[cusp["sign"]],
+            "nakshatra": kp_details["nakshatra"],
+            "nakshatra_lord": kp_details["nakshatra_lord"],
+            "sublord": kp_details["sublord"],
+            "sublord_segment_start_longitude": (
+                kp_details["sublord_segment_start_longitude"]
+            ),
+            "sublord_segment_end_longitude": (
+                kp_details["sublord_segment_end_longitude"]
+            ),
+        }
+
+    matrix = build_kp_significator_matrix(
+        cusp_map,
+        planet_positions,
+    )
+    comparison = compare_kp_cusp_sublords(
+        cusp_sublords,
+        matrix,
+    )
+    array = detect_kp_sublord_array(
+        cusp_sublords,
+        planet_positions,
+    )
+
+    status = (
+        "Pass"
+        if not missing_houses and not missing_requested_planets
+        else "Partial"
+    )
+
+    return {
+        "status": status,
+        "method": "KrishnamurtiKPSublords",
+        "book_chapter": 6,
+        "book_tier": 2,
+        "ayanamsa": "Krishnamurti",
+        "requested_payload_ayanamsa": KP_AYANAMSHA_NAME,
+        "standard_chart_ayanamsa_unchanged": "Lahiri",
+        "interpretation_applied": True,
+        "scoring_policy": {
+            "columns": {
+                "A": 1,
+                "B": 2,
+                "C": 3,
+                "D": 4,
+            },
+            "single_membership": 4,
+            "only_A_and_B_populated": {
+                "A": 2,
+                "B": 4,
+            },
+            "positive_houses": [1, 3, 6, 10, 11],
+            "house2": "half positive",
+            "negative_houses": [4, 5, 7, 8, 9, 12],
+            "house8": "full negative",
+            "close_difference": "3 points or less",
+        },
+        "ayanamsa_degree": ayanamsa_degree,
+        "cusps": parsed_cusps,
+        "planet_positions": planet_positions,
+        "cusp_sublords": cusp_sublords,
+        "significator_matrix": matrix,
+        "main_sublord_comparison": comparison,
+        "sublord_array": array,
+        "failed_planets": [],
+        "missing_planet_houses": missing_houses,
+        "missing_requested_planets": missing_requested_planets,
+        "error": (
+            None
+            if status == "Pass"
+            else (
+                "KP geometry was calculated, but the original Action "
+                "request did not contain every classical planet or one "
+                "planet could not be placed in a Placidus house."
+            )
+        ),
+    }
+
+
 # ============================================================
 # CONSISTENCY VALIDATION
 # ============================================================
@@ -2173,7 +3032,7 @@ def health() -> dict[str, Any]:
             "exact_lahiri_placidus_cusps": True,
             "planet_cusp_contacts": True,
             "navamsha_cusps": True,
-            "kp_sublords": False,
+            "kp_sublords": True,
         },
         "minimum_call_interval_seconds": VEDASTRO_MIN_INTERVAL_SECONDS,
         "maximum_attempts_per_method": VEDASTRO_MAX_RETRIES,
@@ -2325,6 +3184,13 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         rashi_placidus,
     )
 
+    # Chapter 6 is calculated independently under Krishnamurti ayanamsha.
+    # It does not alter or replace the standard Lahiri chart.
+    kp_sublords = calculate_kp_sublords(
+        event_time,
+        requested_planets,
+    )
+
     essential_results: list[dict[str, Any]] = [
         core["ayanamsa_degree"],
         core["lagna_sign"],
@@ -2431,6 +3297,7 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         "rashi_placidus": rashi_placidus,
         "planet_cusp_contacts": planet_cusp_contacts,
         "navamsha_cusps": navamsha_cusps,
+        "kp_sublords": kp_sublords,
         "houses": houses,
         "planets": planets,
         "provenance": {
@@ -2451,6 +3318,11 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
                 "longitudes and cross-checked against available "
                 "VedAstro D9 planet signs. Whole-house D9 sign "
                 "cross-check is optional."
+            ),
+            "kp_sublords": (
+                "Chapter 6 KP cusps and planet longitudes calculated "
+                "with an isolated KRISHNAMURTI payload. Standard chart "
+                "calls remain LAHIRI."
             ),
             "vedastro_api_key": "stored only on Render",
             "minimum_call_interval_seconds": VEDASTRO_MIN_INTERVAL_SECONDS,
