@@ -25,7 +25,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.6.0"
+PROXY_VERSION = "1.6.1"
 
 
 # ============================================================
@@ -766,10 +766,26 @@ def _find_cusp_sequence(value: Any) -> list[float] | None:
     """
     Find the VedAstro cusp array.
 
-    Swiss Ephemeris returns 13 slots: index 0 is unused and indexes 1-12 are
-    House1-House12. Some serializers may remove the unused first slot and
-    return exactly 12 values.
+    VedAstro may serialise GetAllHouseNirayanaMiddleLongitudes as:
+    - a 12- or 13-item list,
+    - a nested object containing that list, or
+    - one comma-separated string such as "0, 305.03, ...".
+
+    Swiss Ephemeris uses 13 slots: index 0 is unused and indexes 1-12 are
+    House1-House12. Some serializers remove the unused first slot.
     """
+
+    if isinstance(value, str):
+        cleaned = value.strip().strip("[]()")
+        if "," in cleaned:
+            parts = [part.strip() for part in cleaned.split(",")]
+            try:
+                numbers = [float(part) for part in parts if part != ""]
+            except ValueError:
+                numbers = []
+
+            if len(numbers) in {12, 13}:
+                return numbers
 
     if isinstance(value, (list, tuple)):
         parsed = [_numeric_from_item(item) for item in value]
