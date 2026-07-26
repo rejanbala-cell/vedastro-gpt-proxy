@@ -7,6 +7,7 @@ import os
 import threading
 import time
 import re
+import statistics
 import unicodedata
 from datetime import date, datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -47,7 +48,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db7b"
+PROXY_VERSION = "1.20.0-db8"
 
 
 # ============================================================
@@ -93,6 +94,22 @@ FIXTURE_LIST_DEFAULT_LIMIT = int(
 )
 FIXTURE_LIST_MAX_LIMIT = int(
     os.getenv("FIXTURE_LIST_MAX_LIMIT", "500")
+)
+
+# DB8 captures one pre-match 1X2 market snapshot for the verified checkpoint
+# fixture. The provider publishes pre-match odds through GET /odds.
+MARKET_CAPTURE_AUTO_RUN = os.getenv(
+    "MARKET_CAPTURE_AUTO_RUN",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+MARKET_CAPTURE_TARGET_FIXTURE_ID = int(
+    os.getenv("MARKET_CAPTURE_TARGET_FIXTURE_ID", "530")
+)
+MARKET_CAPTURE_MIN_INTERVAL_SECONDS = int(
+    os.getenv("MARKET_CAPTURE_MIN_INTERVAL_SECONDS", "10800")
+)
+MARKET_MIN_BOOKMAKER_COUNT = int(
+    os.getenv("MARKET_MIN_BOOKMAKER_COUNT", "3")
 )
 
 LOCATIONIQ_KEY = os.getenv("LOCATIONIQ_KEY", "").strip()
@@ -18345,6 +18362,26 @@ def list_stored_fixtures(
         venue_time_valid = bool(
             time_views["venue_timezone_conversion_valid"]
         )
+        location_time_blockers = [
+            blocker
+            for blocker, missing in (
+                ("venue_name_missing", row[8] is None),
+                (
+                    "venue_timezone_unverified",
+                    row[10] is None or not venue_time_valid,
+                ),
+                ("latitude_missing", row[12] is None),
+                ("longitude_missing", row[13] is None),
+                ("location_source_missing", row[14] is None),
+                ("location_verification_missing", row[16] is None),
+                (
+                    "venue_local_time_unavailable",
+                    not venue_time_valid,
+                ),
+            )
+            if missing
+        ]
+        location_time_ready = not location_time_blockers
         fixtures.append({
             "database_fixture_id": row[0],
             "provider_fixture_id": row[1],
@@ -18375,34 +18412,20 @@ def list_stored_fixtures(
             "venue_coordinates_available": (
                 row[12] is not None and row[13] is not None
             ),
-            "prediction_ready": (
-                row[8] is not None
-                and row[10] is not None
-                and row[12] is not None
-                and row[13] is not None
-                and row[14] is not None
-                and row[16] is not None
-                and venue_time_valid
+            "location_time_ready": location_time_ready,
+            "location_time_blockers": location_time_blockers,
+            "market_status_endpoint": f"/fixtures/{row[0]}/market-status",
+            "prediction_ready": False,
+            "prediction_blockers": (
+                list(location_time_blockers)
+                + [
+                    "market_consensus_not_frozen",
+                    "performance_evidence_not_verified",
+                    "lineups_not_verified",
+                    "injuries_not_verified",
+                ]
             ),
-            "prediction_blockers": [
-                blocker
-                for blocker, missing in (
-                    ("venue_name_missing", row[8] is None),
-                    (
-                        "venue_timezone_unverified",
-                        row[10] is None or not venue_time_valid,
-                    ),
-                    ("latitude_missing", row[12] is None),
-                    ("longitude_missing", row[13] is None),
-                    ("location_source_missing", row[14] is None),
-                    ("location_verification_missing", row[16] is None),
-                    (
-                        "venue_local_time_unavailable",
-                        not venue_time_valid,
-                    ),
-                )
-                if missing
-            ],
+            "astrology_action_allowed": False,
         })
 
     return {
@@ -18499,7 +18522,7 @@ def get_stored_fixture_by_id(
         time_views["venue_timezone_conversion_valid"]
     )
 
-    blockers = [
+    location_time_blockers = [
         blocker
         for blocker, missing in (
             ("venue_name_missing", row[8] is None),
@@ -18515,6 +18538,21 @@ def get_stored_fixture_by_id(
         )
         if missing
     ]
+    location_time_ready = not location_time_blockers
+    market_status = latest_market_status(int(row[0]))
+    market_ready = bool(market_status.get("market_ready"))
+
+    prediction_blockers = list(location_time_blockers)
+    if not market_ready:
+        prediction_blockers.append("market_consensus_unavailable")
+    prediction_blockers.extend(
+        [
+            "market_consensus_not_frozen",
+            "performance_evidence_not_verified",
+            "lineups_not_verified",
+            "injuries_not_verified",
+        ]
+    )
 
     fixture = {
         "database_fixture_id": row[0],
@@ -18546,8 +18584,13 @@ def get_stored_fixture_by_id(
         "venue_coordinates_available": (
             row[12] is not None and row[13] is not None
         ),
-        "prediction_ready": len(blockers) == 0,
-        "prediction_blockers": blockers,
+        "location_time_ready": location_time_ready,
+        "location_time_blockers": location_time_blockers,
+        "market_ready": market_ready,
+        "market_status": market_status,
+        "prediction_ready": False,
+        "prediction_blockers": prediction_blockers,
+        "astrology_action_allowed": False,
     }
 
     return {
@@ -20714,6 +20757,811 @@ def commit_reviewed_locations_on_startup() -> None:
 
 
 # ============================================================
+# PRE-MATCH 1X2 MARKET CAPTURE — CHECKPOINT DB8
+# ============================================================
+
+MARKET_CAPTURE_STARTUP_STATUS: dict[str, Any] = {
+    "status": "not_started",
+    "captured": False,
+}
+
+
+def _market_metadata_prefix(fixture_id: int) -> str:
+    return f"market_capture_{fixture_id}"
+
+
+def _read_market_attempt_metadata(
+    fixture_id: int,
+) -> dict[str, Any]:
+    prefix = _market_metadata_prefix(fixture_id)
+    keys = [
+        f"{prefix}_last_attempt_at",
+        f"{prefix}_last_status",
+        f"{prefix}_last_bookmaker_count",
+    ]
+    output = {
+        "last_attempt_at": None,
+        "last_status": None,
+        "last_bookmaker_count": 0,
+    }
+
+    if not DATABASE_URL or psycopg is None:
+        return output
+
+    try:
+        with psycopg.connect(
+            DATABASE_URL,
+            connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+            autocommit=True,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT key, value
+                    FROM app_metadata
+                    WHERE key = ANY(%s)
+                    """,
+                    (keys,),
+                )
+                values = {
+                    str(row[0]): str(row[1])
+                    for row in cursor.fetchall()
+                }
+    except Exception:
+        return output
+
+    output["last_attempt_at"] = values.get(
+        f"{prefix}_last_attempt_at"
+    )
+    output["last_status"] = values.get(
+        f"{prefix}_last_status"
+    )
+    try:
+        output["last_bookmaker_count"] = int(
+            values.get(f"{prefix}_last_bookmaker_count") or 0
+        )
+    except (TypeError, ValueError):
+        pass
+    return output
+
+
+def _write_market_attempt_metadata(
+    *,
+    fixture_id: int,
+    status: str,
+    bookmaker_count: int,
+) -> None:
+    if not DATABASE_URL or psycopg is None:
+        return
+
+    prefix = _market_metadata_prefix(fixture_id)
+    values = {
+        f"{prefix}_last_attempt_at": (
+            datetime.now(timezone.utc).isoformat()
+        ),
+        f"{prefix}_last_status": status,
+        f"{prefix}_last_bookmaker_count": str(bookmaker_count),
+    }
+
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                for key, value in values.items():
+                    cursor.execute(
+                        """
+                        INSERT INTO app_metadata (key, value)
+                        VALUES (%s, %s)
+                        ON CONFLICT (key) DO UPDATE SET
+                            value = EXCLUDED.value,
+                            updated_at = NOW()
+                        """,
+                        (key, value),
+                    )
+            connection.commit()
+    except Exception:
+        return
+
+
+def _market_attempt_is_fresh(
+    metadata: dict[str, Any],
+) -> bool:
+    value = metadata.get("last_attempt_at")
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        last_attempt = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+    except ValueError:
+        return False
+    if last_attempt.tzinfo is None:
+        return False
+
+    age = (
+        datetime.now(timezone.utc)
+        - last_attempt.astimezone(timezone.utc)
+    )
+    return age.total_seconds() < MARKET_CAPTURE_MIN_INTERVAL_SECONDS
+
+
+def _load_market_capture_fixture(
+    fixture_id: int,
+) -> dict[str, Any] | None:
+    if not DATABASE_URL or psycopg is None:
+        return None
+
+    try:
+        with psycopg.connect(
+            DATABASE_URL,
+            connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+            autocommit=True,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        provider_fixture_id,
+                        home_team,
+                        away_team,
+                        kickoff_utc,
+                        fixture_status,
+                        venue_name,
+                        timezone_name,
+                        latitude,
+                        longitude,
+                        location_source,
+                        location_verified_at
+                    FROM fixtures
+                    WHERE id = %s
+                      AND sport = 'soccer'
+                    LIMIT 1
+                    """,
+                    (fixture_id,),
+                )
+                row = cursor.fetchone()
+    except Exception:
+        return None
+
+    if not row:
+        return None
+
+    location_time_ready = all(
+        value is not None
+        for value in (
+            row[6],
+            row[7],
+            row[8],
+            row[9],
+            row[10],
+            row[11],
+        )
+    )
+
+    return {
+        "database_fixture_id": int(row[0]),
+        "provider_fixture_id": str(row[1]) if row[1] else None,
+        "home_team": row[2],
+        "away_team": row[3],
+        "kickoff_utc": (
+            row[4].isoformat()
+            if isinstance(row[4], datetime)
+            else str(row[4])
+        ),
+        "fixture_status": row[5],
+        "location_time_ready": location_time_ready,
+    }
+
+
+def _normalise_market_text(value: Any) -> str:
+    return " ".join(
+        re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            str(value or "").lower(),
+        ).split()
+    )
+
+
+def _decimal_odd(value: Any) -> float | None:
+    try:
+        odd = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(odd) or odd <= 1.0:
+        return None
+    return odd
+
+
+def _outcome_key(value: Any) -> str | None:
+    label = _normalise_market_text(value)
+    mapping = {
+        "home": "home",
+        "1": "home",
+        "draw": "draw",
+        "x": "draw",
+        "away": "away",
+        "2": "away",
+    }
+    return mapping.get(label)
+
+
+def _extract_prematch_1x2_quotes(
+    payload: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    response_rows = payload.get("response")
+    if not isinstance(response_rows, list):
+        return [], []
+
+    quotes_by_bookmaker: dict[str, dict[str, Any]] = {}
+    provider_updates: list[str] = []
+
+    for response_item in response_rows:
+        if not isinstance(response_item, dict):
+            continue
+
+        update_value = response_item.get("update")
+        if update_value:
+            provider_updates.append(str(update_value))
+
+        bookmakers = response_item.get("bookmakers")
+        if not isinstance(bookmakers, list):
+            continue
+
+        for bookmaker in bookmakers:
+            if not isinstance(bookmaker, dict):
+                continue
+
+            bookmaker_id = bookmaker.get("id")
+            bookmaker_name = str(
+                bookmaker.get("name") or f"bookmaker-{bookmaker_id}"
+            )
+            bookmaker_key = str(
+                bookmaker_id
+                if bookmaker_id is not None
+                else bookmaker_name
+            )
+
+            bets = bookmaker.get("bets")
+            if not isinstance(bets, list):
+                continue
+
+            complete_quote = None
+            for bet in bets:
+                if not isinstance(bet, dict):
+                    continue
+
+                bet_name = _normalise_market_text(bet.get("name"))
+                is_match_winner = bet_name in {
+                    "match winner",
+                    "fulltime result",
+                    "full time result",
+                    "1x2",
+                }
+                if not is_match_winner:
+                    continue
+
+                values = bet.get("values")
+                if not isinstance(values, list):
+                    continue
+
+                odds: dict[str, float] = {}
+                for item in values:
+                    if not isinstance(item, dict):
+                        continue
+                    key = _outcome_key(item.get("value"))
+                    odd = _decimal_odd(item.get("odd"))
+                    if key and odd is not None:
+                        odds[key] = odd
+
+                if set(odds) != {"home", "draw", "away"}:
+                    continue
+
+                raw_probabilities = {
+                    outcome: 1.0 / odd
+                    for outcome, odd in odds.items()
+                }
+                overround = sum(raw_probabilities.values())
+                if overround <= 0:
+                    continue
+
+                no_margin = {
+                    outcome: probability / overround
+                    for outcome, probability
+                    in raw_probabilities.items()
+                }
+
+                complete_quote = {
+                    "bookmaker_id": bookmaker_id,
+                    "bookmaker_name": bookmaker_name,
+                    "bet_id": bet.get("id"),
+                    "bet_name": bet.get("name"),
+                    "odds": odds,
+                    "overround": overround,
+                    "no_margin": no_margin,
+                }
+                break
+
+            if complete_quote is not None:
+                quotes_by_bookmaker[bookmaker_key] = complete_quote
+
+    quotes = sorted(
+        quotes_by_bookmaker.values(),
+        key=lambda item: (
+            str(item.get("bookmaker_name") or ""),
+            str(item.get("bookmaker_id") or ""),
+        ),
+    )
+    return quotes, sorted(set(provider_updates))
+
+
+def _build_market_consensus(
+    *,
+    quotes: list[dict[str, Any]],
+    home_team: str,
+    away_team: str,
+) -> dict[str, Any] | None:
+    if not quotes:
+        return None
+
+    outcomes = ("home", "draw", "away")
+    median_odds = {
+        outcome: statistics.median(
+            float(quote["odds"][outcome])
+            for quote in quotes
+        )
+        for outcome in outcomes
+    }
+    median_no_margin_raw = {
+        outcome: statistics.median(
+            float(quote["no_margin"][outcome])
+            for quote in quotes
+        )
+        for outcome in outcomes
+    }
+
+    probability_total = sum(median_no_margin_raw.values())
+    if probability_total <= 0:
+        return None
+
+    consensus_probability = {
+        outcome: median_no_margin_raw[outcome] / probability_total
+        for outcome in outcomes
+    }
+
+    home_probability = consensus_probability["home"]
+    away_probability = consensus_probability["away"]
+    if math.isclose(
+        home_probability,
+        away_probability,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        team_favourite = "PICKEM"
+        team_favourite_name = None
+    elif home_probability > away_probability:
+        team_favourite = "HOME"
+        team_favourite_name = home_team
+    else:
+        team_favourite = "AWAY"
+        team_favourite_name = away_team
+
+    market_outcome_leader = max(
+        outcomes,
+        key=lambda outcome: consensus_probability[outcome],
+    ).upper()
+
+    bookmaker_count = len(quotes)
+    market_ready = bookmaker_count >= MARKET_MIN_BOOKMAKER_COUNT
+
+    return {
+        "method": (
+            "median bookmaker no-margin probabilities, then renormalised"
+        ),
+        "market": "90-minute Match Winner 1X2",
+        "bookmaker_count": bookmaker_count,
+        "minimum_bookmaker_count": MARKET_MIN_BOOKMAKER_COUNT,
+        "market_ready": market_ready,
+        "median_decimal_odds": {
+            outcome: round(value, 6)
+            for outcome, value in median_odds.items()
+        },
+        "consensus_no_margin_probability": {
+            outcome: round(value, 8)
+            for outcome, value in consensus_probability.items()
+        },
+        "market_outcome_leader": market_outcome_leader,
+        "team_favourite": team_favourite,
+        "team_favourite_name": team_favourite_name,
+        "home_away_probability_gap": round(
+            abs(home_probability - away_probability),
+            8,
+        ),
+        "draw_is_market_leader": (
+            market_outcome_leader == "DRAW"
+        ),
+        "favourite_frozen": False,
+        "astrology_action_allowed": False,
+    }
+
+
+def _store_market_snapshot(
+    *,
+    fixture_id: int,
+    consensus: dict[str, Any],
+    quotes: list[dict[str, Any]],
+    provider_updates: list[str],
+    provider_paging: Any,
+) -> dict[str, Any]:
+    captured_at = datetime.now(timezone.utc)
+    probabilities = consensus["consensus_no_margin_probability"]
+    median_odds = consensus["median_decimal_odds"]
+
+    raw_payload = {
+        "market": "90-minute Match Winner 1X2",
+        "method": consensus["method"],
+        "quotes": quotes,
+        "provider_updates": provider_updates,
+        "provider_paging": provider_paging,
+        "consensus": consensus,
+    }
+
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO odds_snapshots (
+                        fixture_id,
+                        provider,
+                        captured_at,
+                        home_odds,
+                        draw_odds,
+                        away_odds,
+                        no_margin_home,
+                        no_margin_draw,
+                        no_margin_away,
+                        consensus_favourite,
+                        bookmaker_count,
+                        raw_odds_json
+                    )
+                    VALUES (
+                        %s,
+                        'api-football:prematch-1x2',
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s::jsonb
+                    )
+                    RETURNING id
+                    """,
+                    (
+                        fixture_id,
+                        captured_at,
+                        median_odds["home"],
+                        median_odds["draw"],
+                        median_odds["away"],
+                        probabilities["home"],
+                        probabilities["draw"],
+                        probabilities["away"],
+                        consensus["team_favourite"],
+                        consensus["bookmaker_count"],
+                        json.dumps(
+                            raw_payload,
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                    ),
+                )
+                snapshot_id = int(cursor.fetchone()[0])
+            connection.commit()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "stored": False,
+            "error_type": type(exc).__name__,
+            "message": "Market snapshot could not be stored.",
+        }
+
+    return {
+        "status": "ok",
+        "stored": True,
+        "snapshot_id": snapshot_id,
+        "captured_at": captured_at.isoformat(),
+    }
+
+
+def latest_market_status(
+    fixture_id: int,
+) -> dict[str, Any]:
+    if not DATABASE_URL or psycopg is None:
+        return {
+            "status": "database_unavailable",
+            "market_ready": False,
+            "fixture_id": fixture_id,
+        }
+
+    try:
+        with psycopg.connect(
+            DATABASE_URL,
+            connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+            autocommit=True,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        provider,
+                        captured_at,
+                        home_odds,
+                        draw_odds,
+                        away_odds,
+                        no_margin_home,
+                        no_margin_draw,
+                        no_margin_away,
+                        consensus_favourite,
+                        bookmaker_count,
+                        raw_odds_json
+                    FROM odds_snapshots
+                    WHERE fixture_id = %s
+                    ORDER BY captured_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (fixture_id,),
+                )
+                row = cursor.fetchone()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "market_ready": False,
+            "fixture_id": fixture_id,
+            "error_type": type(exc).__name__,
+        }
+
+    if not row:
+        metadata = _read_market_attempt_metadata(fixture_id)
+        return {
+            "status": "missing",
+            "market_ready": False,
+            "fixture_id": fixture_id,
+            "bookmaker_count": 0,
+            "minimum_bookmaker_count": MARKET_MIN_BOOKMAKER_COUNT,
+            "last_attempt": metadata,
+            "favourite_frozen": False,
+            "astrology_action_allowed": False,
+        }
+
+    raw_json = row[11] if isinstance(row[11], dict) else {}
+    consensus = (
+        raw_json.get("consensus")
+        if isinstance(raw_json, dict)
+        else None
+    )
+    consensus = consensus if isinstance(consensus, dict) else {}
+
+    bookmaker_count = int(row[10] or 0)
+    market_ready = (
+        bool(consensus.get("market_ready"))
+        and bookmaker_count >= MARKET_MIN_BOOKMAKER_COUNT
+    )
+
+    return {
+        "status": "ok",
+        "fixture_id": fixture_id,
+        "snapshot_id": int(row[0]),
+        "provider": row[1],
+        "captured_at": (
+            row[2].isoformat()
+            if isinstance(row[2], datetime)
+            else str(row[2])
+        ),
+        "market": "90-minute Match Winner 1X2",
+        "bookmaker_count": bookmaker_count,
+        "minimum_bookmaker_count": MARKET_MIN_BOOKMAKER_COUNT,
+        "market_ready": market_ready,
+        "median_decimal_odds": {
+            "home": float(row[3]) if row[3] is not None else None,
+            "draw": float(row[4]) if row[4] is not None else None,
+            "away": float(row[5]) if row[5] is not None else None,
+        },
+        "consensus_no_margin_probability": {
+            "home": float(row[6]) if row[6] is not None else None,
+            "draw": float(row[7]) if row[7] is not None else None,
+            "away": float(row[8]) if row[8] is not None else None,
+        },
+        "team_favourite": row[9],
+        "team_favourite_name": consensus.get(
+            "team_favourite_name"
+        ),
+        "market_outcome_leader": consensus.get(
+            "market_outcome_leader"
+        ),
+        "home_away_probability_gap": consensus.get(
+            "home_away_probability_gap"
+        ),
+        "draw_is_market_leader": bool(
+            consensus.get("draw_is_market_leader")
+        ),
+        "favourite_frozen": False,
+        "astrology_action_allowed": False,
+        "quote_count": len(
+            raw_json.get("quotes", [])
+            if isinstance(raw_json, dict)
+            and isinstance(raw_json.get("quotes"), list)
+            else []
+        ),
+    }
+
+
+def capture_target_market_odds(
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    fixture_id = MARKET_CAPTURE_TARGET_FIXTURE_ID
+    fixture = _load_market_capture_fixture(fixture_id)
+    if fixture is None:
+        return {
+            "status": "no_candidate",
+            "captured": False,
+            "fixture_id": fixture_id,
+            "message": "The target stored fixture was not found.",
+        }
+
+    if not fixture.get("location_time_ready"):
+        return {
+            "status": "blocked",
+            "captured": False,
+            "fixture": fixture,
+            "message": "Location and venue-local time are not ready.",
+        }
+
+    provider_fixture_id = fixture.get("provider_fixture_id")
+    if not provider_fixture_id:
+        return {
+            "status": "blocked",
+            "captured": False,
+            "fixture": fixture,
+            "message": "Provider fixture ID is missing.",
+        }
+
+    metadata = _read_market_attempt_metadata(fixture_id)
+    if not force and _market_attempt_is_fresh(metadata):
+        return {
+            "status": "ok",
+            "captured": False,
+            "skipped": True,
+            "reason": "A recent market capture attempt already exists.",
+            "fixture": fixture,
+            "last_attempt": metadata,
+            "latest_market_status": latest_market_status(fixture_id),
+        }
+
+    try:
+        payload = _api_football_get(
+            "/odds",
+            params={
+                "fixture": provider_fixture_id,
+                "page": 1,
+            },
+        )
+    except Exception as exc:
+        _write_market_attempt_metadata(
+            fixture_id=fixture_id,
+            status="provider_error",
+            bookmaker_count=0,
+        )
+        return {
+            "status": "error",
+            "captured": False,
+            "fixture": fixture,
+            "error_type": type(exc).__name__,
+            "message": "Pre-match odds capture failed.",
+        }
+
+    quotes, provider_updates = _extract_prematch_1x2_quotes(payload)
+    bookmaker_count = len(quotes)
+
+    if not quotes:
+        _write_market_attempt_metadata(
+            fixture_id=fixture_id,
+            status="no_complete_1x2_odds",
+            bookmaker_count=0,
+        )
+        return {
+            "status": "no_odds",
+            "captured": False,
+            "fixture": fixture,
+            "bookmaker_count": 0,
+            "market_ready": False,
+            "favourite_frozen": False,
+            "astrology_action_allowed": False,
+            "message": (
+                "API-Football returned no complete pre-match 1X2 quotes."
+            ),
+            "provider_paging": payload.get("paging"),
+        }
+
+    consensus = _build_market_consensus(
+        quotes=quotes,
+        home_team=str(fixture["home_team"]),
+        away_team=str(fixture["away_team"]),
+    )
+    if consensus is None:
+        _write_market_attempt_metadata(
+            fixture_id=fixture_id,
+            status="consensus_failed",
+            bookmaker_count=bookmaker_count,
+        )
+        return {
+            "status": "error",
+            "captured": False,
+            "fixture": fixture,
+            "bookmaker_count": bookmaker_count,
+            "message": "The market consensus could not be calculated.",
+        }
+
+    stored = _store_market_snapshot(
+        fixture_id=fixture_id,
+        consensus=consensus,
+        quotes=quotes,
+        provider_updates=provider_updates,
+        provider_paging=payload.get("paging"),
+    )
+    if not stored.get("stored"):
+        _write_market_attempt_metadata(
+            fixture_id=fixture_id,
+            status="storage_failed",
+            bookmaker_count=bookmaker_count,
+        )
+        return {
+            **stored,
+            "captured": False,
+            "fixture": fixture,
+        }
+
+    attempt_status = (
+        "market_ready"
+        if consensus["market_ready"]
+        else "insufficient_bookmakers"
+    )
+    _write_market_attempt_metadata(
+        fixture_id=fixture_id,
+        status=attempt_status,
+        bookmaker_count=bookmaker_count,
+    )
+
+    return {
+        "status": "ok",
+        "captured": True,
+        "fixture": fixture,
+        "snapshot": stored,
+        "consensus": consensus,
+        "provider_updates": provider_updates,
+        "provider_paging": payload.get("paging"),
+    }
+
+
+@app.on_event("startup")
+def capture_market_odds_on_startup() -> None:
+    global MARKET_CAPTURE_STARTUP_STATUS
+
+    if not MARKET_CAPTURE_AUTO_RUN:
+        MARKET_CAPTURE_STARTUP_STATUS = {
+            "status": "disabled",
+            "captured": False,
+        }
+        return
+
+    if not DATABASE_URL or not API_FOOTBALL_KEY:
+        MARKET_CAPTURE_STARTUP_STATUS = {
+            "status": "not_configured",
+            "captured": False,
+        }
+        return
+
+    MARKET_CAPTURE_STARTUP_STATUS = capture_target_market_odds()
+
+
+# ============================================================
 # AUTHENTICATION
 # ============================================================
 
@@ -20749,7 +21597,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB7B separate display and venue-local kickoff times",
+        "database_checkpoint": "DB8 pre-match 1X2 odds capture and consensus",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -20847,6 +21695,29 @@ def health() -> dict[str, Any]:
             "vedastro_std_time_format": "HH:MM DD/MM/YYYY +HH:MM",
             "venue_local_time_required_for_prediction_ready": True,
         },
+        "market_capture_checkpoint": {
+            "provider": "API-Football",
+            "endpoint": "/odds",
+            "market": "90-minute Match Winner 1X2",
+            "target_database_fixture_id": (
+                MARKET_CAPTURE_TARGET_FIXTURE_ID
+            ),
+            "minimum_bookmaker_count": MARKET_MIN_BOOKMAKER_COUNT,
+            "capture_interval_seconds": (
+                MARKET_CAPTURE_MIN_INTERVAL_SECONDS
+            ),
+            "favourite_frozen": False,
+            "astrology_action_allowed": False,
+        },
+        "market_capture_startup_status": (
+            MARKET_CAPTURE_STARTUP_STATUS
+        ),
+        "prediction_readiness_semantics": {
+            "location_time_ready_is_separate": True,
+            "market_ready_is_separate": True,
+            "prediction_ready_requires_future_performance_layers": True,
+            "astrology_action_remains_blocked": True,
+        },
         "locationiq_public_attribution_required": True,
         "ayanamsa": "Lahiri",
         "engine": "VedAstro.Python",
@@ -20854,7 +21725,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + venue-local time DB7B",
+        "response_mode": "prediction-grade compact v2 + market capture DB8",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -21026,6 +21897,18 @@ def fixture_location_preview(
     if result.get("status") not in {"ok", "no_candidate", "no_match"}:
         raise HTTPException(status_code=503, detail=result)
     return result
+
+
+@app.get("/fixtures/{fixture_id}/market-status")
+def fixture_market_status(
+    fixture_id: int,
+) -> dict[str, Any]:
+    """
+    Return the latest stored pre-match 1X2 consensus.
+
+    This route never calls the provider and never freezes the favourite.
+    """
+    return latest_market_status(fixture_id)
 
 
 @app.get("/fixtures/{fixture_id}")
