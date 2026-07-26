@@ -48,7 +48,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db9"
+PROXY_VERSION = "1.20.0-db9a"
 
 
 # ============================================================
@@ -113,6 +113,26 @@ FUTURE_FIXTURE_SYNC_DAYS = max(
 FUTURE_FIXTURE_SYNC_MIN_INTERVAL_SECONDS = int(
     os.getenv(
         "FUTURE_FIXTURE_SYNC_MIN_INTERVAL_SECONDS",
+        "21600",
+    )
+)
+
+# DB9A spaces rolling-window provider requests and records safe diagnostics.
+# This is pacing between request starts, not an automatic retry delay.
+FUTURE_FIXTURE_SYNC_REQUEST_INTERVAL_SECONDS = max(
+    0.0,
+    float(
+        os.getenv(
+            "FUTURE_FIXTURE_SYNC_REQUEST_INTERVAL_SECONDS",
+            "1.0",
+        )
+    ),
+)
+
+# Protected DB9A probe: one date, one provider call, no fixture writes.
+FUTURE_FIXTURE_DIAGNOSTIC_PROBE_MIN_INTERVAL_SECONDS = int(
+    os.getenv(
+        "FUTURE_FIXTURE_DIAGNOSTIC_PROBE_MIN_INTERVAL_SECONDS",
         "21600",
     )
 )
@@ -17972,37 +17992,276 @@ def _normalise_api_fixture(item: Any) -> dict[str, Any] | None:
     }
 
 
+
+API_FOOTBALL_DIAGNOSTIC_HEADERS = (
+    "x-ratelimit-requests-limit",
+    "x-ratelimit-requests-remaining",
+    "x-ratelimit-limit",
+    "x-ratelimit-remaining",
+    "retry-after",
+)
+
+
+def _safe_api_football_diagnostic_value(
+    value: Any,
+    *,
+    depth: int = 0,
+) -> Any:
+    """
+    Bound provider diagnostics without exposing request headers or secrets.
+    """
+    if depth >= 4:
+        return "[truncated]"
+
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+
+    if isinstance(value, str):
+        compact = " ".join(value.split())
+        return compact[:500]
+
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        for key, child in list(value.items())[:20]:
+            key_text = str(key)[:80]
+            if any(
+                token in key_text.lower()
+                for token in ("key", "token", "secret", "authorization")
+            ):
+                output[key_text] = "[redacted]"
+            else:
+                output[key_text] = _safe_api_football_diagnostic_value(
+                    child,
+                    depth=depth + 1,
+                )
+        return output
+
+    if isinstance(value, (list, tuple)):
+        return [
+            _safe_api_football_diagnostic_value(
+                child,
+                depth=depth + 1,
+            )
+            for child in list(value)[:20]
+        ]
+
+    return str(value)[:500]
+
+
+def _api_football_rate_limit_audit(
+    response: requests.Response,
+) -> dict[str, str]:
+    output: dict[str, str] = {}
+    for header_name in API_FOOTBALL_DIAGNOSTIC_HEADERS:
+        value = response.headers.get(header_name)
+        if value is not None:
+            output[header_name] = str(value)[:100]
+    return output
+
+
+def _classify_api_football_failure(
+    *,
+    http_status: int | None,
+    provider_errors: Any,
+    message: str,
+) -> tuple[str, bool]:
+    """
+    Return a safe category and whether the remaining date calls should stop.
+    """
+    searchable = " ".join(
+        [
+            str(http_status or ""),
+            json.dumps(
+                _safe_api_football_diagnostic_value(provider_errors),
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            message,
+        ]
+    ).lower()
+
+    if http_status == 429 or any(
+        phrase in searchable
+        for phrase in (
+            "rate limit",
+            "too many request",
+            "request limit",
+            "quota",
+            "daily limit",
+        )
+    ):
+        return "quota_or_rate_limit", True
+
+    if http_status in {401, 403} or any(
+        phrase in searchable
+        for phrase in (
+            "invalid api key",
+            "not authorized",
+            "unauthorized",
+            "forbidden",
+        )
+    ):
+        return "authentication_or_access_denied", True
+
+    if any(
+        phrase in searchable
+        for phrase in (
+            "subscription",
+            "current plan",
+            "your plan",
+            "does not have access",
+            "not available for your plan",
+        )
+    ):
+        return "plan_or_date_access_restriction", True
+
+    if http_status is not None and http_status >= 500:
+        return "provider_server_error", True
+
+    if http_status is None:
+        return "transport_error", True
+
+    return "provider_rejected_request", False
+
+
+class ApiFootballRequestError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostics: dict[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
 def _api_football_get(
     endpoint: str,
     *,
     params: dict[str, Any],
 ) -> dict[str, Any]:
     if not API_FOOTBALL_KEY:
-        raise RuntimeError("API_FOOTBALL_KEY is not configured.")
+        raise ApiFootballRequestError(
+            "API-Football key is not configured.",
+            diagnostics={
+                "classification": "configuration_error",
+                "http_status": None,
+                "provider_errors": None,
+                "rate_limit": {},
+                "stop_window": True,
+            },
+        )
 
-    response = requests.get(
-        f"{API_FOOTBALL_BASE_URL}{endpoint}",
-        headers={
-            "x-apisports-key": API_FOOTBALL_KEY,
-            "Accept": "application/json",
-        },
-        params=params,
-        timeout=API_FOOTBALL_TIMEOUT_SECONDS,
+    try:
+        response = requests.get(
+            f"{API_FOOTBALL_BASE_URL}{endpoint}",
+            headers={
+                "x-apisports-key": API_FOOTBALL_KEY,
+                "Accept": "application/json",
+            },
+            params=params,
+            timeout=API_FOOTBALL_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        message = "API-Football connection failed."
+        classification, stop_window = _classify_api_football_failure(
+            http_status=None,
+            provider_errors=None,
+            message=str(exc),
+        )
+        raise ApiFootballRequestError(
+            message,
+            diagnostics={
+                "classification": classification,
+                "http_status": None,
+                "provider_errors": None,
+                "rate_limit": {},
+                "transport_message": (
+                    _safe_api_football_diagnostic_value(str(exc))
+                ),
+                "stop_window": stop_window,
+            },
+        ) from exc
+
+    rate_limit = _api_football_rate_limit_audit(response)
+
+    payload: Any = None
+    json_error: str | None = None
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        json_error = str(exc)
+
+    provider_errors = (
+        payload.get("errors")
+        if isinstance(payload, dict)
+        else None
     )
 
     if response.status_code != 200:
-        raise RuntimeError(
-            f"API-Football returned HTTP {response.status_code}."
+        message = f"API-Football returned HTTP {response.status_code}."
+        classification, stop_window = _classify_api_football_failure(
+            http_status=response.status_code,
+            provider_errors=provider_errors,
+            message=message,
+        )
+        raise ApiFootballRequestError(
+            message,
+            diagnostics={
+                "classification": classification,
+                "http_status": response.status_code,
+                "provider_errors": (
+                    _safe_api_football_diagnostic_value(provider_errors)
+                ),
+                "response_preview": (
+                    _safe_api_football_diagnostic_value(response.text)
+                    if payload is None
+                    else None
+                ),
+                "rate_limit": rate_limit,
+                "stop_window": stop_window,
+            },
         )
 
-    payload = response.json()
     if not isinstance(payload, dict):
-        raise RuntimeError("API-Football returned unexpected JSON.")
+        raise ApiFootballRequestError(
+            "API-Football returned unexpected JSON.",
+            diagnostics={
+                "classification": "invalid_provider_response",
+                "http_status": response.status_code,
+                "provider_errors": None,
+                "json_error": (
+                    _safe_api_football_diagnostic_value(json_error)
+                ),
+                "response_preview": (
+                    _safe_api_football_diagnostic_value(response.text)
+                ),
+                "rate_limit": rate_limit,
+                "stop_window": True,
+            },
+        )
 
-    errors = payload.get("errors")
-    if errors:
-        raise RuntimeError("API-Football rejected the fixture request.")
+    if provider_errors:
+        message = "API-Football rejected the fixture request."
+        classification, stop_window = _classify_api_football_failure(
+            http_status=response.status_code,
+            provider_errors=provider_errors,
+            message=message,
+        )
+        raise ApiFootballRequestError(
+            message,
+            diagnostics={
+                "classification": classification,
+                "http_status": response.status_code,
+                "provider_errors": (
+                    _safe_api_football_diagnostic_value(provider_errors)
+                ),
+                "rate_limit": rate_limit,
+                "stop_window": stop_window,
+            },
+        )
 
+    payload["_proxy_rate_limit_audit"] = rate_limit
     return payload
 
 
@@ -18362,6 +18621,8 @@ def _future_fixture_sync_metadata() -> dict[str, Any]:
         "last_upserted": 0,
         "last_invalid": 0,
         "last_error_count": 0,
+        "last_not_attempted_count": 0,
+        "last_daily_results": [],
     }
     if not DATABASE_URL or psycopg is None:
         return output
@@ -18376,6 +18637,10 @@ def _future_fixture_sync_metadata() -> dict[str, Any]:
         "future_fixtures_last_upserted": "last_upserted",
         "future_fixtures_last_invalid": "last_invalid",
         "future_fixtures_last_error_count": "last_error_count",
+        "future_fixtures_last_not_attempted_count": (
+            "last_not_attempted_count"
+        ),
+        "future_fixtures_last_daily_results_json": "last_daily_results",
     }
 
     try:
@@ -18408,11 +18673,23 @@ def _future_fixture_sync_metadata() -> dict[str, Any]:
             "last_upserted",
             "last_invalid",
             "last_error_count",
+            "last_not_attempted_count",
         }:
             try:
                 output[output_key] = int(value or 0)
             except (TypeError, ValueError):
                 output[output_key] = 0
+        elif output_key == "last_daily_results":
+            if not value:
+                output[output_key] = []
+            else:
+                try:
+                    parsed = json.loads(value)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    parsed = []
+                output[output_key] = (
+                    parsed if isinstance(parsed, list) else []
+                )
         else:
             output[output_key] = value
     return output
@@ -18458,10 +18735,11 @@ def sync_future_fixtures(
     force: bool = False,
 ) -> dict[str, Any]:
     """
-    Import tomorrow through the next seven display-local calendar dates.
+    Import tomorrow through the configured future display-local dates.
 
-    Exactly one API-Football /fixtures request is made per date. A persisted
-    attempt timestamp protects the daily request allowance across restarts.
+    One API-Football /fixtures request is allowed per attempted date. Calls
+    are paced, blocking provider failures stop the remaining window, and a
+    persisted attempt timestamp protects the request allowance across restarts.
     """
     if not DATABASE_URL or psycopg is None:
         return {
@@ -18502,9 +18780,21 @@ def sync_future_fixtures(
     normalised_rows: list[dict[str, Any]] = []
     daily_results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+    not_attempted_count = 0
+    previous_call_started: float | None = None
 
-    for fixture_date in dates:
+    for date_index, fixture_date in enumerate(dates):
+        if previous_call_started is not None:
+            elapsed = time.monotonic() - previous_call_started
+            remaining_delay = (
+                FUTURE_FIXTURE_SYNC_REQUEST_INTERVAL_SECONDS - elapsed
+            )
+            if remaining_delay > 0:
+                time.sleep(remaining_delay)
+
+        previous_call_started = time.monotonic()
         provider_call_count += 1
+
         try:
             payload = _api_football_get(
                 "/fixtures",
@@ -18513,15 +18803,67 @@ def sync_future_fixtures(
                     "timezone": SOCCER_DISPLAY_TIMEZONE,
                 },
             )
+        except ApiFootballRequestError as exc:
+            diagnostics = dict(exc.diagnostics)
+            error = {
+                "date": fixture_date.isoformat(),
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "error_code": diagnostics.get("classification"),
+                "http_status": diagnostics.get("http_status"),
+                "message": str(exc)[:300],
+                "provider_errors": diagnostics.get("provider_errors"),
+                "rate_limit": diagnostics.get("rate_limit", {}),
+                "transport_message": diagnostics.get("transport_message"),
+                "response_preview": diagnostics.get("response_preview"),
+            }
+            error = {
+                key: value
+                for key, value in error.items()
+                if value not in (None, {}, [])
+            }
+            errors.append(error)
+            daily_results.append(error)
+
+            if diagnostics.get("stop_window") is True:
+                for unattempted_date in dates[date_index + 1:]:
+                    daily_results.append(
+                        {
+                            "date": unattempted_date.isoformat(),
+                            "status": "not_attempted",
+                            "reason": "provider_blocking_failure",
+                            "blocked_by_date": fixture_date.isoformat(),
+                            "blocking_error_code": diagnostics.get(
+                                "classification"
+                            ),
+                        }
+                    )
+                    not_attempted_count += 1
+                break
+            continue
         except Exception as exc:
             error = {
                 "date": fixture_date.isoformat(),
                 "status": "error",
                 "error_type": type(exc).__name__,
+                "error_code": "unexpected_sync_error",
+                "message": str(exc)[:300],
             }
             errors.append(error)
             daily_results.append(error)
-            continue
+
+            for unattempted_date in dates[date_index + 1:]:
+                daily_results.append(
+                    {
+                        "date": unattempted_date.isoformat(),
+                        "status": "not_attempted",
+                        "reason": "unexpected_blocking_failure",
+                        "blocked_by_date": fixture_date.isoformat(),
+                        "blocking_error_code": "unexpected_sync_error",
+                    }
+                )
+                not_attempted_count += 1
+            break
 
         response_rows = payload.get("response")
         if not isinstance(response_rows, list):
@@ -18553,6 +18895,10 @@ def sync_future_fixtures(
                 "normalised": valid_for_date,
                 "invalid": invalid_for_date,
                 "provider_results_reported": payload.get("results"),
+                "rate_limit": payload.get(
+                    "_proxy_rate_limit_audit",
+                    {},
+                ),
             }
         )
 
@@ -18581,6 +18927,14 @@ def sync_future_fixtures(
                     "future_fixtures_last_upserted": str(upserted),
                     "future_fixtures_last_invalid": str(invalid_count),
                     "future_fixtures_last_error_count": str(len(errors)),
+                    "future_fixtures_last_not_attempted_count": str(
+                        not_attempted_count
+                    ),
+                    "future_fixtures_last_daily_results_json": json.dumps(
+                        daily_results,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
                     "future_fixtures_display_timezone": (
                         SOCCER_DISPLAY_TIMEZONE
                     ),
@@ -18619,14 +18973,251 @@ def sync_future_fixtures(
         "window_end": window_end,
         "days_requested": len(dates),
         "provider_call_count": provider_call_count,
+        "request_interval_seconds": (
+            FUTURE_FIXTURE_SYNC_REQUEST_INTERVAL_SECONDS
+        ),
         "received": total_received,
         "upserted": upserted,
         "invalid_skipped": invalid_count,
         "error_count": len(errors),
+        "not_attempted_count": not_attempted_count,
         "daily_results": daily_results,
         "attempted_at": attempt_at.isoformat(),
         "astrology_action_allowed": False,
     }
+
+
+def _future_fixture_probe_metadata() -> dict[str, Any]:
+    output = {
+        "last_attempt_at": None,
+        "target_date": None,
+        "result": None,
+    }
+    if not DATABASE_URL or psycopg is None:
+        return output
+
+    keys = (
+        "future_fixture_probe_last_attempt_at",
+        "future_fixture_probe_target_date",
+        "future_fixture_probe_result_json",
+    )
+    try:
+        with psycopg.connect(
+            DATABASE_URL,
+            connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+            autocommit=True,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT key, value
+                    FROM app_metadata
+                    WHERE key = ANY(%s)
+                    """,
+                    (list(keys),),
+                )
+                values = {
+                    str(row[0]): str(row[1])
+                    for row in cursor.fetchall()
+                }
+    except Exception:
+        return output
+
+    output["last_attempt_at"] = values.get(
+        "future_fixture_probe_last_attempt_at"
+    )
+    output["target_date"] = values.get(
+        "future_fixture_probe_target_date"
+    )
+
+    raw_result = values.get("future_fixture_probe_result_json")
+    if raw_result:
+        try:
+            parsed = json.loads(raw_result)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            output["result"] = parsed
+
+    return output
+
+
+def _future_fixture_probe_is_fresh(
+    metadata: dict[str, Any],
+    *,
+    target_date: str,
+) -> bool:
+    if metadata.get("target_date") != target_date:
+        return False
+
+    value = metadata.get("last_attempt_at")
+    if not isinstance(value, str) or not value:
+        return False
+
+    try:
+        attempted_at = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+    except ValueError:
+        return False
+
+    if attempted_at.tzinfo is None:
+        return False
+
+    age = (
+        datetime.now(timezone.utc)
+        - attempted_at.astimezone(timezone.utc)
+    )
+    return bool(
+        age.total_seconds()
+        < FUTURE_FIXTURE_DIAGNOSTIC_PROBE_MIN_INTERVAL_SECONDS
+    )
+
+
+def _write_future_fixture_probe_result(
+    *,
+    target_date: str,
+    attempted_at: datetime,
+    result: dict[str, Any],
+) -> None:
+    if not DATABASE_URL or psycopg is None:
+        return
+
+    metadata_values = {
+        "future_fixture_probe_last_attempt_at": attempted_at.isoformat(),
+        "future_fixture_probe_target_date": target_date,
+        "future_fixture_probe_result_json": json.dumps(
+            result,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    }
+
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                for key, value in metadata_values.items():
+                    cursor.execute(
+                        """
+                        INSERT INTO app_metadata (key, value)
+                        VALUES (%s, %s)
+                        ON CONFLICT (key) DO UPDATE SET
+                            value = EXCLUDED.value,
+                            updated_at = NOW()
+                        """,
+                        (key, value),
+                    )
+            connection.commit()
+    except Exception:
+        return
+
+
+def diagnose_future_fixture_date(
+    *,
+    offset_days: int = 2,
+) -> dict[str, Any]:
+    """
+    Probe exactly one future local date without storing its fixtures.
+
+    The separate persisted cooldown prevents this diagnostic route from
+    becoming an uncontrolled provider-call bypass.
+    """
+    safe_offset = max(1, min(int(offset_days), 14))
+    target = _local_date_now() + timedelta(days=safe_offset)
+    target_date = target.isoformat()
+
+    metadata = _future_fixture_probe_metadata()
+    if _future_fixture_probe_is_fresh(
+        metadata,
+        target_date=target_date,
+    ):
+        return {
+            "status": "ok",
+            "probed": False,
+            "skipped": True,
+            "reason": "A recent diagnostic probe already exists.",
+            "target_date": target_date,
+            "display_timezone": SOCCER_DISPLAY_TIMEZONE,
+            "minimum_probe_interval_seconds": (
+                FUTURE_FIXTURE_DIAGNOSTIC_PROBE_MIN_INTERVAL_SECONDS
+            ),
+            "metadata": metadata,
+            "fixtures_stored": False,
+            "astrology_action_allowed": False,
+        }
+
+    attempted_at = datetime.now(timezone.utc)
+    try:
+        payload = _api_football_get(
+            "/fixtures",
+            params={
+                "date": target_date,
+                "timezone": SOCCER_DISPLAY_TIMEZONE,
+            },
+        )
+    except ApiFootballRequestError as exc:
+        diagnostics = dict(exc.diagnostics)
+        result = {
+            "status": "provider_error",
+            "probed": True,
+            "target_date": target_date,
+            "display_timezone": SOCCER_DISPLAY_TIMEZONE,
+            "error_type": type(exc).__name__,
+            "error_code": diagnostics.get("classification"),
+            "http_status": diagnostics.get("http_status"),
+            "message": str(exc)[:300],
+            "provider_errors": diagnostics.get("provider_errors"),
+            "rate_limit": diagnostics.get("rate_limit", {}),
+            "transport_message": diagnostics.get("transport_message"),
+            "response_preview": diagnostics.get("response_preview"),
+            "attempted_at": attempted_at.isoformat(),
+            "fixtures_stored": False,
+            "astrology_action_allowed": False,
+        }
+        result = {
+            key: value
+            for key, value in result.items()
+            if value not in (None, {}, [])
+        }
+    except Exception as exc:
+        result = {
+            "status": "error",
+            "probed": True,
+            "target_date": target_date,
+            "display_timezone": SOCCER_DISPLAY_TIMEZONE,
+            "error_type": type(exc).__name__,
+            "error_code": "unexpected_probe_error",
+            "message": str(exc)[:300],
+            "attempted_at": attempted_at.isoformat(),
+            "fixtures_stored": False,
+            "astrology_action_allowed": False,
+        }
+    else:
+        response_rows = payload.get("response")
+        if not isinstance(response_rows, list):
+            response_rows = []
+        result = {
+            "status": "ok",
+            "probed": True,
+            "target_date": target_date,
+            "display_timezone": SOCCER_DISPLAY_TIMEZONE,
+            "received": len(response_rows),
+            "provider_results_reported": payload.get("results"),
+            "rate_limit": payload.get(
+                "_proxy_rate_limit_audit",
+                {},
+            ),
+            "attempted_at": attempted_at.isoformat(),
+            "fixtures_stored": False,
+            "astrology_action_allowed": False,
+        }
+
+    _write_future_fixture_probe_result(
+        target_date=target_date,
+        attempted_at=attempted_at,
+        result=result,
+    )
+    return result
 
 
 def clear_unverified_fixture_timezones_once() -> dict[str, Any]:
@@ -22303,12 +22894,12 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB9 rolling seven-day future fixtures",
+        "database_checkpoint": "DB9A rolling fixture diagnostics and pacing",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
         "api_football_checkpoint": (
-            "DB9 imports today plus a persisted rolling future window"
+            "DB9A adds safe provider diagnostics and paced future sync"
         ),
         "api_football_health_cache_seconds": (
             API_FOOTBALL_HEALTH_CACHE_SECONDS
@@ -22322,7 +22913,7 @@ def health() -> dict[str, Any]:
             FIXTURE_TIMEZONE_MIGRATION_STATUS
         ),
         "fixture_import_checkpoint": (
-            "today plus tomorrow-through-seven-days imported"
+            "today plus a guarded rolling future-window import"
         ),
         "future_fixture_sync_checkpoint": {
             "enabled": FUTURE_FIXTURE_SYNC_AUTO_RUN,
@@ -22334,6 +22925,21 @@ def health() -> dict[str, Any]:
             "minimum_sync_interval_seconds": (
                 FUTURE_FIXTURE_SYNC_MIN_INTERVAL_SECONDS
             ),
+            "request_interval_seconds": (
+                FUTURE_FIXTURE_SYNC_REQUEST_INTERVAL_SECONDS
+            ),
+            "safe_provider_diagnostics_exposed": True,
+            "blocking_failure_stops_remaining_dates": True,
+            "diagnostics_persisted_in_app_metadata": True,
+            "single_date_diagnostic_probe": {
+                "enabled": True,
+                "default_offset_days": 2,
+                "minimum_interval_seconds": (
+                    FUTURE_FIXTURE_DIAGNOSTIC_PROBE_MIN_INTERVAL_SECONDS
+                ),
+                "fixtures_stored": False,
+                "astrology_action_allowed": False,
+            },
             "provider_endpoint": "/fixtures",
             "one_call_per_local_date": True,
             "astrology_action_allowed": False,
@@ -22462,7 +23068,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + rolling fixtures DB9",
+        "response_mode": "prediction-grade compact v2 + rolling fixture diagnostics DB9A",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -22718,10 +23324,38 @@ def future_fixtures_sync_status() -> dict[str, Any]:
         "minimum_sync_interval_seconds": (
             FUTURE_FIXTURE_SYNC_MIN_INTERVAL_SECONDS
         ),
+        "request_interval_seconds": (
+            FUTURE_FIXTURE_SYNC_REQUEST_INTERVAL_SECONDS
+        ),
+        "safe_provider_diagnostics_exposed": True,
+        "blocking_failure_stops_remaining_dates": True,
         "startup_status": FUTURE_FIXTURE_SYNC_STARTUP_STATUS,
         "metadata": _future_fixture_sync_metadata(),
+        "diagnostic_probe": {
+            "minimum_interval_seconds": (
+                FUTURE_FIXTURE_DIAGNOSTIC_PROBE_MIN_INTERVAL_SECONDS
+            ),
+            "metadata": _future_fixture_probe_metadata(),
+            "fixtures_stored": False,
+            "astrology_action_allowed": False,
+        },
         "astrology_action_allowed": False,
     }
+
+
+@app.post("/fixtures/diagnose-future-date")
+def fixtures_diagnose_future_date(
+    offset_days: int = Query(default=2, ge=1, le=14),
+    x_proxy_key: str | None = Header(
+        default=None,
+        alias="x-proxy-key",
+    ),
+) -> dict[str, Any]:
+    """
+    Protected one-call diagnostic. It never stores fixtures or enables charts.
+    """
+    verify_proxy_key(x_proxy_key)
+    return diagnose_future_fixture_date(offset_days=offset_days)
 
 
 @app.post("/fixtures/sync-future")
