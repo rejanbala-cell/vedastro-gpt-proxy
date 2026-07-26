@@ -40,7 +40,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db2"
+PROXY_VERSION = "1.20.0-db3"
 
 
 # ============================================================
@@ -57,6 +57,21 @@ DATABASE_CONNECT_TIMEOUT_SECONDS = int(
     os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "8")
 )
 DATABASE_SCHEMA_VERSION = "1.20.0-db2"
+
+# API-Football connectivity checkpoint.
+# This version verifies the provider account through GET /status only.
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
+API_FOOTBALL_BASE_URL = os.getenv(
+    "API_FOOTBALL_BASE_URL",
+    "https://v3.football.api-sports.io",
+).rstrip("/")
+API_FOOTBALL_TIMEOUT_SECONDS = int(
+    os.getenv("API_FOOTBALL_TIMEOUT_SECONDS", "12")
+)
+API_FOOTBALL_HEALTH_CACHE_SECONDS = int(
+    os.getenv("API_FOOTBALL_HEALTH_CACHE_SECONDS", "3600")
+)
+
 DATABASE_EXPECTED_TABLES = (
     "app_metadata",
     "fixtures",
@@ -17202,6 +17217,158 @@ def initialize_database_on_startup() -> None:
 
 
 # ============================================================
+# API-FOOTBALL CONNECTIVITY — CHECKPOINT DB3
+# ============================================================
+
+_API_FOOTBALL_STATUS_CACHE: dict[str, Any] = {
+    "checked_at_monotonic": 0.0,
+    "result": None,
+}
+_API_FOOTBALL_STATUS_LOCK = threading.Lock()
+
+
+def _safe_api_football_status_payload(payload: Any) -> dict[str, Any]:
+    """
+    Return only non-secret account-health fields.
+
+    The upstream /status response can include account identity details.
+    Those fields are intentionally excluded.
+    """
+    if not isinstance(payload, dict):
+        return {
+            "status": "error",
+            "connected": False,
+            "message": "API-Football returned an unexpected response.",
+        }
+
+    errors = payload.get("errors")
+    if errors:
+        return {
+            "status": "error",
+            "connected": False,
+            "message": "API-Football rejected the request.",
+            "provider_errors": errors,
+        }
+
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        return {
+            "status": "error",
+            "connected": False,
+            "message": "API-Football status data was missing.",
+        }
+
+    subscription = response.get("subscription")
+    requests_data = response.get("requests")
+
+    if not isinstance(subscription, dict):
+        subscription = {}
+    if not isinstance(requests_data, dict):
+        requests_data = {}
+
+    return {
+        "status": "ok",
+        "connected": True,
+        "proxy_version": PROXY_VERSION,
+        "provider": "API-Football",
+        "endpoint_tested": "/status",
+        "subscription": {
+            "plan": subscription.get("plan"),
+            "active": subscription.get("active"),
+            "end": subscription.get("end"),
+        },
+        "requests": {
+            "current": requests_data.get("current"),
+            "limit_day": requests_data.get("limit_day"),
+        },
+    }
+
+
+def api_football_connection_status(
+    *,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """
+    Verify the API-Football key with GET /status.
+
+    Results are cached to protect a low daily request allowance. The API key
+    and account identity are never returned.
+    """
+    if not API_FOOTBALL_KEY:
+        return {
+            "status": "not_configured",
+            "connected": False,
+            "proxy_version": PROXY_VERSION,
+            "message": "API_FOOTBALL_KEY is not configured.",
+        }
+
+    now = time.monotonic()
+
+    with _API_FOOTBALL_STATUS_LOCK:
+        cached_result = _API_FOOTBALL_STATUS_CACHE.get("result")
+        checked_at = float(
+            _API_FOOTBALL_STATUS_CACHE.get("checked_at_monotonic") or 0.0
+        )
+
+        cache_is_fresh = (
+            cached_result is not None
+            and now - checked_at < API_FOOTBALL_HEALTH_CACHE_SECONDS
+        )
+
+        if cache_is_fresh and not force_refresh:
+            result = dict(cached_result)
+            result["cached"] = True
+            result["cache_seconds"] = API_FOOTBALL_HEALTH_CACHE_SECONDS
+            return result
+
+        try:
+            upstream = requests.get(
+                f"{API_FOOTBALL_BASE_URL}/status",
+                headers={
+                    "x-apisports-key": API_FOOTBALL_KEY,
+                    "Accept": "application/json",
+                },
+                timeout=API_FOOTBALL_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as exc:
+            result = {
+                "status": "error",
+                "connected": False,
+                "proxy_version": PROXY_VERSION,
+                "error_type": type(exc).__name__,
+                "message": "Could not reach API-Football.",
+            }
+        else:
+            if upstream.status_code != 200:
+                result = {
+                    "status": "error",
+                    "connected": False,
+                    "proxy_version": PROXY_VERSION,
+                    "http_status": upstream.status_code,
+                    "message": "API-Football returned a non-200 response.",
+                }
+            else:
+                try:
+                    payload = upstream.json()
+                except ValueError:
+                    result = {
+                        "status": "error",
+                        "connected": False,
+                        "proxy_version": PROXY_VERSION,
+                        "message": "API-Football returned invalid JSON.",
+                    }
+                else:
+                    result = _safe_api_football_status_payload(payload)
+
+        result["cached"] = False
+        result["cache_seconds"] = API_FOOTBALL_HEALTH_CACHE_SECONDS
+
+        _API_FOOTBALL_STATUS_CACHE["checked_at_monotonic"] = now
+        _API_FOOTBALL_STATUS_CACHE["result"] = dict(result)
+        return result
+
+
+# ============================================================
 # AUTHENTICATION
 # ============================================================
 
@@ -17237,16 +17404,23 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB2 schema created; storage endpoints not added yet",
+        "database_checkpoint": "DB3 API-Football connectivity; no fixture import yet",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
+        "api_football_key_configured": bool(API_FOOTBALL_KEY),
+        "api_football_checkpoint": (
+            "DB3 provider connectivity only; fixtures are not imported yet"
+        ),
+        "api_football_health_cache_seconds": (
+            API_FOOTBALL_HEALTH_CACHE_SECONDS
+        ),
         "ayanamsa": "Lahiri",
         "engine": "VedAstro.Python",
         "planet_parameter_shape": "nested PlanetName object",
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + database checkpoint DB2",
+        "response_mode": "prediction-grade compact v2 + database/API checkpoint DB3",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -17313,6 +17487,20 @@ def database_schema() -> dict[str, Any]:
     """
     result = database_schema_status()
     if not result.get("ready"):
+        raise HTTPException(status_code=503, detail=result)
+    return result
+
+
+@app.get("/football-health")
+def football_health() -> dict[str, Any]:
+    """
+    Public, cached, non-secret API-Football connectivity check.
+
+    The one-hour cache prevents repeated browser refreshes from rapidly
+    consuming a limited daily provider allowance.
+    """
+    result = api_football_connection_status()
+    if not result.get("connected"):
         raise HTTPException(status_code=503, detail=result)
     return result
 
