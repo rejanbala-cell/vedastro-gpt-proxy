@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import base64
+import hmac
 import math
 import os
 import threading
@@ -32,7 +34,8 @@ except ImportError:
     timezone_at = None
 
 import requests
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Cookie, Response
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from vedastro import (
     Ayanamsa,
@@ -48,7 +51,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db9a"
+PROXY_VERSION = "1.21.0-ui1"
 
 
 # ============================================================
@@ -57,6 +60,43 @@ PROXY_VERSION = "1.20.0-db9a"
 
 VEDASTRO_API_KEY = os.getenv("VEDASTRO_API_KEY", "").strip()
 PROXY_API_KEY = os.getenv("PROXY_API_KEY", "").strip()
+
+# Private single-user website. A separate PRIVATE_UI_PASSWORD may be set on
+# Render; when omitted, the existing PROXY_API_KEY is used as the login secret.
+# The password is never returned to the browser or stored in PostgreSQL.
+PRIVATE_UI_PASSWORD = os.getenv(
+    "PRIVATE_UI_PASSWORD",
+    "",
+).strip() or PROXY_API_KEY
+PRIVATE_UI_COOKIE_NAME = "vedastro_private_session"
+PRIVATE_UI_SESSION_HOURS = max(
+    1,
+    min(int(os.getenv("PRIVATE_UI_SESSION_HOURS", "12")), 168),
+)
+PRIVATE_UI_COOKIE_SECURE = os.getenv(
+    "PRIVATE_UI_COOKIE_SECURE",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+PRIVATE_UI_CATALOG_MAX_ROWS = max(
+    1000,
+    min(int(os.getenv("PRIVATE_UI_CATALOG_MAX_ROWS", "20000")), 100000),
+)
+PRIVATE_UI_PAGE_SIZE_MAX = max(
+    20,
+    min(int(os.getenv("PRIVATE_UI_PAGE_SIZE_MAX", "100")), 250),
+)
+SELF_LEARNING_MIN_RESOLVED_MATCHES = max(
+    50,
+    int(os.getenv("SELF_LEARNING_MIN_RESOLVED_MATCHES", "500")),
+)
+PREDICTION_MODEL_VERSION = os.getenv(
+    "PREDICTION_MODEL_VERSION",
+    "gambler-dharma-production-v1",
+).strip()
+PREDICTION_INSTRUCTION_VERSION = os.getenv(
+    "PREDICTION_INSTRUCTION_VERSION",
+    "private-ui1-2026-07",
+).strip()
 
 # PostgreSQL is introduced in the 1.20.0 database checkpoint.
 # This checkpoint only verifies connectivity; it does not create tables yet.
@@ -1676,6 +1716,11 @@ class EventChartInput(BaseModel):
             "opening sounds for Chapter 7 nama-pada comparison."
         ),
     )
+
+
+class PrivateLoginInput(BaseModel):
+    password: str = Field(min_length=1, max_length=500)
+
 
 
 # ============================================================
@@ -22862,6 +22907,995 @@ def capture_market_odds_on_startup() -> None:
 # AUTHENTICATION
 # ============================================================
 
+
+# ============================================================
+# PRIVATE WEBSITE — UI1
+# ============================================================
+
+PRIVATE_UI_RANGE_VALUES = {"today", "tomorrow", "3d", "3m"}
+
+
+def _private_session_secret() -> bytes:
+    secret = PRIVATE_UI_PASSWORD or PROXY_API_KEY
+    if not secret:
+        raise RuntimeError("Private UI login secret is not configured.")
+    return secret.encode("utf-8")
+
+
+def _create_private_session_token() -> str:
+    expires_at = int(time.time() + PRIVATE_UI_SESSION_HOURS * 3600)
+    payload = f"v1.{expires_at}"
+    signature = hmac.new(
+        _private_session_secret(),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    raw = f"{payload}.{signature}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _verify_private_session_token(token: str | None) -> bool:
+    if not token:
+        return False
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        decoded = base64.urlsafe_b64decode(
+            padded.encode("ascii")
+        ).decode("utf-8")
+        version, expires_text, signature = decoded.split(".", 2)
+        expires_at = int(expires_text)
+    except Exception:
+        return False
+
+    if version != "v1" or expires_at <= int(time.time()):
+        return False
+
+    payload = f"{version}.{expires_at}"
+    expected = hmac.new(
+        _private_session_secret(),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(signature, expected)
+
+
+def _require_private_session(token: str | None) -> None:
+    if not _verify_private_session_token(token):
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "status": "unauthorized",
+                "message": "Private session is missing or expired.",
+            },
+        )
+
+
+def _private_cookie_options() -> dict[str, Any]:
+    return {
+        "key": PRIVATE_UI_COOKIE_NAME,
+        "httponly": True,
+        "secure": PRIVATE_UI_COOKIE_SECURE,
+        "samesite": "strict",
+        "max_age": PRIVATE_UI_SESSION_HOURS * 3600,
+        "path": "/",
+    }
+
+
+def _private_aware_utc(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        result = value
+    elif isinstance(value, str):
+        try:
+            result = datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            )
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=timezone.utc)
+    return result.astimezone(timezone.utc)
+
+
+def _private_local_date_and_verified(
+    kickoff_utc: datetime,
+    timezone_name: str | None,
+) -> tuple[date, bool]:
+    if isinstance(timezone_name, str) and timezone_name.strip():
+        try:
+            zone = ZoneInfo(timezone_name.strip())
+            return kickoff_utc.astimezone(zone).date(), True
+        except ZoneInfoNotFoundError:
+            pass
+    return kickoff_utc.date(), False
+
+
+def _private_fixture_matches_range(
+    kickoff_utc: datetime,
+    timezone_name: str | None,
+    range_name: str,
+) -> tuple[bool, bool]:
+    fixture_date, verified = _private_local_date_and_verified(
+        kickoff_utc,
+        timezone_name,
+    )
+    if verified and timezone_name:
+        today_local = datetime.now(
+            ZoneInfo(timezone_name)
+        ).date()
+    else:
+        today_local = datetime.now(timezone.utc).date()
+
+    if range_name == "today":
+        return fixture_date == today_local, verified
+    if range_name == "tomorrow":
+        return fixture_date == today_local + timedelta(days=1), verified
+    if range_name == "3d":
+        return (
+            today_local <= fixture_date < today_local + timedelta(days=3)
+        ), verified
+    if range_name == "3m":
+        return (
+            today_local <= fixture_date < today_local + timedelta(days=90)
+        ), verified
+    raise ValueError("Unsupported fixture range.")
+
+
+def _private_latest_performance_status(
+    fixture_id: int,
+) -> dict[str, Any]:
+    if not DATABASE_URL or psycopg is None:
+        return {
+            "status": "database_unavailable",
+            "performance_ready": False,
+        }
+
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        p.id,
+                        p.provider,
+                        p.captured_at,
+                        p.starting_xi_confirmed,
+                        p.injuries_confirmed,
+                        p.home_features,
+                        p.away_features,
+                        p.draw_features,
+                        f.kickoff_utc
+                    FROM fixtures AS f
+                    LEFT JOIN LATERAL (
+                        SELECT *
+                        FROM performance_snapshots
+                        WHERE fixture_id = f.id
+                        ORDER BY captured_at DESC, id DESC
+                        LIMIT 1
+                    ) AS p ON TRUE
+                    WHERE f.id = %s
+                    LIMIT 1
+                    """,
+                    (fixture_id,),
+                )
+                row = cursor.fetchone()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "performance_ready": False,
+            "error_type": type(exc).__name__,
+        }
+
+    if not row:
+        return {
+            "status": "missing",
+            "performance_ready": False,
+        }
+
+    kickoff = _private_aware_utc(row[8])
+    captured = _private_aware_utc(row[2])
+
+    if row[0] is None:
+        return {
+            "status": "missing",
+            "performance_ready": False,
+            "starting_xi_confirmed": False,
+            "injuries_confirmed": False,
+        }
+
+    home_features = row[5] if isinstance(row[5], dict) else {}
+    away_features = row[6] if isinstance(row[6], dict) else {}
+    draw_features = row[7] if isinstance(row[7], dict) else {}
+    capture_valid = bool(
+        kickoff and captured and captured < kickoff
+    )
+    ready = bool(
+        capture_valid
+        and home_features
+        and away_features
+        and draw_features
+    )
+
+    return {
+        "status": "ok" if ready else "incomplete",
+        "snapshot_id": int(row[0]),
+        "provider": row[1],
+        "captured_at": captured.isoformat() if captured else None,
+        "capture_before_kickoff": capture_valid,
+        "starting_xi_confirmed": bool(row[3]),
+        "injuries_confirmed": bool(row[4]),
+        "performance_ready": ready,
+    }
+
+
+def _private_existing_prediction(
+    fixture_id: int,
+) -> dict[str, Any] | None:
+    if not DATABASE_URL or psycopg is None:
+        return None
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        pr.id,
+                        pr.event_id,
+                        pr.predicted_outcome,
+                        pr.market_baseline,
+                        pr.confidence,
+                        pr.eligibility,
+                        pr.astrology_reliability,
+                        pr.evidence_strength,
+                        pr.model_version,
+                        pr.prediction_payload,
+                        pr.frozen_at,
+                        r.actual_result_90,
+                        r.home_score_90,
+                        r.away_score_90
+                    FROM prediction_runs AS pr
+                    LEFT JOIN official_results AS r
+                        ON r.fixture_id = pr.fixture_id
+                    WHERE pr.fixture_id = %s
+                    ORDER BY pr.frozen_at DESC, pr.id DESC
+                    LIMIT 1
+                    """,
+                    (fixture_id,),
+                )
+                row = cursor.fetchone()
+    except Exception:
+        return None
+
+    if not row:
+        return None
+
+    return {
+        "prediction_id": int(row[0]),
+        "event_id": row[1],
+        "predicted_outcome": row[2],
+        "market_baseline": row[3],
+        "confidence": row[4],
+        "eligibility": row[5],
+        "astrology_reliability": row[6],
+        "evidence_strength": row[7],
+        "model_version": row[8],
+        "prediction_payload": (
+            row[9] if isinstance(row[9], dict) else {}
+        ),
+        "frozen_at": (
+            row[10].isoformat()
+            if isinstance(row[10], datetime)
+            else None
+        ),
+        "actual_result": row[11],
+        "home_score_90": row[12],
+        "away_score_90": row[13],
+        "immutable": True,
+    }
+
+
+def private_prediction_readiness(
+    fixture_id: int,
+) -> dict[str, Any]:
+    detail = get_stored_fixture_by_id(fixture_id)
+    if detail.get("status") != "ok":
+        return {
+            "status": "blocked",
+            "fixture_id": fixture_id,
+            "prediction_ready": False,
+            "blockers": ["fixture_not_found"],
+        }
+
+    fixture = detail["fixture"]
+    market = latest_market_status(fixture_id)
+    performance = _private_latest_performance_status(
+        fixture_id
+    )
+    existing = _private_existing_prediction(fixture_id)
+    kickoff = _private_aware_utc(fixture.get("kickoff_utc"))
+    blockers: list[str] = []
+
+    if kickoff is None:
+        blockers.append("kickoff_invalid")
+    elif kickoff <= datetime.now(timezone.utc):
+        blockers.append("kickoff_passed")
+
+    if not fixture.get("location_time_ready"):
+        blockers.extend(
+            fixture.get("location_time_blockers", [])
+        )
+
+    if not market.get("market_ready"):
+        blockers.append("verified_pre_match_market_missing")
+
+    if market.get("team_favourite") not in {"HOME", "AWAY"}:
+        blockers.append("consensus_favourite_not_frozen")
+
+    if not performance.get("performance_ready"):
+        blockers.append("performance_snapshot_missing")
+
+    if existing:
+        blockers.append("prediction_already_frozen")
+
+    return {
+        "status": "ready" if not blockers else "blocked",
+        "fixture_id": fixture_id,
+        "prediction_ready": not blockers,
+        "blockers": list(dict.fromkeys(blockers)),
+        "fixture": fixture,
+        "market": market,
+        "performance": performance,
+        "existing_prediction": existing,
+        "astrology_called": False,
+        "next_engine_checkpoint": (
+            "UI1 verifies readiness only. The next backend checkpoint "
+            "will execute and freeze exactly one deep chart."
+        ),
+    }
+
+
+def private_fixture_catalog(
+    *,
+    range_name: str,
+    page: int,
+    page_size: int,
+    search_text: str | None,
+) -> dict[str, Any]:
+    if range_name not in PRIVATE_UI_RANGE_VALUES:
+        raise ValueError("Unsupported private fixture range.")
+    if not DATABASE_URL or psycopg is None:
+        return {
+            "status": "error",
+            "message": "Database is unavailable.",
+            "fixtures": [],
+        }
+
+    safe_page = max(1, int(page))
+    safe_page_size = max(
+        1,
+        min(int(page_size), PRIVATE_UI_PAGE_SIZE_MAX),
+    )
+    now_utc = datetime.now(timezone.utc)
+    end_utc = now_utc + timedelta(days=92)
+    query_text = (search_text or "").strip().casefold()
+
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        provider_fixture_id,
+                        competition_name,
+                        competition_country,
+                        season,
+                        home_team,
+                        away_team,
+                        kickoff_utc,
+                        venue_name,
+                        venue_city,
+                        timezone_name,
+                        fixture_status,
+                        latitude,
+                        longitude,
+                        location_source,
+                        location_confidence,
+                        location_verified_at
+                    FROM fixtures
+                    WHERE sport = 'soccer'
+                      AND kickoff_utc >= %s
+                      AND kickoff_utc < %s
+                      AND fixture_status IN (
+                          'scheduled',
+                          'not_started',
+                          'tbd',
+                          'postponed'
+                      )
+                    ORDER BY kickoff_utc, competition_name, home_team
+                    LIMIT %s
+                    """,
+                    (
+                        now_utc,
+                        end_utc,
+                        PRIVATE_UI_CATALOG_MAX_ROWS,
+                    ),
+                )
+                rows = cursor.fetchall()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": "Private fixture catalogue could not be read.",
+            "error_type": type(exc).__name__,
+            "fixtures": [],
+        }
+
+    filtered: list[dict[str, Any]] = []
+    verified_count = 0
+    unverified_count = 0
+
+    for row in rows:
+        kickoff = _private_aware_utc(row[7])
+        if kickoff is None:
+            continue
+
+        include, verified_local_time = (
+            _private_fixture_matches_range(
+                kickoff,
+                row[10],
+                range_name,
+            )
+        )
+        if not include:
+            continue
+
+        searchable = " ".join(
+            str(value or "")
+            for value in (
+                row[2],
+                row[3],
+                row[5],
+                row[6],
+                row[8],
+                row[9],
+            )
+        ).casefold()
+        if query_text and query_text not in searchable:
+            continue
+
+        time_views = _fixture_time_views(
+            kickoff_utc=kickoff,
+            venue_timezone_name=row[10],
+        )
+        market = latest_market_status(int(row[0]))
+        performance = _private_latest_performance_status(
+            int(row[0])
+        )
+        prediction = _private_existing_prediction(
+            int(row[0])
+        )
+        location_ready = bool(
+            row[8]
+            and row[10]
+            and row[12] is not None
+            and row[13] is not None
+            and row[14]
+            and row[16] is not None
+            and time_views.get(
+                "venue_timezone_conversion_valid"
+            )
+        )
+        blockers = []
+        if not location_ready:
+            blockers.append("venue_local_time_or_location_unverified")
+        if not market.get("market_ready"):
+            blockers.append("verified_pre_match_market_missing")
+        if not performance.get("performance_ready"):
+            blockers.append("performance_snapshot_missing")
+        if prediction:
+            blockers.append("prediction_already_frozen")
+
+        if verified_local_time:
+            verified_count += 1
+        else:
+            unverified_count += 1
+
+        filtered.append({
+            "database_fixture_id": int(row[0]),
+            "provider_fixture_id": row[1],
+            "competition": row[2],
+            "country": row[3],
+            "season": row[4],
+            "home_team": row[5],
+            "away_team": row[6],
+            **time_views,
+            "venue_name": row[8],
+            "venue_city": row[9],
+            "venue_timezone": row[10],
+            "venue_local_time_verified": verified_local_time,
+            "fixture_status": row[11],
+            "latitude": row[12],
+            "longitude": row[13],
+            "location_source": row[14],
+            "location_confidence": (
+                float(row[15]) if row[15] is not None else None
+            ),
+            "location_verified_at": (
+                row[16].isoformat()
+                if isinstance(row[16], datetime)
+                else None
+            ),
+            "location_time_ready": location_ready,
+            "market": market,
+            "performance": performance,
+            "prediction_ready": not blockers,
+            "prediction_blockers": blockers,
+            "existing_prediction": prediction,
+        })
+
+    total = len(filtered)
+    start = (safe_page - 1) * safe_page_size
+    end = start + safe_page_size
+    page_rows = filtered[start:end]
+    maximum_kickoff = max(
+        (
+            item["kickoff_utc"]
+            for item in filtered
+            if item.get("kickoff_utc")
+        ),
+        default=None,
+    )
+
+    return {
+        "status": "ok",
+        "range": range_name,
+        "range_semantics": {
+            "today": "venue-local calendar date",
+            "tomorrow": "venue-local calendar date",
+            "3d": "today plus two venue-local dates",
+            "3m": "next 90 venue-local dates",
+        },
+        "page": safe_page,
+        "page_size": safe_page_size,
+        "total": total,
+        "total_pages": (
+            math.ceil(total / safe_page_size)
+            if total
+            else 0
+        ),
+        "verified_venue_time_count": verified_count,
+        "unverified_venue_time_count": unverified_count,
+        "maximum_available_kickoff_utc": maximum_kickoff,
+        "source_row_limit_reached": (
+            len(rows) >= PRIVATE_UI_CATALOG_MAX_ROWS
+        ),
+        "fixtures": page_rows,
+    }
+
+
+def private_prediction_history(
+    *,
+    page: int,
+    page_size: int,
+) -> dict[str, Any]:
+    safe_page = max(1, int(page))
+    safe_page_size = max(
+        1,
+        min(int(page_size), PRIVATE_UI_PAGE_SIZE_MAX),
+    )
+    offset = (safe_page - 1) * safe_page_size
+
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM prediction_runs"
+                )
+                total = int(cursor.fetchone()[0])
+                cursor.execute(
+                    """
+                    SELECT
+                        pr.id,
+                        pr.predicted_outcome,
+                        pr.market_baseline,
+                        pr.confidence,
+                        pr.eligibility,
+                        pr.astrology_reliability,
+                        pr.evidence_strength,
+                        pr.model_version,
+                        pr.frozen_at,
+                        f.id,
+                        f.competition_name,
+                        f.competition_country,
+                        f.home_team,
+                        f.away_team,
+                        f.kickoff_utc,
+                        f.venue_name,
+                        f.timezone_name,
+                        r.actual_result_90,
+                        r.home_score_90,
+                        r.away_score_90,
+                        a.prediction_correct,
+                        a.market_baseline_correct
+                    FROM prediction_runs AS pr
+                    INNER JOIN fixtures AS f
+                        ON f.id = pr.fixture_id
+                    LEFT JOIN official_results AS r
+                        ON r.fixture_id = f.id
+                    LEFT JOIN post_match_audits AS a
+                        ON a.prediction_id = pr.id
+                    ORDER BY pr.frozen_at DESC, pr.id DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (safe_page_size, offset),
+                )
+                rows = cursor.fetchall()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": "Prediction history could not be read.",
+            "error_type": type(exc).__name__,
+            "predictions": [],
+        }
+
+    predictions = []
+    for row in rows:
+        time_views = _fixture_time_views(
+            kickoff_utc=row[14],
+            venue_timezone_name=row[16],
+        )
+        predictions.append({
+            "prediction_id": int(row[0]),
+            "predicted_outcome": row[1],
+            "market_baseline": row[2],
+            "confidence": row[3],
+            "eligibility": row[4],
+            "astrology_reliability": row[5],
+            "evidence_strength": row[6],
+            "model_version": row[7],
+            "frozen_at": (
+                row[8].isoformat()
+                if isinstance(row[8], datetime)
+                else None
+            ),
+            "database_fixture_id": int(row[9]),
+            "competition": row[10],
+            "country": row[11],
+            "home_team": row[12],
+            "away_team": row[13],
+            **time_views,
+            "venue_name": row[15],
+            "actual_result": row[17],
+            "home_score_90": row[18],
+            "away_score_90": row[19],
+            "prediction_correct": row[20],
+            "market_baseline_correct": row[21],
+        })
+
+    return {
+        "status": "ok",
+        "page": safe_page,
+        "page_size": safe_page_size,
+        "total": total,
+        "total_pages": (
+            math.ceil(total / safe_page_size)
+            if total
+            else 0
+        ),
+        "predictions": predictions,
+    }
+
+
+def private_learning_summary() -> dict[str, Any]:
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total_predictions,
+                        COUNT(r.id) AS resolved_predictions,
+                        COUNT(*) FILTER (
+                            WHERE a.prediction_correct IS TRUE
+                        ) AS correct_predictions,
+                        COUNT(*) FILTER (
+                            WHERE a.market_baseline_correct IS TRUE
+                        ) AS market_correct
+                    FROM prediction_runs AS pr
+                    LEFT JOIN official_results AS r
+                        ON r.fixture_id = pr.fixture_id
+                    LEFT JOIN post_match_audits AS a
+                        ON a.prediction_id = pr.id
+                    """
+                )
+                row = cursor.fetchone()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": "Learning metrics could not be read.",
+            "error_type": type(exc).__name__,
+        }
+
+    total = int(row[0] or 0)
+    resolved = int(row[1] or 0)
+    correct = int(row[2] or 0)
+    market_correct = int(row[3] or 0)
+
+    def ratio(a: int, b: int) -> float | None:
+        return round(a / b, 6) if b else None
+
+    return {
+        "status": "ok",
+        "totals": {
+            "predictions": total,
+            "resolved": resolved,
+            "pending_results": max(0, total - resolved),
+            "correct": correct,
+            "market_correct": market_correct,
+        },
+        "accuracy": {
+            "prediction": ratio(correct, resolved),
+            "market_baseline": ratio(
+                market_correct,
+                resolved,
+            ),
+        },
+        "learning_state": {
+            "status": (
+                "evaluation_ready"
+                if resolved >= SELF_LEARNING_MIN_RESOLVED_MATCHES
+                else "collecting_untouched_sample"
+            ),
+            "minimum_resolved_matches": (
+                SELF_LEARNING_MIN_RESOLVED_MATCHES
+            ),
+            "remaining_until_evaluation": max(
+                0,
+                SELF_LEARNING_MIN_RESOLVED_MATCHES - resolved,
+            ),
+            "automatic_live_rule_changes": False,
+            "past_predictions_rewritten": False,
+            "holdout_test_required": True,
+            "manual_promotion_required": True,
+        },
+    }
+
+
+def private_system_summary() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "version": PROXY_VERSION,
+        "private_ui": {
+            "enabled": True,
+            "session_hours": PRIVATE_UI_SESSION_HOURS,
+            "distinct_password_configured": bool(
+                os.getenv("PRIVATE_UI_PASSWORD", "").strip()
+            ),
+        },
+        "database": DATABASE_SCHEMA_STARTUP_STATUS,
+        "fixture_sync": {
+            "today": FIXTURE_SYNC_STARTUP_STATUS,
+            "future": FUTURE_FIXTURE_SYNC_STARTUP_STATUS,
+            "future_metadata": _future_fixture_sync_metadata(),
+            "diagnostic_probe": _future_fixture_probe_metadata(),
+        },
+        "prediction_pipeline": {
+            "venue_local_time_required": True,
+            "pre_match_market_required": True,
+            "performance_snapshot_required": True,
+            "immutable_prediction_log": True,
+            "official_result_log": True,
+            "controlled_self_learning": True,
+            "deep_chart_button_checkpoint": "next",
+        },
+    }
+
+
+PRIVATE_UI_HTML = '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<meta name="color-scheme" content="dark">\n<title>Rejans Mastermind — Private Predictor</title>\n<style>\n:root{--bg:#061017;--panel:#0d1923;--panel2:#11212d;--line:#203542;--text:#eef8f7;--muted:#8fa6b3;--teal:#45e0bf;--teal2:#18a991;--gold:#f4cb77;--red:#ff768b;--blue:#7ab5ff}\n*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 10% -15%,rgba(69,224,191,.2),transparent 34rem),radial-gradient(circle at 95% 0,rgba(122,181,255,.13),transparent 30rem),var(--bg);color:var(--text);font:15px/1.5 Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}\nbutton,input{font:inherit}button{cursor:pointer}.hidden{display:none!important}.muted{color:var(--muted)}.kicker{color:var(--teal);font-size:11px;font-weight:900;letter-spacing:.17em;text-transform:uppercase}\n.login{min-height:100vh;display:grid;place-items:center;padding:24px}.login-card{width:min(430px,100%);padding:34px;border:1px solid rgba(69,224,191,.25);border-radius:28px;background:linear-gradient(155deg,rgba(17,33,45,.97),rgba(7,17,24,.97));box-shadow:0 30px 90px rgba(0,0,0,.45)}\n.logo{width:56px;height:56px;border-radius:18px;display:grid;place-items:center;background:linear-gradient(135deg,var(--teal),#0e8e79);color:#03231d;font-size:24px;font-weight:950}.login h1{font-size:31px;letter-spacing:-.04em;margin:18px 0 7px}.field{display:grid;gap:7px;margin:24px 0 12px}.field input,.search{width:100%;border:1px solid var(--line);border-radius:14px;background:#08131c;color:var(--text);padding:13px 15px;outline:none}.field input:focus,.search:focus{border-color:var(--teal)}\n.primary,.secondary{border-radius:13px;padding:11px 15px;font-weight:850}.primary{border:0;background:linear-gradient(135deg,var(--teal),var(--teal2));color:#03221d}.secondary{border:1px solid var(--line);background:#0a1720;color:var(--text)}.danger{color:#ffb0bc;border-color:rgba(255,118,139,.35)}\n.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;padding:14px 22px;background:rgba(6,16,23,.78);backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,.06)}.brand{display:flex;align-items:center;gap:12px}.brand .logo{width:38px;height:38px;border-radius:12px;font-size:16px}.brand strong{display:block}.brand span{font-size:12px;color:var(--muted)}\n.layout{display:grid;grid-template-columns:220px minmax(0,1fr);min-height:calc(100vh - 67px)}.side{border-right:1px solid rgba(255,255,255,.06);padding:20px 14px}.nav{display:grid;gap:8px;position:sticky;top:88px}.nav button{border:0;background:transparent;color:var(--muted);padding:12px 14px;border-radius:12px;text-align:left;font-weight:800}.nav button.active,.nav button:hover{color:var(--teal);background:rgba(69,224,191,.1)}\n.main{padding:28px;max-width:1500px;width:100%;margin:0 auto}.hero{display:flex;justify-content:space-between;align-items:end;gap:18px;margin-bottom:18px}.hero h1{font-size:34px;letter-spacing:-.045em;margin:2px 0 4px}.filters{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0}.chip{border:1px solid var(--line);background:#0a1720;color:var(--muted);padding:9px 13px;border-radius:999px;font-weight:850}.chip.active{color:var(--teal);border-color:rgba(69,224,191,.45);background:rgba(69,224,191,.1)}\n.toolbar{display:grid;grid-template-columns:minmax(240px,1fr) auto;gap:10px;margin-bottom:16px}.notice{padding:12px 14px;border-radius:14px;border:1px solid rgba(244,203,119,.25);background:rgba(244,203,119,.08);color:#f6dfa9;margin-bottom:15px}\n.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:15px}.card{padding:18px;border:1px solid rgba(255,255,255,.07);border-radius:20px;background:linear-gradient(155deg,rgba(17,33,45,.96),rgba(10,23,32,.96));box-shadow:0 16px 44px rgba(0,0,0,.18)}.card:hover{border-color:rgba(69,224,191,.25)}.league{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px}.teams{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:10px;margin:18px 0}.team{font-size:17px;font-weight:850}.team:last-child{text-align:right}.vs{font-size:11px;color:var(--muted)}\n.kickoff{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px;border-radius:14px;background:#07131b}.kickoff strong{display:block;font-size:16px}.kickoff small{display:block;color:var(--muted)}.badges{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.badge{font-size:11px;font-weight:900;padding:5px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.06);background:#11232f;color:var(--muted)}.badge.good{color:var(--teal);background:rgba(69,224,191,.08);border-color:rgba(69,224,191,.22)}.badge.warn{color:var(--gold);background:rgba(244,203,119,.08);border-color:rgba(244,203,119,.2)}.badge.bad{color:#ff9cab;background:rgba(255,118,139,.08);border-color:rgba(255,118,139,.2)}.meta{font-size:12px;color:var(--muted)}.actions{display:flex;gap:8px;margin-top:14px}.actions button{flex:1}\n.empty{padding:46px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:18px}.skeleton{height:245px;border-radius:20px;background:linear-gradient(90deg,#0c1822,#142733,#0c1822);background-size:200% 100%;animation:shimmer 1.4s infinite}@keyframes shimmer{to{background-position:-200% 0}}\n.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:18px}.stat{padding:18px;border:1px solid rgba(255,255,255,.07);border-radius:18px;background:var(--panel)}.stat b{display:block;font-size:28px;letter-spacing:-.04em}.stat span{font-size:12px;color:var(--muted)}\n.table-wrap{overflow:auto;border:1px solid rgba(255,255,255,.07);border-radius:18px}table{width:100%;border-collapse:collapse;background:rgba(13,25,35,.9)}th,td{padding:13px 14px;border-bottom:1px solid rgba(255,255,255,.06);white-space:nowrap;text-align:left}th{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}\n.modal{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:20px;background:rgba(1,7,11,.8);backdrop-filter:blur(10px)}.modal-card{width:min(900px,100%);max-height:90vh;overflow:auto;padding:24px;border-radius:24px;border:1px solid rgba(69,224,191,.24);background:#0a1720;box-shadow:0 30px 100px rgba(0,0,0,.5)}.modal-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}.modal-head h2{margin:2px 0 0}.close{width:38px;height:38px;border:1px solid var(--line);border-radius:12px;background:#10212c;color:var(--text)}\n.detail{display:grid;gap:8px}.detail-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}details{margin-top:12px;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,.07);background:#0e1d28}summary{font-weight:850;cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;color:#b6c9d3;font-size:12px}.pager{display:flex;justify-content:center;align-items:center;gap:10px;margin:22px 0}.system-actions{display:flex;flex-wrap:wrap;gap:9px;margin-bottom:16px}\n@media(max-width:900px){.layout{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid rgba(255,255,255,.06);overflow:auto;padding:10px}.nav{display:flex;position:static;min-width:max-content}.main{padding:20px}.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:560px){.top{padding:12px}.main{padding:15px}.grid{grid-template-columns:1fr}.toolbar{grid-template-columns:1fr}.hero h1{font-size:28px}}\n</style>\n</head>\n<body>\n<section id="loginView" class="login">\n  <form id="loginForm" class="login-card">\n    <div class="logo">R</div>\n    <h1>Private Predictor</h1>\n    <p class="muted">Verified football, venue-local astrology and controlled learning.</p>\n    <label class="field"><span>Private password</span><input id="password" type="password" autocomplete="current-password" required></label>\n    <button class="primary" style="width:100%" type="submit">Enter dashboard</button>\n    <p id="loginError" style="color:#ff9cab;min-height:22px;margin:12px 0 0"></p>\n  </form>\n</section>\n\n<div id="appView" class="hidden">\n<header class="top"><div class="brand"><div class="logo">R</div><div><strong>Rejans Mastermind</strong><span>Private production console</span></div></div><button id="logout" class="secondary danger">Sign out</button></header>\n<div class="layout">\n<aside class="side"><nav class="nav"><button class="active" data-view="fixtures">⚽ Fixtures</button><button data-view="predictions">◎ Predictions</button><button data-view="learning">◈ Learning</button><button data-view="system">⚙ System</button></nav></aside>\n<main class="main">\n<section id="fixturesView">\n  <div class="hero"><div><div class="kicker">Venue-local intelligence</div><h1>Upcoming matches</h1><p class="muted">Kickoff times use each stadium’s verified local timezone.</p></div></div>\n  <div class="filters"><button class="chip active" data-range="today">Today</button><button class="chip" data-range="tomorrow">Tomorrow</button><button class="chip" data-range="3d">Next 3 days</button><button class="chip" data-range="3m">Next 3 months</button></div>\n  <div class="toolbar"><input id="search" class="search" placeholder="Search team, league, country or venue"><button id="refresh" class="secondary">Refresh</button></div>\n  <div id="fixtureNotice"></div><div id="fixtureGrid" class="grid"></div><div id="pager" class="pager"></div>\n</section>\n<section id="predictionsView" class="hidden"><div class="hero"><div><div class="kicker">Immutable audit trail</div><h1>Predictions</h1><p class="muted">Every issued forecast remains frozen.</p></div></div><div id="predictionContent"></div></section>\n<section id="learningView" class="hidden"><div class="hero"><div><div class="kicker">Controlled improvement</div><h1>Results & learning</h1><p class="muted">Prediction versus outcome, market baseline and holdout-gated updates.</p></div></div><div id="learningContent"></div></section>\n<section id="systemView" class="hidden"><div class="hero"><div><div class="kicker">Private operations</div><h1>System</h1><p class="muted">Guarded sync and diagnostics without terminal commands.</p></div></div><div class="system-actions"><button id="syncToday" class="secondary">Sync today</button><button id="syncFuture" class="secondary">Sync future</button><button id="diagnose" class="secondary">Run one-call diagnostic</button></div><div id="systemContent"></div></section>\n</main>\n</div>\n</div>\n\n<div id="modal" class="modal hidden"><div class="modal-card"><div class="modal-head"><div><div class="kicker">Prediction workflow</div><h2 id="modalTitle">Fixture</h2></div><button id="closeModal" class="close">×</button></div><div id="modalBody"></div></div></div>\n\n<script>\nconst state={view:"fixtures",range:"today",page:1,pageSize:24,search:""};\nconst $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];\nconst esc=v=>String(v??"").replace(/[&<>"\']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;","\'":"&#39;"}[m]));\nconst api=async(url,opts={})=>{const r=await fetch(url,{credentials:"same-origin",headers:{"Content-Type":"application/json",...(opts.headers||{})},...opts});let d={};try{d=await r.json()}catch{}if(r.status===401){showLogin();throw new Error("Session expired")}if(!r.ok)throw new Error(d.detail?.message||d.message||"Request failed");return d};\nconst fmt=v=>v?new Intl.DateTimeFormat(undefined,{weekday:"short",day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"}).format(new Date(v)):"Venue time pending";\nconst pct=v=>typeof v==="number"?(v*100).toFixed(1)+"%":"—";\nfunction showLogin(){$("#loginView").classList.remove("hidden");$("#appView").classList.add("hidden")}\nfunction showApp(){$("#loginView").classList.add("hidden");$("#appView").classList.remove("hidden");loadView(state.view)}\n$("#loginForm").onsubmit=async e=>{e.preventDefault();$("#loginError").textContent="";try{await api("/private/api/login",{method:"POST",body:JSON.stringify({password:$("#password").value})});$("#password").value="";showApp()}catch(err){$("#loginError").textContent=err.message}};\n$("#logout").onclick=async()=>{try{await api("/private/api/logout",{method:"POST"})}finally{showLogin()}};\n$$(".nav button").forEach(b=>b.onclick=()=>{state.view=b.dataset.view;$$(".nav button").forEach(x=>x.classList.toggle("active",x===b));["fixtures","predictions","learning","system"].forEach(v=>$(`#${v}View`).classList.toggle("hidden",v!==state.view));loadView(state.view)});\n$$(".chip").forEach(b=>b.onclick=()=>{state.range=b.dataset.range;state.page=1;$$(".chip").forEach(x=>x.classList.toggle("active",x===b));loadFixtures()});\n$("#refresh").onclick=loadFixtures;$("#search").oninput=e=>{clearTimeout(window.searchTimer);window.searchTimer=setTimeout(()=>{state.search=e.target.value;state.page=1;loadFixtures()},300)};\n$("#closeModal").onclick=()=>$("#modal").classList.add("hidden");$("#modal").onclick=e=>{if(e.target===$("#modal"))$("#modal").classList.add("hidden")};\nconst badge=(t,c="")=>`<span class="badge ${c}">${esc(t)}</span>`;\nfunction card(f){const m=f.market||{},p=f.performance||{},o=m.median_decimal_odds||{},existing=f.existing_prediction;return `<article class="card"><div class="league"><span>${esc(f.competition)}</span><span>${esc(f.country||"")}</span></div><div class="teams"><div class="team">${esc(f.home_team)}</div><div class="vs">VS</div><div class="team">${esc(f.away_team)}</div></div><div class="kickoff"><div><strong>${f.kickoff_venue_local?fmt(f.kickoff_venue_local):"Venue time pending"}</strong><small>${esc(f.venue_timezone||"Timezone unverified")} ${esc(f.venue_utc_offset||"")}</small></div><div class="meta">${esc(f.venue_name||"Venue pending")}</div></div><div class="badges">${badge(f.venue_local_time_verified?"Local time verified":"Local time pending",f.venue_local_time_verified?"good":"bad")}${badge(m.market_ready?`${m.bookmaker_count} books`:"Market pending",m.market_ready?"good":"warn")}${badge(p.performance_ready?"Performance ready":"Performance pending",p.performance_ready?"good":"warn")}${existing?badge(`Frozen: ${existing.predicted_outcome}`,"good"):badge(f.prediction_ready?"Ready":"Not ready",f.prediction_ready?"good":"warn")}</div><div class="meta">1X2: ${o.home??"—"} / ${o.draw??"—"} / ${o.away??"—"}</div><div class="actions"><button class="${existing?"secondary":"primary"}" onclick="${existing?`viewPrediction(${f.database_fixture_id})`:`checkPrediction(${f.database_fixture_id})`}">${existing?"View prediction":f.prediction_ready?"Continue to prediction":"Check readiness"}</button></div></article>`}\nasync function loadFixtures(){$("#fixtureGrid").innerHTML=Array.from({length:8},()=>\'<div class="skeleton"></div>\').join("");$("#fixtureNotice").innerHTML="";try{const q=new URLSearchParams({range:state.range,page:state.page,page_size:state.pageSize,search:state.search});const d=await api("/private/api/fixtures?"+q);$("#fixtureGrid").innerHTML=d.fixtures.length?d.fixtures.map(card).join(""):\'<div class="empty">No stored fixtures match this filter.</div>\';const n=[];if(d.unverified_venue_time_count)n.push(`${d.unverified_venue_time_count} fixture(s) have no verified venue timezone and cannot be predicted.`);if(state.range==="3m"&&d.maximum_available_kickoff_utc)n.push(`Current stored coverage reaches ${fmt(d.maximum_available_kickoff_utc)}.`);$("#fixtureNotice").innerHTML=n.length?`<div class="notice">${n.map(esc).join(" ")}</div>`:"";$("#pager").innerHTML=d.total_pages>1?`<button class="secondary" ${d.page<=1?"disabled":""} onclick="pageBy(-1)">Previous</button><span class="meta">Page ${d.page} of ${d.total_pages}</span><button class="secondary" ${d.page>=d.total_pages?"disabled":""} onclick="pageBy(1)">Next</button>`:""}catch(err){$("#fixtureGrid").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nwindow.pageBy=n=>{state.page=Math.max(1,state.page+n);loadFixtures();scrollTo({top:0,behavior:"smooth"})};\nfunction openModal(title,body){$("#modalTitle").textContent=title;$("#modalBody").innerHTML=body;$("#modal").classList.remove("hidden")}\nwindow.checkPrediction=async id=>{openModal("Checking readiness",\'<div class="empty">Verifying venue, local time, market, performance and freeze state…</div>\');try{const d=await api(`/private/api/fixtures/${id}/readiness`);if(d.existing_prediction){renderExisting(d.existing_prediction);return}if(!d.prediction_ready){$("#modalTitle").textContent="Prediction not ready";$("#modalBody").innerHTML=`<div class="notice">No astrology call was made.</div><div class="detail">${(d.blockers||[]).map(x=>`<div class="detail-row"><span>${esc(x.replaceAll("_"," "))}</span>${badge("Blocked","warn")}</div>`).join("")}</div>`;return}$("#modalTitle").textContent="Ready for deep calculation";$("#modalBody").innerHTML=\'<div class="notice">All current data gates pass. The next backend checkpoint connects this button to exactly one deep Gambler’s Dharma chart and freezes the result.</div>\'}catch(err){$("#modalBody").innerHTML=`<div class="notice">${esc(err.message)}</div>`}};\nwindow.viewPrediction=async id=>{openModal("Frozen prediction",\'<div class="empty">Loading immutable record…</div>\');try{const d=await api(`/private/api/fixtures/${id}/prediction`);renderExisting(d.prediction)}catch(err){$("#modalBody").innerHTML=`<div class="notice">${esc(err.message)}</div>`}};\nfunction renderExisting(p){const d=p.prediction_payload?.decision||p;$("#modalTitle").textContent="Frozen pre-match prediction";$("#modalBody").innerHTML=`<div class="card"><div class="kicker">Final prediction</div><h1>${esc(d.predicted_outcome_label||d.predicted_outcome||p.predicted_outcome)}</h1><div class="detail"><div class="detail-row"><span>Confidence</span><b>${esc(d.confidence||p.confidence||"—")}</b></div><div class="detail-row"><span>Eligibility</span><b>${esc(d.eligibility||p.eligibility||"—")}</b></div><div class="detail-row"><span>Actual result</span><b>${esc(p.actual_result||"Pending")}</b></div></div></div><details><summary>Stored audit payload</summary><pre>${esc(JSON.stringify(p,null,2))}</pre></details>`}\nasync function loadPredictions(){$("#predictionContent").innerHTML=\'<div class="empty">Loading prediction ledger…</div>\';try{const d=await api("/private/api/predictions?page=1&page_size=100");if(!d.predictions.length){$("#predictionContent").innerHTML=\'<div class="empty">No frozen predictions yet.</div>\';return}$("#predictionContent").innerHTML=`<div class="table-wrap"><table><thead><tr><th>Fixture</th><th>Venue-local kickoff</th><th>Prediction</th><th>Actual</th><th>Confidence</th><th>Correct</th></tr></thead><tbody>${d.predictions.map(p=>`<tr><td>${esc(p.home_team)} vs ${esc(p.away_team)}<br><span class="meta">${esc(p.competition)}</span></td><td>${esc(p.kickoff_venue_local?fmt(p.kickoff_venue_local):"Pending")}</td><td>${esc(p.predicted_outcome)}</td><td>${esc(p.actual_result||"Pending")}</td><td>${esc(p.confidence||"—")}</td><td>${p.prediction_correct===true?"✓":p.prediction_correct===false?"✕":"—"}</td></tr>`).join("")}</tbody></table></div>`}catch(err){$("#predictionContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function loadLearning(){$("#learningContent").innerHTML=\'<div class="empty">Loading learning audit…</div>\';try{const d=await api("/private/api/learning"),t=d.totals||{},a=d.accuracy||{},s=d.learning_state||{};$("#learningContent").innerHTML=`<div class="stats"><div class="stat"><b>${t.predictions||0}</b><span>Frozen predictions</span></div><div class="stat"><b>${t.resolved||0}</b><span>Resolved outcomes</span></div><div class="stat"><b>${pct(a.prediction)}</b><span>Prediction accuracy</span></div><div class="stat"><b>${pct(a.market_baseline)}</b><span>Market baseline</span></div></div><div class="card"><h3>Learning gate</h3><div class="detail"><div class="detail-row"><span>Status</span><b>${esc(s.status)}</b></div><div class="detail-row"><span>Minimum resolved sample</span><b>${s.minimum_resolved_matches}</b></div><div class="detail-row"><span>Remaining</span><b>${s.remaining_until_evaluation}</b></div><div class="detail-row"><span>Silent live rule changes</span><b>No</b></div><div class="detail-row"><span>Holdout test</span><b>Required</b></div></div></div>`}catch(err){$("#learningContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function loadSystem(){$("#systemContent").innerHTML=\'<div class="empty">Loading system status…</div>\';try{const d=await api("/private/api/system");$("#systemContent").innerHTML=`<details open><summary>Production status</summary><pre>${esc(JSON.stringify(d,null,2))}</pre></details>`}catch(err){$("#systemContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function admin(path){$("#systemContent").innerHTML=\'<div class="empty">Running guarded operation…</div>\';try{const d=await api(path,{method:"POST"});$("#systemContent").innerHTML=`<details open><summary>Operation result</summary><pre>${esc(JSON.stringify(d,null,2))}</pre></details>`}catch(err){$("#systemContent").innerHTML=`<div class="notice">${esc(err.message)}</div>`}}\n$("#syncToday").onclick=()=>admin("/private/api/admin/sync-today");$("#syncFuture").onclick=()=>admin("/private/api/admin/sync-future");$("#diagnose").onclick=()=>admin("/private/api/admin/diagnose-future?offset_days=2");\nfunction loadView(v){if(v==="fixtures")loadFixtures();if(v==="predictions")loadPredictions();if(v==="learning")loadLearning();if(v==="system")loadSystem()}\n(async()=>{try{await api("/private/api/session");showApp()}catch{showLogin()}})();\n</script>\n</body>\n</html>'
+
+
+@app.get("/private", response_class=HTMLResponse)
+def private_ui_page() -> HTMLResponse:
+    return HTMLResponse(
+        content=PRIVATE_UI_HTML,
+        headers={
+            "Cache-Control": "no-store",
+            "X-Frame-Options": "DENY",
+            "Content-Security-Policy": (
+                "default-src 'self'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "script-src 'self' 'unsafe-inline'; "
+                "connect-src 'self'; "
+                "img-src 'self' data:; "
+                "frame-ancestors 'none';"
+            ),
+        },
+    )
+
+
+@app.post("/private/api/login")
+def private_ui_login(
+    request: PrivateLoginInput,
+    response: Response,
+) -> dict[str, Any]:
+    if not hmac.compare_digest(
+        request.password.encode("utf-8"),
+        _private_session_secret(),
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "status": "unauthorized",
+                "message": "Private password is incorrect.",
+            },
+        )
+    response.set_cookie(
+        value=_create_private_session_token(),
+        **_private_cookie_options(),
+    )
+    return {
+        "status": "ok",
+        "authenticated": True,
+        "expires_in_hours": PRIVATE_UI_SESSION_HOURS,
+    }
+
+
+@app.post("/private/api/logout")
+def private_ui_logout(response: Response) -> dict[str, Any]:
+    response.delete_cookie(PRIVATE_UI_COOKIE_NAME, path="/")
+    return {"status": "ok", "authenticated": False}
+
+
+@app.get("/private/api/session")
+def private_ui_session(
+    private_session: str | None = Cookie(
+        default=None,
+        alias=PRIVATE_UI_COOKIE_NAME,
+    ),
+) -> dict[str, Any]:
+    _require_private_session(private_session)
+    return {
+        "status": "ok",
+        "authenticated": True,
+        "version": PROXY_VERSION,
+    }
+
+
+@app.get("/private/api/fixtures")
+def private_ui_fixtures(
+    range: str = Query(
+        default="today",
+        pattern="^(today|tomorrow|3d|3m)$",
+    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=24, ge=1, le=250),
+    search: str | None = Query(default=None, max_length=120),
+    private_session: str | None = Cookie(
+        default=None,
+        alias=PRIVATE_UI_COOKIE_NAME,
+    ),
+) -> dict[str, Any]:
+    _require_private_session(private_session)
+    result = private_fixture_catalog(
+        range_name=range,
+        page=page,
+        page_size=page_size,
+        search_text=search,
+    )
+    if result.get("status") != "ok":
+        raise HTTPException(status_code=503, detail=result)
+    return result
+
+
+@app.get("/private/api/fixtures/{fixture_id}/readiness")
+def private_ui_fixture_readiness(
+    fixture_id: int,
+    private_session: str | None = Cookie(
+        default=None,
+        alias=PRIVATE_UI_COOKIE_NAME,
+    ),
+) -> dict[str, Any]:
+    _require_private_session(private_session)
+    return private_prediction_readiness(fixture_id)
+
+
+@app.get("/private/api/fixtures/{fixture_id}/prediction")
+def private_ui_fixture_prediction(
+    fixture_id: int,
+    private_session: str | None = Cookie(
+        default=None,
+        alias=PRIVATE_UI_COOKIE_NAME,
+    ),
+) -> dict[str, Any]:
+    _require_private_session(private_session)
+    prediction = _private_existing_prediction(fixture_id)
+    if prediction is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "status": "not_found",
+                "message": "No frozen prediction exists for this fixture.",
+            },
+        )
+    return {"status": "ok", "prediction": prediction}
+
+
+@app.get("/private/api/predictions")
+def private_ui_predictions(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=250),
+    private_session: str | None = Cookie(
+        default=None,
+        alias=PRIVATE_UI_COOKIE_NAME,
+    ),
+) -> dict[str, Any]:
+    _require_private_session(private_session)
+    return private_prediction_history(
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get("/private/api/learning")
+def private_ui_learning(
+    private_session: str | None = Cookie(
+        default=None,
+        alias=PRIVATE_UI_COOKIE_NAME,
+    ),
+) -> dict[str, Any]:
+    _require_private_session(private_session)
+    return private_learning_summary()
+
+
+@app.get("/private/api/system")
+def private_ui_system(
+    private_session: str | None = Cookie(
+        default=None,
+        alias=PRIVATE_UI_COOKIE_NAME,
+    ),
+) -> dict[str, Any]:
+    _require_private_session(private_session)
+    return private_system_summary()
+
+
+@app.post("/private/api/admin/sync-today")
+def private_ui_sync_today(
+    private_session: str | None = Cookie(
+        default=None,
+        alias=PRIVATE_UI_COOKIE_NAME,
+    ),
+) -> dict[str, Any]:
+    _require_private_session(private_session)
+    return sync_today_fixtures(force=False)
+
+
+@app.post("/private/api/admin/sync-future")
+def private_ui_sync_future(
+    private_session: str | None = Cookie(
+        default=None,
+        alias=PRIVATE_UI_COOKIE_NAME,
+    ),
+) -> dict[str, Any]:
+    _require_private_session(private_session)
+    return sync_future_fixtures(force=False)
+
+
+@app.post("/private/api/admin/diagnose-future")
+def private_ui_diagnose_future(
+    offset_days: int = Query(default=2, ge=1, le=14),
+    private_session: str | None = Cookie(
+        default=None,
+        alias=PRIVATE_UI_COOKIE_NAME,
+    ),
+) -> dict[str, Any]:
+    _require_private_session(private_session)
+    return diagnose_future_fixture_date(
+        offset_days=offset_days
+    )
+
+
 def verify_proxy_key(supplied_key: str | None) -> None:
     if supplied_key != PROXY_API_KEY:
         raise HTTPException(
@@ -22881,6 +23915,7 @@ def root() -> dict[str, Any]:
         "service": "VedAstro GPT Proxy",
         "version": PROXY_VERSION,
         "health": "/health",
+        "private_ui": "/private",
     }
 
 
@@ -22890,11 +23925,27 @@ def health() -> dict[str, Any]:
         "status": "ok",
         "service": "VedAstro GPT Proxy",
         "version": PROXY_VERSION,
+        "private_ui_checkpoint": {
+            "enabled": True,
+            "path": "/private",
+            "login_cookie_http_only": True,
+            "venue_local_filters": ["today", "tomorrow", "3d", "3m"],
+            "prediction_history_visible": True,
+            "learning_dashboard_visible": True,
+            "deep_prediction_orchestrator": "next_checkpoint",
+        },
+        "self_learning_checkpoint": {
+            "immutable_prediction_log": True,
+            "official_result_table_ready": True,
+            "post_match_audit_table_ready": True,
+            "minimum_resolved_matches": SELF_LEARNING_MIN_RESOLVED_MATCHES,
+            "automatic_live_rule_changes": False,
+        },
         "vedastro_key_configured": bool(VEDASTRO_API_KEY),
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB9A rolling fixture diagnostics and pacing",
+        "database_checkpoint": "UI1 private dashboard, immutable ledger and learning view",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -23068,7 +24119,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + rolling fixture diagnostics DB9A",
+        "response_mode": "prediction-grade compact v2 + private website UI1",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
