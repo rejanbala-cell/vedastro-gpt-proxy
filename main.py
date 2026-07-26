@@ -47,7 +47,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db6"
+PROXY_VERSION = "1.20.0-db6a"
 
 
 # ============================================================
@@ -121,7 +121,7 @@ LOCATION_PREVIEW_LOOKAHEAD_DAYS = int(
     os.getenv("LOCATION_PREVIEW_LOOKAHEAD_DAYS", "7")
 )
 LOCATION_PREVIEW_AUTO_APPROVE_SCORE = float(
-    os.getenv("LOCATION_PREVIEW_AUTO_APPROVE_SCORE", "75")
+    os.getenv("LOCATION_PREVIEW_AUTO_APPROVE_SCORE", "85")
 )
 
 DATABASE_EXPECTED_TABLES = (
@@ -18521,32 +18521,63 @@ def _evaluate_location_candidate(
 
     score = 0.0
     if expected_country:
-        score += 35.0 if country_match else 0.0
+        score += 30.0 if country_match else 0.0
     else:
-        score += 20.0
+        score += 15.0
 
     if expected_city:
-        score += 25.0 if city_match else 0.0
+        score += 20.0 if city_match else 0.0
     else:
         score += 10.0
 
-    score += min(30.0, venue_overlap * 30.0)
+    score += min(35.0, venue_overlap * 35.0)
     if sports_place_match:
-        score += 10.0
+        score += 15.0
+
+    approval_blockers: list[str] = []
 
     if expected_country and not country_match:
+        approval_blockers.append("country_mismatch")
         score = min(score, 39.0)
+
+    if expected_city and not city_match:
+        approval_blockers.append("city_mismatch")
+
+    if not sports_place_match:
+        approval_blockers.append("not_a_verified_sports_place")
+        # A hotel, restaurant, road or generic landmark must never be
+        # auto-approved merely because it is in the right city/country.
+        score = min(score, 59.0)
+
+    if venue_overlap < 0.50:
+        approval_blockers.append("venue_name_overlap_below_0_50")
+
+    if safe.get("timezone_lookup_successful") is not True:
+        approval_blockers.append("timezone_lookup_failed")
 
     auto_approved = (
         score >= LOCATION_PREVIEW_AUTO_APPROVE_SCORE
         and (not expected_country or country_match)
-        and (
-            not expected_city
-            or city_match
-            or venue_overlap >= 0.60
-        )
+        and (not expected_city or city_match)
+        and sports_place_match
+        and venue_overlap >= 0.50
         and safe.get("timezone_lookup_successful") is True
     )
+
+    rejected = (
+        (expected_country and not country_match)
+        or (
+            not sports_place_match
+            and venue_overlap < 0.75
+        )
+    )
+
+    if auto_approved:
+        decision_status = "AUTO_APPROVED"
+    elif rejected:
+        decision_status = "REJECTED"
+    else:
+        decision_status = "PREVIEW"
 
     return {
         **safe,
@@ -18559,9 +18590,8 @@ def _evaluate_location_candidate(
         "city_match": city_match,
         "sports_place_match": sports_place_match,
         "confidence_score": round(score, 3),
-        "decision_status": (
-            "AUTO_APPROVED" if auto_approved else "PREVIEW"
-        ),
+        "approval_blockers": approval_blockers,
+        "decision_status": decision_status,
     }
 
 
@@ -18648,6 +18678,98 @@ def _load_fixture_for_location_preview(
     }
 
 
+def downgrade_unsafe_geocode_approvals_once() -> dict[str, Any]:
+    """
+    Downgrade DB6 false-positive auto-approvals.
+
+    Any cached candidate that is not a sports place and has weak venue-name
+    overlap is marked REJECTED. Strong-name but non-sports candidates are
+    reduced to PREVIEW for manual review.
+    """
+    migration_key = "migration_db6a_geocode_safety_applied"
+
+    if not DATABASE_URL or psycopg is None:
+        return {
+            "status": "not_configured",
+            "rejected_rows": 0,
+            "preview_rows": 0,
+        }
+
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT value FROM app_metadata WHERE key = %s",
+                    (migration_key,),
+                )
+                existing = cursor.fetchone()
+                if existing and existing[0] == "true":
+                    return {
+                        "status": "ok",
+                        "already_applied": True,
+                        "rejected_rows": 0,
+                        "preview_rows": 0,
+                    }
+
+                cursor.execute(
+                    """
+                    UPDATE venue_geocodes
+                    SET decision_status = 'REJECTED',
+                        confidence_score = LEAST(confidence_score, 59),
+                        updated_at = NOW()
+                    WHERE decision_status = 'AUTO_APPROVED'
+                      AND sports_place_match = FALSE
+                      AND venue_token_overlap < 0.75
+                    """
+                )
+                rejected_rows = cursor.rowcount
+
+                cursor.execute(
+                    """
+                    UPDATE venue_geocodes
+                    SET decision_status = 'PREVIEW',
+                        confidence_score = LEAST(confidence_score, 74),
+                        updated_at = NOW()
+                    WHERE decision_status = 'AUTO_APPROVED'
+                      AND sports_place_match = FALSE
+                      AND venue_token_overlap >= 0.75
+                    """
+                )
+                preview_rows = cursor.rowcount
+
+                cursor.execute(
+                    """
+                    INSERT INTO app_metadata (key, value)
+                    VALUES (%s, 'true')
+                    ON CONFLICT (key) DO UPDATE
+                    SET value = EXCLUDED.value, updated_at = NOW()
+                    """,
+                    (migration_key,),
+                )
+            connection.commit()
+
+        return {
+            "status": "ok",
+            "already_applied": False,
+            "rejected_rows": rejected_rows,
+            "preview_rows": preview_rows,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error_type": type(exc).__name__,
+            "rejected_rows": 0,
+            "preview_rows": 0,
+        }
+
+
+GEOCODE_SAFETY_MIGRATION_STATUS: dict[str, Any] = {
+    "status": "not_started",
+    "rejected_rows": 0,
+    "preview_rows": 0,
+}
+
+
 def _cached_geocode_preview(query_hash: str) -> dict[str, Any] | None:
     with psycopg.connect(
         DATABASE_URL,
@@ -18675,6 +18797,18 @@ def _cached_geocode_preview(query_hash: str) -> dict[str, Any] | None:
     if not row:
         return None
 
+    approval_blockers = []
+    if not bool(row[15]):
+        approval_blockers.append("country_mismatch")
+    if not bool(row[16]):
+        approval_blockers.append("city_mismatch")
+    if not bool(row[17]):
+        approval_blockers.append("not_a_verified_sports_place")
+    if float(row[13]) < 0.50:
+        approval_blockers.append("venue_name_overlap_below_0_50")
+    if row[9] is None:
+        approval_blockers.append("timezone_lookup_failed")
+
     return {
         "provider": row[0],
         "query_text": row[1],
@@ -18694,6 +18828,7 @@ def _cached_geocode_preview(query_hash: str) -> dict[str, Any] | None:
         "country_match": bool(row[15]),
         "city_match": bool(row[16]),
         "sports_place_match": bool(row[17]),
+        "approval_blockers": approval_blockers,
         "decision_status": row[18],
         "cached_at": (
             row[19].isoformat()
@@ -18968,6 +19103,12 @@ def preview_one_fixture_location_on_startup() -> None:
         }
         return
 
+    global GEOCODE_SAFETY_MIGRATION_STATUS
+
+    GEOCODE_SAFETY_MIGRATION_STATUS = (
+        downgrade_unsafe_geocode_approvals_once()
+    )
+
     if not DATABASE_URL or not LOCATIONIQ_KEY or timezone_at is None:
         LOCATION_PREVIEW_STARTUP_STATUS = {
             "status": "not_configured",
@@ -19014,7 +19155,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB6 one-fixture geocode preview cache",
+        "database_checkpoint": "DB6A strict geocode auto-approval safety",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -19047,6 +19188,17 @@ def health() -> dict[str, Any]:
         "location_preview_startup_status": (
             LOCATION_PREVIEW_STARTUP_STATUS
         ),
+        "geocode_safety_migration_status": (
+            GEOCODE_SAFETY_MIGRATION_STATUS
+        ),
+        "geocode_auto_approval_policy": {
+            "minimum_score": LOCATION_PREVIEW_AUTO_APPROVE_SCORE,
+            "country_match_required": True,
+            "city_match_required_when_known": True,
+            "sports_place_match_required": True,
+            "minimum_venue_token_overlap": 0.50,
+            "timezone_required": True,
+        },
         "locationiq_public_attribution_required": True,
         "ayanamsa": "Lahiri",
         "engine": "VedAstro.Python",
@@ -19054,7 +19206,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + location preview DB6",
+        "response_mode": "prediction-grade compact v2 + geocode safety DB6A",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -19159,6 +19311,14 @@ def location_preview_status() -> dict[str, Any]:
         "status": "ok",
         "proxy_version": PROXY_VERSION,
         "fixture_coordinates_committed": False,
+        "geocode_safety_migration_status": (
+            GEOCODE_SAFETY_MIGRATION_STATUS
+        ),
+        "auto_approval_policy": {
+            "minimum_score": LOCATION_PREVIEW_AUTO_APPROVE_SCORE,
+            "sports_place_match_required": True,
+            "minimum_venue_token_overlap": 0.50,
+        },
         "startup_status": LOCATION_PREVIEW_STARTUP_STATUS,
     }
 
