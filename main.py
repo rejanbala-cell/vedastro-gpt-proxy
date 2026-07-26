@@ -7,11 +7,12 @@ import threading
 import time
 import re
 import unicodedata
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from enum import Enum
 from typing import Any, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     import swisseph as swe
@@ -24,7 +25,7 @@ except ImportError:
     psycopg = None
 
 import requests
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 from vedastro import (
     Ayanamsa,
@@ -40,7 +41,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db3"
+PROXY_VERSION = "1.20.0-db4"
 
 
 # ============================================================
@@ -70,6 +71,22 @@ API_FOOTBALL_TIMEOUT_SECONDS = int(
 )
 API_FOOTBALL_HEALTH_CACHE_SECONDS = int(
     os.getenv("API_FOOTBALL_HEALTH_CACHE_SECONDS", "3600")
+)
+
+# Fixture-import checkpoint. One provider call imports today's fixtures.
+# A database timestamp prevents repeated Render restarts from consuming calls.
+SOCCER_DISPLAY_TIMEZONE = os.getenv(
+    "SOCCER_DISPLAY_TIMEZONE",
+    "Australia/Sydney",
+).strip()
+FIXTURE_SYNC_MIN_INTERVAL_SECONDS = int(
+    os.getenv("FIXTURE_SYNC_MIN_INTERVAL_SECONDS", "21600")
+)
+FIXTURE_LIST_DEFAULT_LIMIT = int(
+    os.getenv("FIXTURE_LIST_DEFAULT_LIMIT", "250")
+)
+FIXTURE_LIST_MAX_LIMIT = int(
+    os.getenv("FIXTURE_LIST_MAX_LIMIT", "500")
 )
 
 DATABASE_EXPECTED_TABLES = (
@@ -17216,6 +17233,29 @@ def initialize_database_on_startup() -> None:
     DATABASE_SCHEMA_STARTUP_STATUS = ensure_database_schema()
 
 
+FIXTURE_SYNC_STARTUP_STATUS: dict[str, Any] = {
+    "status": "not_started",
+    "synced": False,
+}
+
+
+@app.on_event("startup")
+def import_today_fixtures_on_startup() -> None:
+    """
+    Import today's fixtures once per configured interval after deployment.
+
+    Failures do not stop the astrology service.
+    """
+    global FIXTURE_SYNC_STARTUP_STATUS
+    if not DATABASE_URL or not API_FOOTBALL_KEY:
+        FIXTURE_SYNC_STARTUP_STATUS = {
+            "status": "not_configured",
+            "synced": False,
+        }
+        return
+    FIXTURE_SYNC_STARTUP_STATUS = sync_today_fixtures(force=False)
+
+
 # ============================================================
 # API-FOOTBALL CONNECTIVITY — CHECKPOINT DB3
 # ============================================================
@@ -17369,6 +17409,578 @@ def api_football_connection_status(
 
 
 # ============================================================
+# FIXTURE IMPORT — CHECKPOINT DB4
+# ============================================================
+
+FIXTURE_STATUS_MAP = {
+    "NS": "scheduled",
+    "TBD": "scheduled",
+    "1H": "live",
+    "HT": "live",
+    "2H": "live",
+    "ET": "live",
+    "BT": "live",
+    "P": "live",
+    "SUSP": "suspended",
+    "INT": "interrupted",
+    "FT": "completed",
+    "AET": "completed",
+    "PEN": "completed",
+    "PST": "postponed",
+    "CANC": "cancelled",
+    "ABD": "abandoned",
+    "AWD": "awarded",
+    "WO": "walkover",
+}
+
+
+def _display_timezone() -> ZoneInfo:
+    try:
+        return ZoneInfo(SOCCER_DISPLAY_TIMEZONE)
+    except ZoneInfoNotFoundError as exc:
+        raise RuntimeError(
+            f"Invalid SOCCER_DISPLAY_TIMEZONE: {SOCCER_DISPLAY_TIMEZONE}"
+        ) from exc
+
+
+def _local_date_now() -> date:
+    return datetime.now(_display_timezone()).date()
+
+
+def _parse_provider_datetime(value: Any) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Fixture date is missing.")
+    normalized = value.strip().replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        raise ValueError("Fixture date has no UTC offset.")
+    return parsed
+
+
+def _fixture_window_utc(window: str) -> tuple[datetime, datetime]:
+    """
+    Return a half-open UTC range for the website window.
+
+    Windows are based on SOCCER_DISPLAY_TIMEZONE:
+    today, tomorrow, 7d and 30d.
+    """
+    tz = _display_timezone()
+    today_local = datetime.now(tz).date()
+
+    if window == "today":
+        start_date = today_local
+        days = 1
+    elif window == "tomorrow":
+        start_date = today_local + timedelta(days=1)
+        days = 1
+    elif window == "7d":
+        start_date = today_local
+        days = 7
+    elif window == "30d":
+        start_date = today_local
+        days = 30
+    else:
+        raise ValueError(
+            "window must be one of: today, tomorrow, 7d, 30d"
+        )
+
+    local_start = datetime.combine(
+        start_date,
+        datetime.min.time(),
+        tzinfo=tz,
+    )
+    local_end = local_start + timedelta(days=days)
+    return (
+        local_start.astimezone(timezone.utc),
+        local_end.astimezone(timezone.utc),
+    )
+
+
+def _fixture_sync_metadata() -> dict[str, Any]:
+    """
+    Read the persisted sync metadata without exposing secrets.
+    """
+    if not DATABASE_URL or psycopg is None:
+        return {
+            "last_sync_at": None,
+            "last_sync_date": None,
+            "last_received": 0,
+            "last_stored": 0,
+        }
+
+    keys = (
+        "fixtures_last_sync_at",
+        "fixtures_last_sync_date",
+        "fixtures_last_received",
+        "fixtures_last_stored",
+    )
+    output = {
+        "last_sync_at": None,
+        "last_sync_date": None,
+        "last_received": 0,
+        "last_stored": 0,
+    }
+
+    try:
+        with psycopg.connect(
+            DATABASE_URL,
+            connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+            autocommit=True,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT key, value
+                    FROM app_metadata
+                    WHERE key = ANY(%s)
+                    """,
+                    (list(keys),),
+                )
+                values = {row[0]: row[1] for row in cursor.fetchall()}
+    except Exception:
+        return output
+
+    output["last_sync_at"] = values.get("fixtures_last_sync_at")
+    output["last_sync_date"] = values.get("fixtures_last_sync_date")
+    try:
+        output["last_received"] = int(
+            values.get("fixtures_last_received") or 0
+        )
+    except (TypeError, ValueError):
+        pass
+    try:
+        output["last_stored"] = int(
+            values.get("fixtures_last_stored") or 0
+        )
+    except (TypeError, ValueError):
+        pass
+    return output
+
+
+def _fixture_sync_is_fresh(metadata: dict[str, Any]) -> bool:
+    value = metadata.get("last_sync_at")
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        last_sync = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if last_sync.tzinfo is None:
+        return False
+    age = datetime.now(timezone.utc) - last_sync.astimezone(timezone.utc)
+    same_local_date = (
+        metadata.get("last_sync_date") == _local_date_now().isoformat()
+    )
+    return (
+        same_local_date
+        and age.total_seconds() < FIXTURE_SYNC_MIN_INTERVAL_SECONDS
+    )
+
+
+def _normalise_api_fixture(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+
+    fixture = item.get("fixture")
+    league = item.get("league")
+    teams = item.get("teams")
+
+    if not isinstance(fixture, dict):
+        return None
+    if not isinstance(league, dict):
+        league = {}
+    if not isinstance(teams, dict):
+        teams = {}
+
+    home = teams.get("home")
+    away = teams.get("away")
+    if not isinstance(home, dict):
+        home = {}
+    if not isinstance(away, dict):
+        away = {}
+
+    fixture_id = fixture.get("id")
+    home_name = home.get("name")
+    away_name = away.get("name")
+    competition_name = league.get("name")
+    kickoff_value = fixture.get("date")
+
+    if (
+        fixture_id is None
+        or not home_name
+        or not away_name
+        or not competition_name
+        or not kickoff_value
+    ):
+        return None
+
+    kickoff = _parse_provider_datetime(kickoff_value)
+    venue = fixture.get("venue")
+    if not isinstance(venue, dict):
+        venue = {}
+    status = fixture.get("status")
+    if not isinstance(status, dict):
+        status = {}
+
+    provider_status = str(status.get("short") or "UNKNOWN").upper()
+    canonical_status = FIXTURE_STATUS_MAP.get(
+        provider_status,
+        provider_status.lower(),
+    )
+
+    return {
+        "provider": "api-football",
+        "provider_fixture_id": str(fixture_id),
+        "competition_name": str(competition_name),
+        "competition_country": (
+            str(league.get("country"))
+            if league.get("country") is not None
+            else None
+        ),
+        "season": (
+            str(league.get("season"))
+            if league.get("season") is not None
+            else None
+        ),
+        "home_team": str(home_name),
+        "away_team": str(away_name),
+        "kickoff_utc": kickoff.astimezone(timezone.utc),
+        "venue_name": (
+            str(venue.get("name"))
+            if venue.get("name") is not None
+            else None
+        ),
+        "venue_city": (
+            str(venue.get("city"))
+            if venue.get("city") is not None
+            else None
+        ),
+        "timezone_name": (
+            str(fixture.get("timezone"))
+            if fixture.get("timezone") is not None
+            else SOCCER_DISPLAY_TIMEZONE
+        ),
+        "fixture_status": canonical_status,
+        "provider_status": provider_status,
+        "raw_fixture_json": item,
+    }
+
+
+def _api_football_get(
+    endpoint: str,
+    *,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    if not API_FOOTBALL_KEY:
+        raise RuntimeError("API_FOOTBALL_KEY is not configured.")
+
+    response = requests.get(
+        f"{API_FOOTBALL_BASE_URL}{endpoint}",
+        headers={
+            "x-apisports-key": API_FOOTBALL_KEY,
+            "Accept": "application/json",
+        },
+        params=params,
+        timeout=API_FOOTBALL_TIMEOUT_SECONDS,
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"API-Football returned HTTP {response.status_code}."
+        )
+
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("API-Football returned unexpected JSON.")
+
+    errors = payload.get("errors")
+    if errors:
+        raise RuntimeError("API-Football rejected the fixture request.")
+
+    return payload
+
+
+def sync_today_fixtures(
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """
+    Import today's API-Football fixtures and upsert them into PostgreSQL.
+
+    The date is interpreted in SOCCER_DISPLAY_TIMEZONE. The provider call is
+    skipped when a successful sync exists within the configured interval.
+    """
+    if not DATABASE_URL or psycopg is None:
+        return {
+            "status": "error",
+            "synced": False,
+            "message": "Database is unavailable.",
+        }
+
+    metadata = _fixture_sync_metadata()
+    if not force and _fixture_sync_is_fresh(metadata):
+        return {
+            "status": "ok",
+            "synced": False,
+            "skipped": True,
+            "reason": "A fresh fixture sync already exists.",
+            "display_timezone": SOCCER_DISPLAY_TIMEZONE,
+            **metadata,
+        }
+
+    local_date = _local_date_now()
+    try:
+        payload = _api_football_get(
+            "/fixtures",
+            params={
+                "date": local_date.isoformat(),
+                "timezone": SOCCER_DISPLAY_TIMEZONE,
+            },
+        )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "synced": False,
+            "error_type": type(exc).__name__,
+            "message": "Today's fixture import failed.",
+        }
+
+    response_rows = payload.get("response")
+    if not isinstance(response_rows, list):
+        response_rows = []
+
+    normalised: list[dict[str, Any]] = []
+    invalid_count = 0
+    for item in response_rows:
+        try:
+            row = _normalise_api_fixture(item)
+        except Exception:
+            row = None
+        if row is None:
+            invalid_count += 1
+        else:
+            normalised.append(row)
+
+    stored = 0
+    sync_at = datetime.now(timezone.utc)
+
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                for row in normalised:
+                    cursor.execute(
+                        """
+                        INSERT INTO fixtures (
+                            provider,
+                            provider_fixture_id,
+                            sport,
+                            competition_name,
+                            competition_country,
+                            season,
+                            home_team,
+                            away_team,
+                            kickoff_utc,
+                            venue_name,
+                            venue_city,
+                            timezone_name,
+                            fixture_status,
+                            neutral_venue,
+                            raw_fixture_json
+                        )
+                        VALUES (
+                            %(provider)s,
+                            %(provider_fixture_id)s,
+                            'soccer',
+                            %(competition_name)s,
+                            %(competition_country)s,
+                            %(season)s,
+                            %(home_team)s,
+                            %(away_team)s,
+                            %(kickoff_utc)s,
+                            %(venue_name)s,
+                            %(venue_city)s,
+                            %(timezone_name)s,
+                            %(fixture_status)s,
+                            FALSE,
+                            %(raw_fixture_json)s::jsonb
+                        )
+                        ON CONFLICT (provider, provider_fixture_id)
+                        DO UPDATE SET
+                            competition_name = EXCLUDED.competition_name,
+                            competition_country = EXCLUDED.competition_country,
+                            season = EXCLUDED.season,
+                            home_team = EXCLUDED.home_team,
+                            away_team = EXCLUDED.away_team,
+                            kickoff_utc = EXCLUDED.kickoff_utc,
+                            venue_name = EXCLUDED.venue_name,
+                            venue_city = EXCLUDED.venue_city,
+                            timezone_name = EXCLUDED.timezone_name,
+                            fixture_status = EXCLUDED.fixture_status,
+                            raw_fixture_json = EXCLUDED.raw_fixture_json
+                        """,
+                        {
+                            **row,
+                            "raw_fixture_json": json.dumps(
+                                row["raw_fixture_json"],
+                                ensure_ascii=False,
+                                default=str,
+                            ),
+                        },
+                    )
+                    stored += 1
+
+                metadata_values = {
+                    "fixtures_last_sync_at": sync_at.isoformat(),
+                    "fixtures_last_sync_date": local_date.isoformat(),
+                    "fixtures_last_received": str(len(response_rows)),
+                    "fixtures_last_stored": str(stored),
+                    "fixtures_last_invalid": str(invalid_count),
+                    "fixtures_display_timezone": SOCCER_DISPLAY_TIMEZONE,
+                }
+                for key, value in metadata_values.items():
+                    cursor.execute(
+                        """
+                        INSERT INTO app_metadata (key, value)
+                        VALUES (%s, %s)
+                        ON CONFLICT (key) DO UPDATE
+                        SET value = EXCLUDED.value, updated_at = NOW()
+                        """,
+                        (key, value),
+                    )
+            connection.commit()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "synced": False,
+            "error_type": type(exc).__name__,
+            "message": "Fixtures were fetched but could not be stored.",
+        }
+
+    return {
+        "status": "ok",
+        "synced": True,
+        "skipped": False,
+        "provider": "API-Football",
+        "provider_endpoint": "/fixtures",
+        "local_date": local_date.isoformat(),
+        "display_timezone": SOCCER_DISPLAY_TIMEZONE,
+        "received": len(response_rows),
+        "stored": stored,
+        "invalid_skipped": invalid_count,
+        "provider_results_reported": payload.get("results"),
+        "synced_at": sync_at.isoformat(),
+    }
+
+
+def list_stored_fixtures(
+    *,
+    window: str,
+    limit: int,
+) -> dict[str, Any]:
+    start_utc, end_utc = _fixture_window_utc(window)
+    safe_limit = max(1, min(int(limit), FIXTURE_LIST_MAX_LIMIT))
+
+    try:
+        with psycopg.connect(
+            DATABASE_URL,
+            connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+            autocommit=True,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        provider_fixture_id,
+                        competition_name,
+                        competition_country,
+                        season,
+                        home_team,
+                        away_team,
+                        kickoff_utc,
+                        venue_name,
+                        venue_city,
+                        timezone_name,
+                        fixture_status,
+                        latitude,
+                        longitude
+                    FROM fixtures
+                    WHERE sport = 'soccer'
+                      AND kickoff_utc >= %s
+                      AND kickoff_utc < %s
+                    ORDER BY kickoff_utc, competition_name, home_team
+                    LIMIT %s
+                    """,
+                    (start_utc, end_utc, safe_limit),
+                )
+                rows = cursor.fetchall()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "ready": False,
+            "error_type": type(exc).__name__,
+            "message": "Stored fixtures could not be read.",
+        }
+
+    tz = _display_timezone()
+    fixtures = []
+    for row in rows:
+        kickoff_utc = row[7]
+        kickoff_local = (
+            kickoff_utc.astimezone(tz)
+            if isinstance(kickoff_utc, datetime)
+            else None
+        )
+        fixtures.append({
+            "database_fixture_id": row[0],
+            "provider_fixture_id": row[1],
+            "competition": row[2],
+            "country": row[3],
+            "season": row[4],
+            "home_team": row[5],
+            "away_team": row[6],
+            "kickoff_utc": (
+                kickoff_utc.isoformat()
+                if isinstance(kickoff_utc, datetime)
+                else str(kickoff_utc)
+            ),
+            "kickoff_local": (
+                kickoff_local.isoformat()
+                if kickoff_local is not None
+                else None
+            ),
+            "venue_name": row[8],
+            "venue_city": row[9],
+            "timezone": row[10],
+            "fixture_status": row[11],
+            "latitude": row[12],
+            "longitude": row[13],
+            "venue_coordinates_available": (
+                row[12] is not None and row[13] is not None
+            ),
+            "prediction_ready": (
+                row[8] is not None
+                and row[12] is not None
+                and row[13] is not None
+            ),
+        })
+
+    return {
+        "status": "ok",
+        "ready": True,
+        "window": window,
+        "display_timezone": SOCCER_DISPLAY_TIMEZONE,
+        "range_utc": {
+            "start": start_utc.isoformat(),
+            "end_exclusive": end_utc.isoformat(),
+        },
+        "count": len(fixtures),
+        "limit": safe_limit,
+        "fixtures": fixtures,
+    }
+
+
+# ============================================================
 # AUTHENTICATION
 # ============================================================
 
@@ -17404,15 +18016,23 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB3 API-Football connectivity; no fixture import yet",
+        "database_checkpoint": "DB4 today-fixture import and listing",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
         "api_football_checkpoint": (
-            "DB3 provider connectivity only; fixtures are not imported yet"
+            "DB4 imports today's fixtures with a persisted cooldown"
         ),
         "api_football_health_cache_seconds": (
             API_FOOTBALL_HEALTH_CACHE_SECONDS
+        ),
+        "soccer_display_timezone": SOCCER_DISPLAY_TIMEZONE,
+        "fixture_sync_min_interval_seconds": (
+            FIXTURE_SYNC_MIN_INTERVAL_SECONDS
+        ),
+        "fixture_sync_startup_status": FIXTURE_SYNC_STARTUP_STATUS,
+        "fixture_import_checkpoint": (
+            "today only; tomorrow/7d/30d provider sync comes next"
         ),
         "ayanamsa": "Lahiri",
         "engine": "VedAstro.Python",
@@ -17420,7 +18040,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + database/API checkpoint DB3",
+        "response_mode": "prediction-grade compact v2 + fixture checkpoint DB4",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -17501,6 +18121,60 @@ def football_health() -> dict[str, Any]:
     """
     result = api_football_connection_status()
     if not result.get("connected"):
+        raise HTTPException(status_code=503, detail=result)
+    return result
+
+
+@app.get("/fixtures")
+def fixtures(
+    window: str = Query(
+        default="today",
+        pattern="^(today|tomorrow|7d|30d)$",
+    ),
+    limit: int = Query(
+        default=FIXTURE_LIST_DEFAULT_LIMIT,
+        ge=1,
+        le=FIXTURE_LIST_MAX_LIMIT,
+    ),
+) -> dict[str, Any]:
+    """
+    List stored fixtures. DB4 imports today only; later releases fill the
+    longer windows.
+    """
+    result = list_stored_fixtures(window=window, limit=limit)
+    if not result.get("ready"):
+        raise HTTPException(status_code=503, detail=result)
+    return result
+
+
+@app.get("/fixtures-sync-status")
+def fixtures_sync_status() -> dict[str, Any]:
+    metadata = _fixture_sync_metadata()
+    return {
+        "status": "ok",
+        "proxy_version": PROXY_VERSION,
+        "display_timezone": SOCCER_DISPLAY_TIMEZONE,
+        "minimum_sync_interval_seconds": (
+            FIXTURE_SYNC_MIN_INTERVAL_SECONDS
+        ),
+        "startup_status": FIXTURE_SYNC_STARTUP_STATUS,
+        "metadata": metadata,
+    }
+
+
+@app.post("/fixtures/sync-today")
+def fixtures_sync_today(
+    x_proxy_key: str | None = Header(
+        default=None,
+        alias="x-proxy-key",
+    ),
+) -> dict[str, Any]:
+    """
+    Protected manual sync. It still honours the persisted cooldown.
+    """
+    verify_proxy_key(x_proxy_key)
+    result = sync_today_fixtures(force=False)
+    if result.get("status") != "ok":
         raise HTTPException(status_code=503, detail=result)
     return result
 
