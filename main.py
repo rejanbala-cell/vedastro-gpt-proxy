@@ -47,7 +47,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db6d"
+PROXY_VERSION = "1.20.0-db7"
 
 
 # ============================================================
@@ -63,7 +63,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DATABASE_CONNECT_TIMEOUT_SECONDS = int(
     os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "8")
 )
-DATABASE_SCHEMA_VERSION = "1.20.0-db6c"
+DATABASE_SCHEMA_VERSION = "1.20.0-db7"
 
 # API-Football connectivity checkpoint.
 # This version verifies the provider account through GET /status only.
@@ -147,6 +147,13 @@ LOCATION_PREVIEW_STARTUP_MAX_PROVIDER_CALLS = int(
     os.getenv("LOCATION_PREVIEW_STARTUP_MAX_PROVIDER_CALLS", "6")
 )
 
+# DB7 contains one independently reviewed venue manifest. It commits only when
+# every cached geocode guard matches. No other AUTO_APPROVED venue is written.
+REVIEWED_LOCATION_COMMIT_ENABLED = os.getenv(
+    "REVIEWED_LOCATION_COMMIT_ENABLED",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+
 DATABASE_EXPECTED_TABLES = (
     "app_metadata",
     "fixtures",
@@ -161,6 +168,7 @@ DATABASE_EXPECTED_TABLES = (
     "venue_geocodes",
     "location_contexts",
     "location_attempts",
+    "location_reviews",
 )
 
 # This is the MINIMUM delay between the START of upstream calls.
@@ -16989,6 +16997,42 @@ def database_schema_statements() -> list[str]:
             ON location_attempts (attempt_status, created_at DESC)
         """,
         """
+        CREATE TABLE IF NOT EXISTS location_reviews (
+            id BIGSERIAL PRIMARY KEY,
+            review_key TEXT NOT NULL UNIQUE,
+            venue_name TEXT NOT NULL,
+            venue_city TEXT NOT NULL,
+            venue_country TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            provider_place_id TEXT,
+            provider_latitude DOUBLE PRECISION NOT NULL,
+            provider_longitude DOUBLE PRECISION NOT NULL,
+            provider_timezone TEXT NOT NULL,
+            external_source_name TEXT NOT NULL,
+            external_source_reference TEXT NOT NULL,
+            external_latitude DOUBLE PRECISION NOT NULL,
+            external_longitude DOUBLE PRECISION NOT NULL,
+            separation_meters DOUBLE PRECISION NOT NULL,
+            review_status TEXT NOT NULL CHECK (
+                review_status IN (
+                    'APPROVED',
+                    'REJECTED',
+                    'COMMITTED'
+                )
+            ),
+            fixtures_updated INTEGER NOT NULL DEFAULT 0,
+            review_notes TEXT,
+            reviewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            committed_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_location_reviews_status
+            ON location_reviews (review_status, reviewed_at DESC)
+        """,
+        """
         CREATE TABLE IF NOT EXISTS odds_snapshots (
             id BIGSERIAL PRIMARY KEY,
             fixture_id BIGINT NOT NULL REFERENCES fixtures(id)
@@ -17241,6 +17285,15 @@ def database_schema_statements() -> list[str]:
         """
         CREATE TRIGGER location_attempts_touch_updated_at
         BEFORE UPDATE ON location_attempts
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at()
+        """,
+        """
+        DROP TRIGGER IF EXISTS location_reviews_touch_updated_at
+            ON location_reviews
+        """,
+        """
+        CREATE TRIGGER location_reviews_touch_updated_at
+        BEFORE UPDATE ON location_reviews
         FOR EACH ROW EXECUTE FUNCTION touch_updated_at()
         """,
         """
@@ -18170,7 +18223,10 @@ def list_stored_fixtures(
                         timezone_name,
                         fixture_status,
                         latitude,
-                        longitude
+                        longitude,
+                        location_source,
+                        location_confidence,
+                        location_verified_at
                     FROM fixtures
                     WHERE sport = 'soccer'
                       AND kickoff_utc >= %s
@@ -18232,6 +18288,15 @@ def list_stored_fixtures(
             "fixture_status": row[11],
             "latitude": row[12],
             "longitude": row[13],
+            "location_source": row[14],
+            "location_confidence": (
+                float(row[15]) if row[15] is not None else None
+            ),
+            "location_verified_at": (
+                row[16].isoformat()
+                if isinstance(row[16], datetime)
+                else None
+            ),
             "venue_coordinates_available": (
                 row[12] is not None and row[13] is not None
             ),
@@ -18240,6 +18305,8 @@ def list_stored_fixtures(
                 and row[10] is not None
                 and row[12] is not None
                 and row[13] is not None
+                and row[14] is not None
+                and row[16] is not None
             ),
             "prediction_blockers": [
                 blocker
@@ -18248,6 +18315,8 @@ def list_stored_fixtures(
                     ("venue_timezone_unverified", row[10] is None),
                     ("latitude_missing", row[12] is None),
                     ("longitude_missing", row[13] is None),
+                    ("location_source_missing", row[14] is None),
+                    ("location_verification_missing", row[16] is None),
                 )
                 if missing
             ],
@@ -19998,6 +20067,428 @@ def preview_one_fixture_location_on_startup() -> None:
 
 
 # ============================================================
+# REVIEWED LOCATION COMMIT — CHECKPOINT DB7
+# ============================================================
+
+# Independent reference reviewed on 26 July 2026.
+#
+# LocationIQ candidate:
+#   24.4740081, 118.0264486
+# OpenStreetMap-derived reference:
+#   way 1251039637, 24.47387, 118.02609
+#
+# The two points are about 39 metres apart. This manifest is intentionally
+# explicit and allows only this one reviewed venue to be committed in DB7.
+REVIEWED_LOCATION_MANIFESTS: tuple[dict[str, Any], ...] = (
+    {
+        "review_key": "haicang-sports-centre-stadium-xiamen-cn-v1",
+        "venue_name": "Haicang Sports Centre Stadium",
+        "venue_city": "Xiamen",
+        "venue_country": "China",
+        "provider": "locationiq",
+        "provider_place_id": "224538479",
+        "provider_latitude": 24.4740081,
+        "provider_longitude": 118.0264486,
+        "provider_timezone": "Asia/Shanghai",
+        "external_source_name": "OpenStreetMap-derived map reference",
+        "external_source_reference": "OpenStreetMap way 1251039637",
+        "external_latitude": 24.47387,
+        "external_longitude": 118.02609,
+        "maximum_separation_meters": 100.0,
+        "minimum_confidence_score": 100.0,
+        "minimum_venue_token_overlap": 1.0,
+        "review_notes": (
+            "Exact stadium name, Xiamen/China match, sports-place classification, "
+            "city-bounded search and independent coordinate corroboration."
+        ),
+    },
+)
+
+
+def _haversine_distance_meters(
+    latitude_a: float,
+    longitude_a: float,
+    latitude_b: float,
+    longitude_b: float,
+) -> float:
+    phi_a = math.radians(latitude_a)
+    phi_b = math.radians(latitude_b)
+    delta_phi = math.radians(latitude_b - latitude_a)
+    delta_lambda = math.radians(longitude_b - longitude_a)
+
+    haversine = (
+        math.sin(delta_phi / 2.0) ** 2
+        + math.cos(phi_a)
+        * math.cos(phi_b)
+        * math.sin(delta_lambda / 2.0) ** 2
+    )
+    return (
+        6371008.8
+        * 2.0
+        * math.atan2(
+            math.sqrt(haversine),
+            math.sqrt(max(0.0, 1.0 - haversine)),
+        )
+    )
+
+
+def _normalised_sql_match(value: Any) -> str:
+    return _normalise_lookup_text(value)
+
+
+def commit_reviewed_location_manifest(
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Commit one independently reviewed geocode with strict guards.
+
+    The operation is idempotent. It updates all exact matching fixture rows so
+    future fixtures at the same venue can reuse the verified coordinates.
+    """
+    if not DATABASE_URL or psycopg is None:
+        return {
+            "status": "not_configured",
+            "committed": False,
+            "review_key": manifest.get("review_key"),
+        }
+
+    separation_meters = _haversine_distance_meters(
+        float(manifest["provider_latitude"]),
+        float(manifest["provider_longitude"]),
+        float(manifest["external_latitude"]),
+        float(manifest["external_longitude"]),
+    )
+
+    if separation_meters > float(manifest["maximum_separation_meters"]):
+        return {
+            "status": "guard_failed",
+            "committed": False,
+            "review_key": manifest["review_key"],
+            "guard": "independent_coordinate_separation",
+            "separation_meters": round(separation_meters, 3),
+        }
+
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        provider,
+                        provider_place_id,
+                        latitude,
+                        longitude,
+                        timezone_name,
+                        confidence_score,
+                        venue_token_overlap,
+                        country_match,
+                        city_match,
+                        sports_place_match,
+                        decision_status,
+                        venue_name,
+                        expected_city,
+                        expected_country
+                    FROM venue_geocodes
+                    WHERE lower(trim(venue_name)) = lower(trim(%s))
+                      AND lower(trim(expected_city)) = lower(trim(%s))
+                      AND lower(trim(expected_country)) = lower(trim(%s))
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        manifest["venue_name"],
+                        manifest["venue_city"],
+                        manifest["venue_country"],
+                    ),
+                )
+                row = cursor.fetchone()
+
+                if not row:
+                    connection.rollback()
+                    return {
+                        "status": "guard_failed",
+                        "committed": False,
+                        "review_key": manifest["review_key"],
+                        "guard": "cached_geocode_missing",
+                    }
+
+                geocode = {
+                    "id": int(row[0]),
+                    "provider": row[1],
+                    "provider_place_id": row[2],
+                    "latitude": float(row[3]),
+                    "longitude": float(row[4]),
+                    "timezone_name": row[5],
+                    "confidence_score": float(row[6]),
+                    "venue_token_overlap": float(row[7]),
+                    "country_match": bool(row[8]),
+                    "city_match": bool(row[9]),
+                    "sports_place_match": bool(row[10]),
+                    "decision_status": row[11],
+                    "venue_name": row[12],
+                    "expected_city": row[13],
+                    "expected_country": row[14],
+                }
+
+                provider_distance_meters = _haversine_distance_meters(
+                    geocode["latitude"],
+                    geocode["longitude"],
+                    float(manifest["provider_latitude"]),
+                    float(manifest["provider_longitude"]),
+                )
+
+                guards = {
+                    "provider_match": (
+                        geocode["provider"] == manifest["provider"]
+                    ),
+                    "provider_place_id_match": (
+                        str(geocode["provider_place_id"])
+                        == str(manifest["provider_place_id"])
+                    ),
+                    "provider_coordinate_match": (
+                        provider_distance_meters <= 5.0
+                    ),
+                    "timezone_match": (
+                        geocode["timezone_name"]
+                        == manifest["provider_timezone"]
+                    ),
+                    "confidence_match": (
+                        geocode["confidence_score"]
+                        >= float(manifest["minimum_confidence_score"])
+                    ),
+                    "venue_overlap_match": (
+                        geocode["venue_token_overlap"]
+                        >= float(manifest["minimum_venue_token_overlap"])
+                    ),
+                    "country_match": geocode["country_match"],
+                    "city_match": geocode["city_match"],
+                    "sports_place_match": geocode["sports_place_match"],
+                    "decision_status_match": (
+                        geocode["decision_status"]
+                        in {"AUTO_APPROVED", "MANUALLY_APPROVED"}
+                    ),
+                }
+
+                failed_guards = [
+                    name for name, passed in guards.items() if not passed
+                ]
+                if failed_guards:
+                    connection.rollback()
+                    return {
+                        "status": "guard_failed",
+                        "committed": False,
+                        "review_key": manifest["review_key"],
+                        "failed_guards": failed_guards,
+                        "provider_distance_meters": round(
+                            provider_distance_meters,
+                            3,
+                        ),
+                    }
+
+                cursor.execute(
+                    """
+                    INSERT INTO location_reviews (
+                        review_key,
+                        venue_name,
+                        venue_city,
+                        venue_country,
+                        provider,
+                        provider_place_id,
+                        provider_latitude,
+                        provider_longitude,
+                        provider_timezone,
+                        external_source_name,
+                        external_source_reference,
+                        external_latitude,
+                        external_longitude,
+                        separation_meters,
+                        review_status,
+                        fixtures_updated,
+                        review_notes
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, 'APPROVED', 0, %s
+                    )
+                    ON CONFLICT (review_key) DO UPDATE SET
+                        provider_place_id = EXCLUDED.provider_place_id,
+                        provider_latitude = EXCLUDED.provider_latitude,
+                        provider_longitude = EXCLUDED.provider_longitude,
+                        provider_timezone = EXCLUDED.provider_timezone,
+                        external_source_name = EXCLUDED.external_source_name,
+                        external_source_reference = EXCLUDED.external_source_reference,
+                        external_latitude = EXCLUDED.external_latitude,
+                        external_longitude = EXCLUDED.external_longitude,
+                        separation_meters = EXCLUDED.separation_meters,
+                        review_notes = EXCLUDED.review_notes
+                    """,
+                    (
+                        manifest["review_key"],
+                        manifest["venue_name"],
+                        manifest["venue_city"],
+                        manifest["venue_country"],
+                        manifest["provider"],
+                        str(manifest["provider_place_id"]),
+                        float(manifest["provider_latitude"]),
+                        float(manifest["provider_longitude"]),
+                        manifest["provider_timezone"],
+                        manifest["external_source_name"],
+                        manifest["external_source_reference"],
+                        float(manifest["external_latitude"]),
+                        float(manifest["external_longitude"]),
+                        separation_meters,
+                        manifest["review_notes"],
+                    ),
+                )
+
+                cursor.execute(
+                    """
+                    UPDATE fixtures
+                    SET
+                        latitude = %s,
+                        longitude = %s,
+                        timezone_name = %s,
+                        location_source = %s,
+                        location_confidence = %s,
+                        location_verified_at = NOW(),
+                        updated_at = NOW()
+                    WHERE lower(trim(venue_name)) = lower(trim(%s))
+                      AND lower(trim(venue_city)) = lower(trim(%s))
+                      AND lower(trim(competition_country)) = lower(trim(%s))
+                      AND (
+                          latitude IS NULL
+                          OR longitude IS NULL
+                          OR timezone_name IS NULL
+                          OR location_verified_at IS NULL
+                      )
+                    """,
+                    (
+                        geocode["latitude"],
+                        geocode["longitude"],
+                        geocode["timezone_name"],
+                        (
+                            "reviewed:locationiq+"
+                            "openstreetmap-way-1251039637"
+                        ),
+                        geocode["confidence_score"],
+                        manifest["venue_name"],
+                        manifest["venue_city"],
+                        manifest["venue_country"],
+                    ),
+                )
+                fixtures_updated = cursor.rowcount
+
+                cursor.execute(
+                    """
+                    UPDATE venue_geocodes
+                    SET decision_status = 'MANUALLY_APPROVED',
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (geocode["id"],),
+                )
+
+                cursor.execute(
+                    """
+                    UPDATE location_reviews
+                    SET review_status = 'COMMITTED',
+                        fixtures_updated = %s,
+                        committed_at = COALESCE(committed_at, NOW()),
+                        updated_at = NOW()
+                    WHERE review_key = %s
+                    """,
+                    (
+                        fixtures_updated,
+                        manifest["review_key"],
+                    ),
+                )
+            connection.commit()
+
+        return {
+            "status": "ok",
+            "committed": True,
+            "review_key": manifest["review_key"],
+            "venue_name": manifest["venue_name"],
+            "venue_city": manifest["venue_city"],
+            "venue_country": manifest["venue_country"],
+            "latitude": geocode["latitude"],
+            "longitude": geocode["longitude"],
+            "timezone_name": geocode["timezone_name"],
+            "confidence_score": geocode["confidence_score"],
+            "independent_reference_separation_meters": round(
+                separation_meters,
+                3,
+            ),
+            "fixtures_updated": fixtures_updated,
+            "location_source": (
+                "reviewed:locationiq+openstreetmap-way-1251039637"
+            ),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "committed": False,
+            "review_key": manifest.get("review_key"),
+            "error_type": type(exc).__name__,
+            "message": "Reviewed location could not be committed.",
+        }
+
+
+def commit_reviewed_locations() -> dict[str, Any]:
+    if not REVIEWED_LOCATION_COMMIT_ENABLED:
+        return {
+            "status": "disabled",
+            "committed": False,
+            "results": [],
+        }
+
+    results = [
+        commit_reviewed_location_manifest(manifest)
+        for manifest in REVIEWED_LOCATION_MANIFESTS
+    ]
+    committed_count = sum(
+        1 for result in results if result.get("committed")
+    )
+    return {
+        "status": (
+            "ok"
+            if all(
+                result.get("status") in {"ok", "guard_failed"}
+                for result in results
+            )
+            else "error"
+        ),
+        "committed": committed_count > 0,
+        "manifest_count": len(REVIEWED_LOCATION_MANIFESTS),
+        "committed_count": committed_count,
+        "results": results,
+    }
+
+
+REVIEWED_LOCATION_COMMIT_STATUS: dict[str, Any] = {
+    "status": "not_started",
+    "committed": False,
+    "results": [],
+}
+
+
+@app.on_event("startup")
+def commit_reviewed_locations_on_startup() -> None:
+    global REVIEWED_LOCATION_COMMIT_STATUS
+
+    if not DATABASE_URL:
+        REVIEWED_LOCATION_COMMIT_STATUS = {
+            "status": "not_configured",
+            "committed": False,
+            "results": [],
+        }
+        return
+
+    REVIEWED_LOCATION_COMMIT_STATUS = commit_reviewed_locations()
+
+
+# ============================================================
 # AUTHENTICATION
 # ============================================================
 
@@ -20033,7 +20524,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB6D cache LocationIQ 404 and advance preview batch",
+        "database_checkpoint": "DB7 commit one independently reviewed venue",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -20057,7 +20548,7 @@ def health() -> dict[str, Any]:
         "locationiq_key_configured": bool(LOCATIONIQ_KEY),
         "timezonefinder_available": timezone_at is not None,
         "location_checkpoint": (
-            "DB6 previews one real fixture; fixture coordinates remain untouched"
+            "DB7 commits only independently reviewed venue manifests"
         ),
         "location_health_cache_seconds": (
             LOCATIONIQ_HEALTH_CACHE_SECONDS
@@ -20104,6 +20595,19 @@ def health() -> dict[str, Any]:
             "stop_for_preview_or_auto_approved": True,
             "coordinates_committed": False,
         },
+        "reviewed_location_commit_enabled": (
+            REVIEWED_LOCATION_COMMIT_ENABLED
+        ),
+        "reviewed_location_commit_status": (
+            REVIEWED_LOCATION_COMMIT_STATUS
+        ),
+        "location_commit_policy": {
+            "automatic_general_commit": False,
+            "review_manifest_required": True,
+            "independent_coordinate_reference_required": True,
+            "maximum_reference_separation_meters": 100.0,
+            "provenance_required_for_prediction_ready": True,
+        },
         "locationiq_public_attribution_required": True,
         "ayanamsa": "Lahiri",
         "engine": "VedAstro.Python",
@@ -20111,7 +20615,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + bounded no-match batch DB6D",
+        "response_mode": "prediction-grade compact v2 + reviewed location commit DB7",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -20205,6 +20709,20 @@ def location_health() -> dict[str, Any]:
     if not result.get("connected"):
         raise HTTPException(status_code=503, detail=result)
     return result
+
+
+@app.get("/location-commit-status")
+def location_commit_status() -> dict[str, Any]:
+    """
+    Public non-secret audit status for reviewed coordinate commits.
+    """
+    return {
+        "status": "ok",
+        "proxy_version": PROXY_VERSION,
+        "automatic_general_commit": False,
+        "review_manifest_required": True,
+        "startup_status": REVIEWED_LOCATION_COMMIT_STATUS,
+    }
 
 
 @app.get("/location-preview-status")
