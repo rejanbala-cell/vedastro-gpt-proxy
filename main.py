@@ -48,7 +48,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db8"
+PROXY_VERSION = "1.20.0-db8a"
 
 
 # ============================================================
@@ -21162,6 +21162,9 @@ def _build_market_consensus(
         "bookmaker_count": bookmaker_count,
         "minimum_bookmaker_count": MARKET_MIN_BOOKMAKER_COUNT,
         "market_ready": market_ready,
+        "pre_match_capture_valid": pre_match_capture_valid,
+        "historical_research_only": not pre_match_capture_valid,
+        "temporal_validation": temporal_validation,
         "median_decimal_odds": {
             outcome: round(value, 6)
             for outcome, value in median_odds.items()
@@ -21185,6 +21188,103 @@ def _build_market_consensus(
     }
 
 
+def _parse_market_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(
+                value.strip().replace("Z", "+00:00")
+            )
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _market_temporal_validation(
+    *,
+    kickoff_utc: Any,
+    captured_at: Any,
+    provider_updates: list[str] | None = None,
+) -> dict[str, Any]:
+    kickoff = _parse_market_datetime(kickoff_utc)
+    captured = _parse_market_datetime(captured_at)
+
+    parsed_updates = [
+        parsed
+        for parsed in (
+            _parse_market_datetime(value)
+            for value in (provider_updates or [])
+        )
+        if parsed is not None
+    ]
+    latest_provider_update = (
+        max(parsed_updates) if parsed_updates else None
+    )
+
+    capture_before_kickoff = bool(
+        kickoff is not None
+        and captured is not None
+        and captured < kickoff
+    )
+    provider_update_before_kickoff = bool(
+        kickoff is not None
+        and (
+            latest_provider_update is None
+            or latest_provider_update < kickoff
+        )
+    )
+    pre_match_capture_valid = bool(
+        capture_before_kickoff
+        and provider_update_before_kickoff
+    )
+
+    reason = None
+    if kickoff is None:
+        reason = "kickoff_time_invalid"
+    elif captured is None:
+        reason = "capture_time_invalid"
+    elif captured >= kickoff:
+        reason = "captured_at_or_after_kickoff"
+    elif (
+        latest_provider_update is not None
+        and latest_provider_update >= kickoff
+    ):
+        reason = "provider_update_at_or_after_kickoff"
+
+    seconds_before_kickoff = None
+    if kickoff is not None and captured is not None:
+        seconds_before_kickoff = (
+            kickoff - captured
+        ).total_seconds()
+
+    return {
+        "kickoff_utc": (
+            kickoff.isoformat() if kickoff is not None else None
+        ),
+        "captured_at": (
+            captured.isoformat() if captured is not None else None
+        ),
+        "latest_provider_update": (
+            latest_provider_update.isoformat()
+            if latest_provider_update is not None
+            else None
+        ),
+        "capture_before_kickoff": capture_before_kickoff,
+        "provider_update_before_kickoff": (
+            provider_update_before_kickoff
+        ),
+        "pre_match_capture_valid": pre_match_capture_valid,
+        "seconds_before_kickoff": seconds_before_kickoff,
+        "temporal_rejection_reason": reason,
+    }
+
+
 def _store_market_snapshot(
     *,
     fixture_id: int,
@@ -21192,8 +21292,9 @@ def _store_market_snapshot(
     quotes: list[dict[str, Any]],
     provider_updates: list[str],
     provider_paging: Any,
+    captured_at: datetime,
+    temporal_validation: dict[str, Any],
 ) -> dict[str, Any]:
-    captured_at = datetime.now(timezone.utc)
     probabilities = consensus["consensus_no_margin_probability"]
     median_odds = consensus["median_decimal_odds"]
 
@@ -21204,6 +21305,7 @@ def _store_market_snapshot(
         "provider_updates": provider_updates,
         "provider_paging": provider_paging,
         "consensus": consensus,
+        "temporal_validation": temporal_validation,
     }
 
     try:
@@ -21289,21 +21391,26 @@ def latest_market_status(
                 cursor.execute(
                     """
                     SELECT
-                        id,
-                        provider,
-                        captured_at,
-                        home_odds,
-                        draw_odds,
-                        away_odds,
-                        no_margin_home,
-                        no_margin_draw,
-                        no_margin_away,
-                        consensus_favourite,
-                        bookmaker_count,
-                        raw_odds_json
+                        odds_snapshots.id,
+                        odds_snapshots.provider,
+                        odds_snapshots.captured_at,
+                        odds_snapshots.home_odds,
+                        odds_snapshots.draw_odds,
+                        odds_snapshots.away_odds,
+                        odds_snapshots.no_margin_home,
+                        odds_snapshots.no_margin_draw,
+                        odds_snapshots.no_margin_away,
+                        odds_snapshots.consensus_favourite,
+                        odds_snapshots.bookmaker_count,
+                        odds_snapshots.raw_odds_json,
+                        fixtures.kickoff_utc
                     FROM odds_snapshots
-                    WHERE fixture_id = %s
-                    ORDER BY captured_at DESC, id DESC
+                    INNER JOIN fixtures
+                        ON fixtures.id = odds_snapshots.fixture_id
+                    WHERE odds_snapshots.fixture_id = %s
+                    ORDER BY
+                        odds_snapshots.captured_at DESC,
+                        odds_snapshots.id DESC
                     LIMIT 1
                     """,
                     (fixture_id,),
@@ -21339,13 +21446,32 @@ def latest_market_status(
     consensus = consensus if isinstance(consensus, dict) else {}
 
     bookmaker_count = int(row[10] or 0)
+    provider_updates = (
+        raw_json.get("provider_updates", [])
+        if isinstance(raw_json, dict)
+        and isinstance(raw_json.get("provider_updates"), list)
+        else []
+    )
+    temporal_validation = _market_temporal_validation(
+        kickoff_utc=row[12],
+        captured_at=row[2],
+        provider_updates=provider_updates,
+    )
+    pre_match_capture_valid = bool(
+        temporal_validation["pre_match_capture_valid"]
+    )
     market_ready = (
         bool(consensus.get("market_ready"))
         and bookmaker_count >= MARKET_MIN_BOOKMAKER_COUNT
+        and pre_match_capture_valid
     )
 
     return {
-        "status": "ok",
+        "status": (
+            "ok"
+            if pre_match_capture_valid
+            else "historical_research_only"
+        ),
         "fixture_id": fixture_id,
         "snapshot_id": int(row[0]),
         "provider": row[1],
@@ -21421,6 +21547,53 @@ def capture_target_market_odds(
             "captured": False,
             "fixture": fixture,
             "message": "Provider fixture ID is missing.",
+        }
+
+    kickoff_utc = _parse_market_datetime(
+        fixture.get("kickoff_utc")
+    )
+    capture_started_at = datetime.now(timezone.utc)
+    if kickoff_utc is None:
+        _write_market_attempt_metadata(
+            fixture_id=fixture_id,
+            status="kickoff_time_invalid",
+            bookmaker_count=0,
+        )
+        return {
+            "status": "blocked",
+            "captured": False,
+            "fixture": fixture,
+            "market_ready": False,
+            "favourite_frozen": False,
+            "astrology_action_allowed": False,
+            "message": "Kickoff time is invalid.",
+        }
+
+    if capture_started_at >= kickoff_utc:
+        _write_market_attempt_metadata(
+            fixture_id=fixture_id,
+            status="kickoff_passed_no_capture",
+            bookmaker_count=0,
+        )
+        return {
+            "status": "blocked_post_kickoff",
+            "captured": False,
+            "fixture": fixture,
+            "market_ready": False,
+            "pre_match_capture_valid": False,
+            "historical_research_only": True,
+            "favourite_frozen": False,
+            "astrology_action_allowed": False,
+            "seconds_after_kickoff": round(
+                (capture_started_at - kickoff_utc).total_seconds(),
+                3,
+            ),
+            "latest_market_status": latest_market_status(
+                fixture_id
+            ),
+            "message": (
+                "Kickoff has passed. No new odds request was made."
+            ),
         }
 
     metadata = _read_market_attempt_metadata(fixture_id)
@@ -21499,12 +21672,46 @@ def capture_target_market_odds(
             "message": "The market consensus could not be calculated.",
         }
 
+    captured_at = datetime.now(timezone.utc)
+    temporal_validation = _market_temporal_validation(
+        kickoff_utc=kickoff_utc,
+        captured_at=captured_at,
+        provider_updates=provider_updates,
+    )
+    if not temporal_validation["pre_match_capture_valid"]:
+        _write_market_attempt_metadata(
+            fixture_id=fixture_id,
+            status=(
+                temporal_validation["temporal_rejection_reason"]
+                or "temporal_validation_failed"
+            ),
+            bookmaker_count=bookmaker_count,
+        )
+        return {
+            "status": "blocked_temporal_validation",
+            "captured": False,
+            "fixture": fixture,
+            "bookmaker_count": bookmaker_count,
+            "market_ready": False,
+            "pre_match_capture_valid": False,
+            "historical_research_only": True,
+            "temporal_validation": temporal_validation,
+            "favourite_frozen": False,
+            "astrology_action_allowed": False,
+            "message": (
+                "The odds response was not stored as a live "
+                "pre-match market snapshot."
+            ),
+        }
+
     stored = _store_market_snapshot(
         fixture_id=fixture_id,
         consensus=consensus,
         quotes=quotes,
         provider_updates=provider_updates,
         provider_paging=payload.get("paging"),
+        captured_at=captured_at,
+        temporal_validation=temporal_validation,
     )
     if not stored.get("stored"):
         _write_market_attempt_metadata(
@@ -21537,6 +21744,7 @@ def capture_target_market_odds(
         "consensus": consensus,
         "provider_updates": provider_updates,
         "provider_paging": payload.get("paging"),
+        "temporal_validation": temporal_validation,
     }
 
 
@@ -21597,7 +21805,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB8 pre-match 1X2 odds capture and consensus",
+        "database_checkpoint": "DB8A enforce capture-before-kickoff market validity",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -21709,6 +21917,13 @@ def health() -> dict[str, Any]:
             "favourite_frozen": False,
             "astrology_action_allowed": False,
         },
+        "market_temporal_guard": {
+            "capture_must_precede_kickoff": True,
+            "provider_update_must_precede_kickoff": True,
+            "post_kickoff_provider_call_allowed": False,
+            "post_kickoff_snapshot_market_ready": False,
+            "post_kickoff_snapshot_use": "historical_research_only",
+        },
         "market_capture_startup_status": (
             MARKET_CAPTURE_STARTUP_STATUS
         ),
@@ -21725,7 +21940,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + market capture DB8",
+        "response_mode": "prediction-grade compact v2 + pre-match time guard DB8A",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
