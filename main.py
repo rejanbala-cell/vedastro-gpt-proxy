@@ -48,7 +48,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db8b"
+PROXY_VERSION = "1.20.0-db9"
 
 
 # ============================================================
@@ -94,6 +94,27 @@ FIXTURE_LIST_DEFAULT_LIMIT = int(
 )
 FIXTURE_LIST_MAX_LIMIT = int(
     os.getenv("FIXTURE_LIST_MAX_LIMIT", "500")
+)
+
+# DB9 imports tomorrow through the next seven local calendar dates.
+# The persisted attempt timestamp prevents Render restarts from repeating
+# the seven provider calls inside the configured interval.
+FUTURE_FIXTURE_SYNC_AUTO_RUN = os.getenv(
+    "FUTURE_FIXTURE_SYNC_AUTO_RUN",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+FUTURE_FIXTURE_SYNC_DAYS = max(
+    1,
+    min(
+        int(os.getenv("FUTURE_FIXTURE_SYNC_DAYS", "7")),
+        14,
+    ),
+)
+FUTURE_FIXTURE_SYNC_MIN_INTERVAL_SECONDS = int(
+    os.getenv(
+        "FUTURE_FIXTURE_SYNC_MIN_INTERVAL_SECONDS",
+        "21600",
+    )
 )
 
 # DB8 captures one pre-match 1X2 market snapshot for the verified checkpoint
@@ -17491,6 +17512,11 @@ FIXTURE_SYNC_STARTUP_STATUS: dict[str, Any] = {
     "synced": False,
 }
 
+FUTURE_FIXTURE_SYNC_STARTUP_STATUS: dict[str, Any] = {
+    "status": "not_started",
+    "synced": False,
+}
+
 FIXTURE_TIMEZONE_MIGRATION_STATUS: dict[str, Any] = {
     "status": "not_started",
     "updated_rows": 0,
@@ -17500,11 +17526,13 @@ FIXTURE_TIMEZONE_MIGRATION_STATUS: dict[str, Any] = {
 @app.on_event("startup")
 def import_today_fixtures_on_startup() -> None:
     """
-    Import today's fixtures once per configured interval after deployment.
+    Import today's fixtures and the rolling future window.
 
+    Persisted cooldowns protect provider calls across Render restarts.
     Failures do not stop the astrology service.
     """
     global FIXTURE_SYNC_STARTUP_STATUS
+    global FUTURE_FIXTURE_SYNC_STARTUP_STATUS
     global FIXTURE_TIMEZONE_MIGRATION_STATUS
 
     FIXTURE_TIMEZONE_MIGRATION_STATUS = (
@@ -17516,8 +17544,23 @@ def import_today_fixtures_on_startup() -> None:
             "status": "not_configured",
             "synced": False,
         }
+        FUTURE_FIXTURE_SYNC_STARTUP_STATUS = {
+            "status": "not_configured",
+            "synced": False,
+        }
         return
+
     FIXTURE_SYNC_STARTUP_STATUS = sync_today_fixtures(force=False)
+
+    if FUTURE_FIXTURE_SYNC_AUTO_RUN:
+        FUTURE_FIXTURE_SYNC_STARTUP_STATUS = (
+            sync_future_fixtures(force=False)
+        )
+    else:
+        FUTURE_FIXTURE_SYNC_STARTUP_STATUS = {
+            "status": "disabled",
+            "synced": False,
+        }
 
 
 # ============================================================
@@ -17963,6 +18006,223 @@ def _api_football_get(
     return payload
 
 
+def _upsert_normalised_fixture(
+    cursor: Any,
+    row: dict[str, Any],
+) -> None:
+    """
+    Upsert one provider fixture without silently destroying reviewed location
+    data.
+
+    Missing upstream venue text preserves an existing venue. A material
+    non-empty venue/city change invalidates the previously verified location
+    fields so the event must be geocoded and reviewed again.
+    """
+    cursor.execute(
+        """
+        INSERT INTO fixtures (
+            provider,
+            provider_fixture_id,
+            sport,
+            competition_name,
+            competition_country,
+            season,
+            home_team,
+            away_team,
+            kickoff_utc,
+            venue_name,
+            venue_city,
+            timezone_name,
+            fixture_status,
+            neutral_venue,
+            raw_fixture_json
+        )
+        VALUES (
+            %(provider)s,
+            %(provider_fixture_id)s,
+            'soccer',
+            %(competition_name)s,
+            %(competition_country)s,
+            %(season)s,
+            %(home_team)s,
+            %(away_team)s,
+            %(kickoff_utc)s,
+            %(venue_name)s,
+            %(venue_city)s,
+            %(timezone_name)s,
+            %(fixture_status)s,
+            FALSE,
+            %(raw_fixture_json)s::jsonb
+        )
+        ON CONFLICT (provider, provider_fixture_id)
+        DO UPDATE SET
+            competition_name = EXCLUDED.competition_name,
+            competition_country = EXCLUDED.competition_country,
+            season = EXCLUDED.season,
+            home_team = EXCLUDED.home_team,
+            away_team = EXCLUDED.away_team,
+            kickoff_utc = EXCLUDED.kickoff_utc,
+            venue_name = COALESCE(
+                NULLIF(BTRIM(EXCLUDED.venue_name), ''),
+                fixtures.venue_name
+            ),
+            venue_city = COALESCE(
+                NULLIF(BTRIM(EXCLUDED.venue_city), ''),
+                fixtures.venue_city
+            ),
+            timezone_name = CASE
+                WHEN fixtures.location_verified_at IS NOT NULL
+                 AND LOWER(
+                        COALESCE(
+                            NULLIF(BTRIM(EXCLUDED.venue_name), ''),
+                            BTRIM(fixtures.venue_name),
+                            ''
+                        )
+                     ) = LOWER(
+                        COALESCE(BTRIM(fixtures.venue_name), '')
+                     )
+                 AND LOWER(
+                        COALESCE(
+                            NULLIF(BTRIM(EXCLUDED.venue_city), ''),
+                            BTRIM(fixtures.venue_city),
+                            ''
+                        )
+                     ) = LOWER(
+                        COALESCE(BTRIM(fixtures.venue_city), '')
+                     )
+                THEN fixtures.timezone_name
+                ELSE NULL
+            END,
+            latitude = CASE
+                WHEN fixtures.location_verified_at IS NOT NULL
+                 AND LOWER(
+                        COALESCE(
+                            NULLIF(BTRIM(EXCLUDED.venue_name), ''),
+                            BTRIM(fixtures.venue_name),
+                            ''
+                        )
+                     ) = LOWER(
+                        COALESCE(BTRIM(fixtures.venue_name), '')
+                     )
+                 AND LOWER(
+                        COALESCE(
+                            NULLIF(BTRIM(EXCLUDED.venue_city), ''),
+                            BTRIM(fixtures.venue_city),
+                            ''
+                        )
+                     ) = LOWER(
+                        COALESCE(BTRIM(fixtures.venue_city), '')
+                     )
+                THEN fixtures.latitude
+                ELSE NULL
+            END,
+            longitude = CASE
+                WHEN fixtures.location_verified_at IS NOT NULL
+                 AND LOWER(
+                        COALESCE(
+                            NULLIF(BTRIM(EXCLUDED.venue_name), ''),
+                            BTRIM(fixtures.venue_name),
+                            ''
+                        )
+                     ) = LOWER(
+                        COALESCE(BTRIM(fixtures.venue_name), '')
+                     )
+                 AND LOWER(
+                        COALESCE(
+                            NULLIF(BTRIM(EXCLUDED.venue_city), ''),
+                            BTRIM(fixtures.venue_city),
+                            ''
+                        )
+                     ) = LOWER(
+                        COALESCE(BTRIM(fixtures.venue_city), '')
+                     )
+                THEN fixtures.longitude
+                ELSE NULL
+            END,
+            location_source = CASE
+                WHEN fixtures.location_verified_at IS NOT NULL
+                 AND LOWER(
+                        COALESCE(
+                            NULLIF(BTRIM(EXCLUDED.venue_name), ''),
+                            BTRIM(fixtures.venue_name),
+                            ''
+                        )
+                     ) = LOWER(
+                        COALESCE(BTRIM(fixtures.venue_name), '')
+                     )
+                 AND LOWER(
+                        COALESCE(
+                            NULLIF(BTRIM(EXCLUDED.venue_city), ''),
+                            BTRIM(fixtures.venue_city),
+                            ''
+                        )
+                     ) = LOWER(
+                        COALESCE(BTRIM(fixtures.venue_city), '')
+                     )
+                THEN fixtures.location_source
+                ELSE NULL
+            END,
+            location_confidence = CASE
+                WHEN fixtures.location_verified_at IS NOT NULL
+                 AND LOWER(
+                        COALESCE(
+                            NULLIF(BTRIM(EXCLUDED.venue_name), ''),
+                            BTRIM(fixtures.venue_name),
+                            ''
+                        )
+                     ) = LOWER(
+                        COALESCE(BTRIM(fixtures.venue_name), '')
+                     )
+                 AND LOWER(
+                        COALESCE(
+                            NULLIF(BTRIM(EXCLUDED.venue_city), ''),
+                            BTRIM(fixtures.venue_city),
+                            ''
+                        )
+                     ) = LOWER(
+                        COALESCE(BTRIM(fixtures.venue_city), '')
+                     )
+                THEN fixtures.location_confidence
+                ELSE NULL
+            END,
+            location_verified_at = CASE
+                WHEN fixtures.location_verified_at IS NOT NULL
+                 AND LOWER(
+                        COALESCE(
+                            NULLIF(BTRIM(EXCLUDED.venue_name), ''),
+                            BTRIM(fixtures.venue_name),
+                            ''
+                        )
+                     ) = LOWER(
+                        COALESCE(BTRIM(fixtures.venue_name), '')
+                     )
+                 AND LOWER(
+                        COALESCE(
+                            NULLIF(BTRIM(EXCLUDED.venue_city), ''),
+                            BTRIM(fixtures.venue_city),
+                            ''
+                        )
+                     ) = LOWER(
+                        COALESCE(BTRIM(fixtures.venue_city), '')
+                     )
+                THEN fixtures.location_verified_at
+                ELSE NULL
+            END,
+            fixture_status = EXCLUDED.fixture_status,
+            raw_fixture_json = EXCLUDED.raw_fixture_json,
+            updated_at = NOW()
+        """,
+        {
+            **row,
+            "raw_fixture_json": json.dumps(
+                row["raw_fixture_json"],
+                ensure_ascii=False,
+                default=str,
+            ),
+        },
+    )
+
+
 def sync_today_fixtures(
     *,
     force: bool = False,
@@ -18031,66 +18291,9 @@ def sync_today_fixtures(
         with _database_connect() as connection:
             with connection.cursor() as cursor:
                 for row in normalised:
-                    cursor.execute(
-                        """
-                        INSERT INTO fixtures (
-                            provider,
-                            provider_fixture_id,
-                            sport,
-                            competition_name,
-                            competition_country,
-                            season,
-                            home_team,
-                            away_team,
-                            kickoff_utc,
-                            venue_name,
-                            venue_city,
-                            timezone_name,
-                            fixture_status,
-                            neutral_venue,
-                            raw_fixture_json
-                        )
-                        VALUES (
-                            %(provider)s,
-                            %(provider_fixture_id)s,
-                            'soccer',
-                            %(competition_name)s,
-                            %(competition_country)s,
-                            %(season)s,
-                            %(home_team)s,
-                            %(away_team)s,
-                            %(kickoff_utc)s,
-                            %(venue_name)s,
-                            %(venue_city)s,
-                            %(timezone_name)s,
-                            %(fixture_status)s,
-                            FALSE,
-                            %(raw_fixture_json)s::jsonb
-                        )
-                        ON CONFLICT (provider, provider_fixture_id)
-                        DO UPDATE SET
-                            competition_name = EXCLUDED.competition_name,
-                            competition_country = EXCLUDED.competition_country,
-                            season = EXCLUDED.season,
-                            home_team = EXCLUDED.home_team,
-                            away_team = EXCLUDED.away_team,
-                            kickoff_utc = EXCLUDED.kickoff_utc,
-                            venue_name = EXCLUDED.venue_name,
-                            venue_city = EXCLUDED.venue_city,
-                            timezone_name = EXCLUDED.timezone_name,
-                            fixture_status = EXCLUDED.fixture_status,
-                            raw_fixture_json = EXCLUDED.raw_fixture_json
-                        """,
-                        {
-                            **row,
-                            "raw_fixture_json": json.dumps(
-                                row["raw_fixture_json"],
-                                ensure_ascii=False,
-                                default=str,
-                            ),
-                        },
-                    )
+                    _upsert_normalised_fixture(cursor, row)
                     stored += 1
+
 
                 metadata_values = {
                     "fixtures_last_sync_at": sync_at.isoformat(),
@@ -18132,6 +18335,297 @@ def sync_today_fixtures(
         "invalid_skipped": invalid_count,
         "provider_results_reported": payload.get("results"),
         "synced_at": sync_at.isoformat(),
+    }
+
+
+def _future_fixture_dates(
+    base_local_date: Any | None = None,
+) -> list[Any]:
+    """
+    Return tomorrow through the configured number of future local dates.
+    """
+    today_local = base_local_date or _local_date_now()
+    return [
+        today_local + timedelta(days=offset)
+        for offset in range(1, FUTURE_FIXTURE_SYNC_DAYS + 1)
+    ]
+
+
+def _future_fixture_sync_metadata() -> dict[str, Any]:
+    output = {
+        "last_attempt_at": None,
+        "last_status": None,
+        "window_start": None,
+        "window_end": None,
+        "last_provider_calls": 0,
+        "last_received": 0,
+        "last_upserted": 0,
+        "last_invalid": 0,
+        "last_error_count": 0,
+    }
+    if not DATABASE_URL or psycopg is None:
+        return output
+
+    mapping = {
+        "future_fixtures_last_attempt_at": "last_attempt_at",
+        "future_fixtures_last_status": "last_status",
+        "future_fixtures_window_start": "window_start",
+        "future_fixtures_window_end": "window_end",
+        "future_fixtures_last_provider_calls": "last_provider_calls",
+        "future_fixtures_last_received": "last_received",
+        "future_fixtures_last_upserted": "last_upserted",
+        "future_fixtures_last_invalid": "last_invalid",
+        "future_fixtures_last_error_count": "last_error_count",
+    }
+
+    try:
+        with psycopg.connect(
+            DATABASE_URL,
+            connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+            autocommit=True,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT key, value
+                    FROM app_metadata
+                    WHERE key = ANY(%s)
+                    """,
+                    (list(mapping),),
+                )
+                values = {
+                    str(row[0]): str(row[1])
+                    for row in cursor.fetchall()
+                }
+    except Exception:
+        return output
+
+    for metadata_key, output_key in mapping.items():
+        value = values.get(metadata_key)
+        if output_key in {
+            "last_provider_calls",
+            "last_received",
+            "last_upserted",
+            "last_invalid",
+            "last_error_count",
+        }:
+            try:
+                output[output_key] = int(value or 0)
+            except (TypeError, ValueError):
+                output[output_key] = 0
+        else:
+            output[output_key] = value
+    return output
+
+
+def _future_fixture_sync_is_fresh(
+    metadata: dict[str, Any],
+    *,
+    expected_start: str,
+    expected_end: str,
+) -> bool:
+    value = metadata.get("last_attempt_at")
+    if not isinstance(value, str) or not value:
+        return False
+
+    try:
+        last_attempt = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+    except ValueError:
+        return False
+
+    if last_attempt.tzinfo is None:
+        return False
+
+    same_window = (
+        metadata.get("window_start") == expected_start
+        and metadata.get("window_end") == expected_end
+    )
+    age = (
+        datetime.now(timezone.utc)
+        - last_attempt.astimezone(timezone.utc)
+    )
+    return bool(
+        same_window
+        and age.total_seconds()
+        < FUTURE_FIXTURE_SYNC_MIN_INTERVAL_SECONDS
+    )
+
+
+def sync_future_fixtures(
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """
+    Import tomorrow through the next seven display-local calendar dates.
+
+    Exactly one API-Football /fixtures request is made per date. A persisted
+    attempt timestamp protects the daily request allowance across restarts.
+    """
+    if not DATABASE_URL or psycopg is None:
+        return {
+            "status": "error",
+            "synced": False,
+            "message": "Database is unavailable.",
+        }
+
+    dates = _future_fixture_dates()
+    window_start = dates[0].isoformat()
+    window_end = dates[-1].isoformat()
+
+    metadata = _future_fixture_sync_metadata()
+    if (
+        not force
+        and _future_fixture_sync_is_fresh(
+            metadata,
+            expected_start=window_start,
+            expected_end=window_end,
+        )
+    ):
+        return {
+            "status": "ok",
+            "synced": False,
+            "skipped": True,
+            "reason": (
+                "A recent rolling future-fixture attempt already exists."
+            ),
+            "display_timezone": SOCCER_DISPLAY_TIMEZONE,
+            "window_start": window_start,
+            "window_end": window_end,
+            **metadata,
+        }
+
+    provider_call_count = 0
+    total_received = 0
+    invalid_count = 0
+    normalised_rows: list[dict[str, Any]] = []
+    daily_results: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    for fixture_date in dates:
+        provider_call_count += 1
+        try:
+            payload = _api_football_get(
+                "/fixtures",
+                params={
+                    "date": fixture_date.isoformat(),
+                    "timezone": SOCCER_DISPLAY_TIMEZONE,
+                },
+            )
+        except Exception as exc:
+            error = {
+                "date": fixture_date.isoformat(),
+                "status": "error",
+                "error_type": type(exc).__name__,
+            }
+            errors.append(error)
+            daily_results.append(error)
+            continue
+
+        response_rows = payload.get("response")
+        if not isinstance(response_rows, list):
+            response_rows = []
+
+        received_for_date = len(response_rows)
+        total_received += received_for_date
+        valid_for_date = 0
+        invalid_for_date = 0
+
+        for item in response_rows:
+            try:
+                row = _normalise_api_fixture(item)
+            except Exception:
+                row = None
+
+            if row is None:
+                invalid_count += 1
+                invalid_for_date += 1
+            else:
+                normalised_rows.append(row)
+                valid_for_date += 1
+
+        daily_results.append(
+            {
+                "date": fixture_date.isoformat(),
+                "status": "ok",
+                "received": received_for_date,
+                "normalised": valid_for_date,
+                "invalid": invalid_for_date,
+                "provider_results_reported": payload.get("results"),
+            }
+        )
+
+    upserted = 0
+    attempt_at = datetime.now(timezone.utc)
+    overall_status = "ok" if not errors else "partial"
+
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                for row in normalised_rows:
+                    _upsert_normalised_fixture(cursor, row)
+                    upserted += 1
+
+                metadata_values = {
+                    "future_fixtures_last_attempt_at": (
+                        attempt_at.isoformat()
+                    ),
+                    "future_fixtures_last_status": overall_status,
+                    "future_fixtures_window_start": window_start,
+                    "future_fixtures_window_end": window_end,
+                    "future_fixtures_last_provider_calls": str(
+                        provider_call_count
+                    ),
+                    "future_fixtures_last_received": str(total_received),
+                    "future_fixtures_last_upserted": str(upserted),
+                    "future_fixtures_last_invalid": str(invalid_count),
+                    "future_fixtures_last_error_count": str(len(errors)),
+                    "future_fixtures_display_timezone": (
+                        SOCCER_DISPLAY_TIMEZONE
+                    ),
+                }
+                for key, value in metadata_values.items():
+                    cursor.execute(
+                        """
+                        INSERT INTO app_metadata (key, value)
+                        VALUES (%s, %s)
+                        ON CONFLICT (key) DO UPDATE SET
+                            value = EXCLUDED.value,
+                            updated_at = NOW()
+                        """,
+                        (key, value),
+                    )
+            connection.commit()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "synced": False,
+            "provider_call_count": provider_call_count,
+            "error_type": type(exc).__name__,
+            "message": (
+                "Future fixtures were fetched but could not be stored."
+            ),
+        }
+
+    return {
+        "status": overall_status,
+        "synced": True,
+        "skipped": False,
+        "provider": "API-Football",
+        "provider_endpoint": "/fixtures",
+        "display_timezone": SOCCER_DISPLAY_TIMEZONE,
+        "window_start": window_start,
+        "window_end": window_end,
+        "days_requested": len(dates),
+        "provider_call_count": provider_call_count,
+        "received": total_received,
+        "upserted": upserted,
+        "invalid_skipped": invalid_count,
+        "error_count": len(errors),
+        "daily_results": daily_results,
+        "attempted_at": attempt_at.isoformat(),
+        "astrology_action_allowed": False,
     }
 
 
@@ -21809,12 +22303,12 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB8B expose complete market temporal audit",
+        "database_checkpoint": "DB9 rolling seven-day future fixtures",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
         "api_football_checkpoint": (
-            "DB4 imports today's fixtures with a persisted cooldown"
+            "DB9 imports today plus a persisted rolling future window"
         ),
         "api_football_health_cache_seconds": (
             API_FOOTBALL_HEALTH_CACHE_SECONDS
@@ -21828,8 +22322,31 @@ def health() -> dict[str, Any]:
             FIXTURE_TIMEZONE_MIGRATION_STATUS
         ),
         "fixture_import_checkpoint": (
-            "today imported; default listing now shows upcoming only"
+            "today plus tomorrow-through-seven-days imported"
         ),
+        "future_fixture_sync_checkpoint": {
+            "enabled": FUTURE_FIXTURE_SYNC_AUTO_RUN,
+            "days": FUTURE_FIXTURE_SYNC_DAYS,
+            "start_offset_days": 1,
+            "maximum_provider_calls_per_attempt": (
+                FUTURE_FIXTURE_SYNC_DAYS
+            ),
+            "minimum_sync_interval_seconds": (
+                FUTURE_FIXTURE_SYNC_MIN_INTERVAL_SECONDS
+            ),
+            "provider_endpoint": "/fixtures",
+            "one_call_per_local_date": True,
+            "astrology_action_allowed": False,
+        },
+        "future_fixture_sync_startup_status": (
+            FUTURE_FIXTURE_SYNC_STARTUP_STATUS
+        ),
+        "fixture_sync_location_safety": {
+            "reviewed_location_preserved_when_venue_unchanged": True,
+            "missing_upstream_venue_does_not_erase_reviewed_location": True,
+            "material_venue_or_city_change_invalidates_location": True,
+            "provider_display_timezone_never_trusted_as_venue_timezone": True,
+        },
         "locationiq_key_configured": bool(LOCATIONIQ_KEY),
         "timezonefinder_available": timezone_at is not None,
         "location_checkpoint": (
@@ -21945,7 +22462,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + market temporal audit DB8B",
+        "response_mode": "prediction-grade compact v2 + rolling fixtures DB9",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -22189,6 +22706,39 @@ def fixtures_sync_status() -> dict[str, Any]:
         "timezone_migration_status": FIXTURE_TIMEZONE_MIGRATION_STATUS,
         "metadata": metadata,
     }
+
+
+@app.get("/future-fixtures-sync-status")
+def future_fixtures_sync_status() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "proxy_version": PROXY_VERSION,
+        "display_timezone": SOCCER_DISPLAY_TIMEZONE,
+        "days": FUTURE_FIXTURE_SYNC_DAYS,
+        "minimum_sync_interval_seconds": (
+            FUTURE_FIXTURE_SYNC_MIN_INTERVAL_SECONDS
+        ),
+        "startup_status": FUTURE_FIXTURE_SYNC_STARTUP_STATUS,
+        "metadata": _future_fixture_sync_metadata(),
+        "astrology_action_allowed": False,
+    }
+
+
+@app.post("/fixtures/sync-future")
+def fixtures_sync_future(
+    x_proxy_key: str | None = Header(
+        default=None,
+        alias="x-proxy-key",
+    ),
+) -> dict[str, Any]:
+    """
+    Protected rolling future sync. The persisted cooldown still applies.
+    """
+    verify_proxy_key(x_proxy_key)
+    result = sync_future_fixtures(force=False)
+    if result.get("status") not in {"ok", "partial"}:
+        raise HTTPException(status_code=503, detail=result)
+    return result
 
 
 @app.post("/fixtures/sync-today")
