@@ -47,7 +47,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db7"
+PROXY_VERSION = "1.20.0-db7a"
 
 
 # ============================================================
@@ -18338,6 +18338,139 @@ def list_stored_fixtures(
     }
 
 
+def get_stored_fixture_by_id(
+    fixture_id: int,
+) -> dict[str, Any]:
+    """
+    Return one stored fixture without list-window truncation.
+    """
+    if not DATABASE_URL or psycopg is None:
+        return {
+            "status": "error",
+            "ready": False,
+            "message": "Database is unavailable.",
+        }
+
+    try:
+        with psycopg.connect(
+            DATABASE_URL,
+            connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+            autocommit=True,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        provider_fixture_id,
+                        competition_name,
+                        competition_country,
+                        season,
+                        home_team,
+                        away_team,
+                        kickoff_utc,
+                        venue_name,
+                        venue_city,
+                        timezone_name,
+                        fixture_status,
+                        latitude,
+                        longitude,
+                        location_source,
+                        location_confidence,
+                        location_verified_at
+                    FROM fixtures
+                    WHERE id = %s
+                      AND sport = 'soccer'
+                    LIMIT 1
+                    """,
+                    (fixture_id,),
+                )
+                row = cursor.fetchone()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "ready": False,
+            "error_type": type(exc).__name__,
+            "message": "Stored fixture could not be read.",
+        }
+
+    if row is None:
+        return {
+            "status": "not_found",
+            "ready": True,
+            "database_fixture_id": fixture_id,
+            "message": "No stored soccer fixture has this database ID.",
+        }
+
+    kickoff_utc = row[7]
+    tz = _display_timezone()
+    kickoff_local = (
+        kickoff_utc.astimezone(tz)
+        if isinstance(kickoff_utc, datetime)
+        else None
+    )
+
+    blockers = [
+        blocker
+        for blocker, missing in (
+            ("venue_name_missing", row[8] is None),
+            ("venue_timezone_unverified", row[10] is None),
+            ("latitude_missing", row[12] is None),
+            ("longitude_missing", row[13] is None),
+            ("location_source_missing", row[14] is None),
+            ("location_verification_missing", row[16] is None),
+        )
+        if missing
+    ]
+
+    fixture = {
+        "database_fixture_id": row[0],
+        "provider_fixture_id": row[1],
+        "competition": row[2],
+        "country": row[3],
+        "season": row[4],
+        "home_team": row[5],
+        "away_team": row[6],
+        "kickoff_utc": (
+            kickoff_utc.isoformat()
+            if isinstance(kickoff_utc, datetime)
+            else str(kickoff_utc)
+        ),
+        "kickoff_local": (
+            kickoff_local.isoformat()
+            if kickoff_local is not None
+            else None
+        ),
+        "venue_name": row[8],
+        "venue_city": row[9],
+        "venue_timezone": row[10],
+        "venue_timezone_verified": row[10] is not None,
+        "fixture_status": row[11],
+        "latitude": row[12],
+        "longitude": row[13],
+        "location_source": row[14],
+        "location_confidence": (
+            float(row[15]) if row[15] is not None else None
+        ),
+        "location_verified_at": (
+            row[16].isoformat()
+            if isinstance(row[16], datetime)
+            else None
+        ),
+        "venue_coordinates_available": (
+            row[12] is not None and row[13] is not None
+        ),
+        "prediction_ready": len(blockers) == 0,
+        "prediction_blockers": blockers,
+    }
+
+    return {
+        "status": "ok",
+        "ready": True,
+        "fixture": fixture,
+    }
+
+
 # ============================================================
 # LOCATIONIQ + TIMEZONE CONNECTIVITY — CHECKPOINT DB5
 # ============================================================
@@ -20524,7 +20657,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB7 commit one independently reviewed venue",
+        "database_checkpoint": "DB7A exact fixture detail endpoint",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -20608,6 +20741,11 @@ def health() -> dict[str, Any]:
             "maximum_reference_separation_meters": 100.0,
             "provenance_required_for_prediction_ready": True,
         },
+        "fixture_detail_endpoint": {
+            "enabled": True,
+            "path_template": "/fixtures/{database_fixture_id}",
+            "avoids_list_limit_truncation": True,
+        },
         "locationiq_public_attribution_required": True,
         "ayanamsa": "Lahiri",
         "engine": "VedAstro.Python",
@@ -20615,7 +20753,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + reviewed location commit DB7",
+        "response_mode": "prediction-grade compact v2 + fixture detail DB7A",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -20785,6 +20923,21 @@ def fixture_location_preview(
     verify_proxy_key(x_proxy_key)
     result = preview_fixture_location(fixture_id=fixture_id)
     if result.get("status") not in {"ok", "no_candidate", "no_match"}:
+        raise HTTPException(status_code=503, detail=result)
+    return result
+
+
+@app.get("/fixtures/{fixture_id}")
+def fixture_detail(
+    fixture_id: int,
+) -> dict[str, Any]:
+    """
+    Retrieve one stored fixture by its database ID.
+    """
+    result = get_stored_fixture_by_id(fixture_id)
+    if result.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail=result)
+    if not result.get("ready"):
         raise HTTPException(status_code=503, detail=result)
     return result
 
