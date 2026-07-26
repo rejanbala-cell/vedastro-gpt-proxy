@@ -47,7 +47,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db6a"
+PROXY_VERSION = "1.20.0-db6b"
 
 
 # ============================================================
@@ -122,6 +122,9 @@ LOCATION_PREVIEW_LOOKAHEAD_DAYS = int(
 )
 LOCATION_PREVIEW_AUTO_APPROVE_SCORE = float(
     os.getenv("LOCATION_PREVIEW_AUTO_APPROVE_SCORE", "85")
+)
+LOCATION_PREVIEW_QUEUE_SCAN_LIMIT = int(
+    os.getenv("LOCATION_PREVIEW_QUEUE_SCAN_LIMIT", "100")
 )
 
 DATABASE_EXPECTED_TABLES = (
@@ -18604,9 +18607,73 @@ def _fixture_location_query(fixture: dict[str, Any]) -> str:
     return ", ".join(str(part).strip() for part in parts if part)
 
 
+SPORTS_VENUE_HINTS = {
+    "stadium", "stadion", "stadio", "stade", "estadio", "arena",
+    "oval", "ground", "park", "sport", "sports", "football",
+    "futbol", "fútbol", "soccer", "pitch", "campo", "cancha",
+    "centre", "center", "complex", "kompleks",
+}
+
+
+def _fixture_row_to_location_dict(row: Any) -> dict[str, Any]:
+    return {
+        "database_fixture_id": int(row[0]),
+        "provider_fixture_id": row[1],
+        "competition": row[2],
+        "competition_country": row[3],
+        "home_team": row[4],
+        "away_team": row[5],
+        "kickoff_utc": (
+            row[6].isoformat()
+            if isinstance(row[6], datetime)
+            else str(row[6])
+        ),
+        "venue_name": row[7],
+        "venue_city": row[8],
+        "latitude": row[9],
+        "longitude": row[10],
+        "venue_timezone": row[11],
+        "fixture_status": row[12],
+    }
+
+
+def _location_query_hash(query_text: str) -> str:
+    return hashlib.sha256(
+        _normalise_lookup_text(query_text).encode("utf-8")
+    ).hexdigest()
+
+
+def _fixture_location_priority(
+    fixture: dict[str, Any],
+) -> tuple[int, int, str]:
+    """
+    Prefer explicit sports-venue names, then richer names, then kickoff order.
+
+    This affects only which venue is previewed next. It never approves a
+    candidate and never writes coordinates.
+    """
+    venue_name = _normalise_lookup_text(fixture.get("venue_name"))
+    venue_tokens = set(venue_name.split())
+    sports_hint_count = len(venue_tokens.intersection(SPORTS_VENUE_HINTS))
+    significant_count = len(_significant_tokens(venue_name))
+    kickoff = str(fixture.get("kickoff_utc") or "")
+    return (-sports_hint_count, -significant_count, kickoff)
+
+
 def _load_fixture_for_location_preview(
     fixture_id: int | None = None,
 ) -> dict[str, Any] | None:
+    """
+    Load a fixture for geocoding preview.
+
+    Explicit fixture_id:
+      Return that fixture, even if its query was already cached.
+
+    Automatic selection:
+      Scan upcoming candidates, skip every query already present in
+      venue_geocodes (PREVIEW, AUTO_APPROVED, REJECTED or MANUALLY_APPROVED),
+      and return the highest-priority unseen venue.
+    """
     if not DATABASE_URL or psycopg is None:
         return None
 
@@ -18629,53 +18696,79 @@ def _load_fixture_for_location_preview(
                     """,
                     (fixture_id,),
                 )
-            else:
-                cursor.execute(
-                    """
-                    SELECT
-                        id, provider_fixture_id, competition_name,
-                        competition_country, home_team, away_team,
-                        kickoff_utc, venue_name, venue_city,
-                        latitude, longitude, timezone_name, fixture_status
-                    FROM fixtures
-                    WHERE sport = 'soccer'
-                      AND fixture_status = 'scheduled'
-                      AND kickoff_utc >= NOW()
-                      AND kickoff_utc < NOW() + (%s * INTERVAL '1 day')
-                      AND venue_name IS NOT NULL
-                      AND venue_city IS NOT NULL
-                      AND competition_country IS NOT NULL
-                      AND latitude IS NULL
-                      AND longitude IS NULL
-                    ORDER BY kickoff_utc, id
-                    LIMIT 1
-                    """,
-                    (LOCATION_PREVIEW_LOOKAHEAD_DAYS,),
+                row = cursor.fetchone()
+                return (
+                    _fixture_row_to_location_dict(row)
+                    if row
+                    else None
                 )
-            row = cursor.fetchone()
 
-    if not row:
+            cursor.execute(
+                """
+                SELECT
+                    id, provider_fixture_id, competition_name,
+                    competition_country, home_team, away_team,
+                    kickoff_utc, venue_name, venue_city,
+                    latitude, longitude, timezone_name, fixture_status
+                FROM fixtures
+                WHERE sport = 'soccer'
+                  AND fixture_status = 'scheduled'
+                  AND kickoff_utc >= NOW()
+                  AND kickoff_utc < NOW() + (%s * INTERVAL '1 day')
+                  AND venue_name IS NOT NULL
+                  AND venue_city IS NOT NULL
+                  AND competition_country IS NOT NULL
+                  AND latitude IS NULL
+                  AND longitude IS NULL
+                ORDER BY kickoff_utc, id
+                LIMIT %s
+                """,
+                (
+                    LOCATION_PREVIEW_LOOKAHEAD_DAYS,
+                    LOCATION_PREVIEW_QUEUE_SCAN_LIMIT,
+                ),
+            )
+            rows = cursor.fetchall()
+
+            fixtures = [
+                _fixture_row_to_location_dict(row)
+                for row in rows
+            ]
+            if not fixtures:
+                return None
+
+            query_hashes = {
+                _location_query_hash(_fixture_location_query(fixture))
+                for fixture in fixtures
+            }
+
+            cursor.execute(
+                """
+                SELECT query_hash
+                FROM venue_geocodes
+                WHERE query_hash = ANY(%s)
+                """,
+                (list(query_hashes),),
+            )
+            cached_hashes = {str(row[0]) for row in cursor.fetchall()}
+
+    unseen = [
+        fixture
+        for fixture in fixtures
+        if _location_query_hash(
+            _fixture_location_query(fixture)
+        ) not in cached_hashes
+    ]
+
+    if not unseen:
         return None
 
-    return {
-        "database_fixture_id": int(row[0]),
-        "provider_fixture_id": row[1],
-        "competition": row[2],
-        "competition_country": row[3],
-        "home_team": row[4],
-        "away_team": row[5],
-        "kickoff_utc": (
-            row[6].isoformat()
-            if isinstance(row[6], datetime)
-            else str(row[6])
-        ),
-        "venue_name": row[7],
-        "venue_city": row[8],
-        "latitude": row[9],
-        "longitude": row[10],
-        "venue_timezone": row[11],
-        "fixture_status": row[12],
-    }
+    unseen.sort(key=_fixture_location_priority)
+    selected = dict(unseen[0])
+    selected["automatic_queue_selection"] = True
+    selected["cached_queries_skipped"] = len(fixtures) - len(unseen)
+    selected["queue_candidates_scanned"] = len(fixtures)
+    return selected
 
 
 def downgrade_unsafe_geocode_approvals_once() -> dict[str, Any]:
@@ -18874,15 +18967,13 @@ def preview_fixture_location(
             "status": "no_candidate",
             "previewed": False,
             "message": (
-                "No suitable stored fixture with venue, city and country "
-                "was found."
+                "No unseen suitable fixture with venue, city and country "
+                "was found in the preview queue."
             ),
         }
 
     query_text = _fixture_location_query(fixture)
-    query_hash = hashlib.sha256(
-        _normalise_lookup_text(query_text).encode("utf-8")
-    ).hexdigest()
+    query_hash = _location_query_hash(query_text)
 
     cached = _cached_geocode_preview(query_hash)
     if cached is not None:
@@ -19155,7 +19246,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB6A strict geocode auto-approval safety",
+        "database_checkpoint": "DB6B skip rejected/cached venues and preview next",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -19199,6 +19290,12 @@ def health() -> dict[str, Any]:
             "minimum_venue_token_overlap": 0.50,
             "timezone_required": True,
         },
+        "location_preview_queue_policy": {
+            "scan_limit": LOCATION_PREVIEW_QUEUE_SCAN_LIMIT,
+            "skip_all_cached_query_statuses": True,
+            "prefer_sports_venue_names": True,
+            "coordinates_committed": False,
+        },
         "locationiq_public_attribution_required": True,
         "ayanamsa": "Lahiri",
         "engine": "VedAstro.Python",
@@ -19206,7 +19303,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + geocode safety DB6A",
+        "response_mode": "prediction-grade compact v2 + geocode queue DB6B",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -19318,6 +19415,11 @@ def location_preview_status() -> dict[str, Any]:
             "minimum_score": LOCATION_PREVIEW_AUTO_APPROVE_SCORE,
             "sports_place_match_required": True,
             "minimum_venue_token_overlap": 0.50,
+        },
+        "queue_policy": {
+            "scan_limit": LOCATION_PREVIEW_QUEUE_SCAN_LIMIT,
+            "skip_cached_queries": True,
+            "prefer_sports_venue_names": True,
         },
         "startup_status": LOCATION_PREVIEW_STARTUP_STATUS,
     }
