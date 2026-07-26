@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import threading
 import time
@@ -24,6 +25,11 @@ try:
 except ImportError:
     psycopg = None
 
+try:
+    from timezonefinder import timezone_at
+except ImportError:
+    timezone_at = None
+
 import requests
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -41,7 +47,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db4a"
+PROXY_VERSION = "1.20.0-db5"
 
 
 # ============================================================
@@ -88,6 +94,22 @@ FIXTURE_LIST_DEFAULT_LIMIT = int(
 FIXTURE_LIST_MAX_LIMIT = int(
     os.getenv("FIXTURE_LIST_MAX_LIMIT", "500")
 )
+
+LOCATIONIQ_KEY = os.getenv("LOCATIONIQ_KEY", "").strip()
+LOCATIONIQ_BASE_URL = os.getenv(
+    "LOCATIONIQ_BASE_URL",
+    "https://us1.locationiq.com/v1",
+).rstrip("/")
+LOCATIONIQ_TIMEOUT_SECONDS = int(
+    os.getenv("LOCATIONIQ_TIMEOUT_SECONDS", "12")
+)
+LOCATIONIQ_HEALTH_CACHE_SECONDS = int(
+    os.getenv("LOCATIONIQ_HEALTH_CACHE_SECONDS", "86400")
+)
+LOCATIONIQ_HEALTH_TEST_QUERY = os.getenv(
+    "LOCATIONIQ_HEALTH_TEST_QUERY",
+    "Sydney Opera House, Sydney, Australia",
+).strip()
 
 DATABASE_EXPECTED_TABLES = (
     "app_metadata",
@@ -18087,6 +18109,205 @@ def list_stored_fixtures(
 
 
 # ============================================================
+# LOCATIONIQ + TIMEZONE CONNECTIVITY — CHECKPOINT DB5
+# ============================================================
+
+_LOCATIONIQ_HEALTH_CACHE: dict[str, Any] = {
+    "checked_at_monotonic": 0.0,
+    "result": None,
+}
+_LOCATIONIQ_HEALTH_LOCK = threading.Lock()
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _safe_locationiq_candidate(candidate: Any) -> dict[str, Any] | None:
+    if not isinstance(candidate, dict):
+        return None
+
+    latitude = _safe_float(candidate.get("lat"))
+    longitude = _safe_float(candidate.get("lon"))
+
+    if latitude is None or longitude is None:
+        return None
+    if not (-90.0 <= latitude <= 90.0):
+        return None
+    if not (-180.0 <= longitude <= 180.0):
+        return None
+
+    derived_timezone = None
+    if timezone_at is not None:
+        try:
+            derived_timezone = timezone_at(
+                lng=longitude,
+                lat=latitude,
+            )
+        except Exception:
+            derived_timezone = None
+
+    return {
+        "display_name": candidate.get("display_name"),
+        "latitude": latitude,
+        "longitude": longitude,
+        "place_type": candidate.get("type"),
+        "category": candidate.get("class"),
+        "importance": _safe_float(candidate.get("importance")),
+        "derived_timezone": derived_timezone,
+        "timezone_lookup_successful": bool(derived_timezone),
+    }
+
+
+def locationiq_connection_status(
+    *,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """
+    Verify LocationIQ with one known forward-geocoding request.
+
+    The access token is never returned. The result is cached for 24 hours by
+    default to avoid unnecessary use of the provider allowance.
+    """
+    if not LOCATIONIQ_KEY:
+        return {
+            "status": "not_configured",
+            "connected": False,
+            "proxy_version": PROXY_VERSION,
+            "message": "LOCATIONIQ_KEY is not configured.",
+        }
+
+    if timezone_at is None:
+        return {
+            "status": "timezone_driver_missing",
+            "connected": False,
+            "proxy_version": PROXY_VERSION,
+            "message": (
+                "timezonefinder is unavailable. Add "
+                "timezonefinder>=8.2,<9 to requirements.txt."
+            ),
+        }
+
+    now = time.monotonic()
+
+    with _LOCATIONIQ_HEALTH_LOCK:
+        cached_result = _LOCATIONIQ_HEALTH_CACHE.get("result")
+        checked_at = float(
+            _LOCATIONIQ_HEALTH_CACHE.get("checked_at_monotonic") or 0.0
+        )
+        cache_is_fresh = (
+            cached_result is not None
+            and now - checked_at < LOCATIONIQ_HEALTH_CACHE_SECONDS
+        )
+
+        if cache_is_fresh and not force_refresh:
+            result = dict(cached_result)
+            result["cached"] = True
+            result["cache_seconds"] = LOCATIONIQ_HEALTH_CACHE_SECONDS
+            return result
+
+        try:
+            response = requests.get(
+                f"{LOCATIONIQ_BASE_URL}/search",
+                params={
+                    "key": LOCATIONIQ_KEY,
+                    "q": LOCATIONIQ_HEALTH_TEST_QUERY,
+                    "format": "json",
+                    "addressdetails": 1,
+                    "limit": 1,
+                },
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": (
+                        f"VedAstro-GPT-Proxy/{PROXY_VERSION}"
+                    ),
+                },
+                timeout=LOCATIONIQ_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as exc:
+            result = {
+                "status": "error",
+                "connected": False,
+                "proxy_version": PROXY_VERSION,
+                "error_type": type(exc).__name__,
+                "message": "Could not reach LocationIQ.",
+            }
+        else:
+            if response.status_code != 200:
+                result = {
+                    "status": "error",
+                    "connected": False,
+                    "proxy_version": PROXY_VERSION,
+                    "http_status": response.status_code,
+                    "message": "LocationIQ returned a non-200 response.",
+                }
+            else:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    result = {
+                        "status": "error",
+                        "connected": False,
+                        "proxy_version": PROXY_VERSION,
+                        "message": "LocationIQ returned invalid JSON.",
+                    }
+                else:
+                    candidate = (
+                        payload[0]
+                        if isinstance(payload, list) and payload
+                        else None
+                    )
+                    safe_candidate = _safe_locationiq_candidate(candidate)
+
+                    if safe_candidate is None:
+                        result = {
+                            "status": "error",
+                            "connected": False,
+                            "proxy_version": PROXY_VERSION,
+                            "message": (
+                                "LocationIQ returned no usable coordinates."
+                            ),
+                        }
+                    elif not safe_candidate[
+                        "timezone_lookup_successful"
+                    ]:
+                        result = {
+                            "status": "error",
+                            "connected": False,
+                            "proxy_version": PROXY_VERSION,
+                            "message": (
+                                "Coordinates were returned, but the offline "
+                                "timezone lookup failed."
+                            ),
+                            "test_result": safe_candidate,
+                        }
+                    else:
+                        result = {
+                            "status": "ok",
+                            "connected": True,
+                            "proxy_version": PROXY_VERSION,
+                            "provider": "LocationIQ",
+                            "endpoint_tested": "/search",
+                            "test_query": LOCATIONIQ_HEALTH_TEST_QUERY,
+                            "test_result": safe_candidate,
+                            "attribution_required_for_public_website": True,
+                            "attribution_text": (
+                                "Search by LocationIQ.com"
+                            ),
+                        }
+
+        result["cached"] = False
+        result["cache_seconds"] = LOCATIONIQ_HEALTH_CACHE_SECONDS
+        _LOCATIONIQ_HEALTH_CACHE["checked_at_monotonic"] = now
+        _LOCATIONIQ_HEALTH_CACHE["result"] = dict(result)
+        return result
+
+
+# ============================================================
 # AUTHENTICATION
 # ============================================================
 
@@ -18122,7 +18343,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB4A upcoming-only listing and timezone semantics fix",
+        "database_checkpoint": "DB5 LocationIQ and offline-timezone connectivity",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -18143,13 +18364,22 @@ def health() -> dict[str, Any]:
         "fixture_import_checkpoint": (
             "today imported; default listing now shows upcoming only"
         ),
+        "locationiq_key_configured": bool(LOCATIONIQ_KEY),
+        "timezonefinder_available": timezone_at is not None,
+        "location_checkpoint": (
+            "DB5 connectivity only; fixture coordinates are not enriched yet"
+        ),
+        "location_health_cache_seconds": (
+            LOCATIONIQ_HEALTH_CACHE_SECONDS
+        ),
+        "locationiq_public_attribution_required": True,
         "ayanamsa": "Lahiri",
         "engine": "VedAstro.Python",
         "planet_parameter_shape": "nested PlanetName object",
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + fixture correction DB4A",
+        "response_mode": "prediction-grade compact v2 + location checkpoint DB5",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -18229,6 +18459,17 @@ def football_health() -> dict[str, Any]:
     consuming a limited daily provider allowance.
     """
     result = api_football_connection_status()
+    if not result.get("connected"):
+        raise HTTPException(status_code=503, detail=result)
+    return result
+
+
+@app.get("/location-health")
+def location_health() -> dict[str, Any]:
+    """
+    Public, cached and non-secret LocationIQ/timezone connectivity check.
+    """
+    result = locationiq_connection_status()
     if not result.get("connected"):
         raise HTTPException(status_code=503, detail=result)
     return result
