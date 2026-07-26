@@ -18,6 +18,11 @@ try:
 except ImportError:
     swe = None
 
+try:
+    import psycopg
+except ImportError:
+    psycopg = None
+
 import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -35,7 +40,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.19.0"
+PROXY_VERSION = "1.20.0-db1"
 
 
 # ============================================================
@@ -44,6 +49,13 @@ PROXY_VERSION = "1.19.0"
 
 VEDASTRO_API_KEY = os.getenv("VEDASTRO_API_KEY", "").strip()
 PROXY_API_KEY = os.getenv("PROXY_API_KEY", "").strip()
+
+# PostgreSQL is introduced in the 1.20.0 database checkpoint.
+# This checkpoint only verifies connectivity; it does not create tables yet.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_CONNECT_TIMEOUT_SECONDS = int(
+    os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "8")
+)
 
 # This is the MINIMUM delay between the START of upstream calls.
 # 0.20 = no more than about five new VedAstro calls started per second
@@ -16650,6 +16662,66 @@ def calculate_planet(
 
 
 # ============================================================
+# DATABASE CONNECTIVITY — CHECKPOINT DB1
+# ============================================================
+
+def database_connection_status() -> dict[str, Any]:
+    """
+    Verify that Render can reach PostgreSQL using DATABASE_URL.
+
+    This checkpoint deliberately performs only SELECT 1. It does not create,
+    update or delete database objects.
+    """
+    if not DATABASE_URL:
+        return {
+            "status": "not_configured",
+            "connected": False,
+            "proxy_version": PROXY_VERSION,
+            "message": "DATABASE_URL is not configured.",
+        }
+
+    if psycopg is None:
+        return {
+            "status": "driver_missing",
+            "connected": False,
+            "proxy_version": PROXY_VERSION,
+            "message": (
+                "The psycopg driver is unavailable. Add "
+                "psycopg[binary]>=3.2,<4 to requirements.txt."
+            ),
+        }
+
+    try:
+        with psycopg.connect(
+            DATABASE_URL,
+            connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+            autocommit=True,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT 1, current_setting('server_version')"
+                )
+                row = cursor.fetchone()
+
+        return {
+            "status": "ok",
+            "connected": bool(row and row[0] == 1),
+            "proxy_version": PROXY_VERSION,
+            "postgres_version": row[1] if row else None,
+            "operation": "SELECT 1 only",
+        }
+    except Exception as exc:
+        # Do not expose credentials, hostnames or the connection URL.
+        return {
+            "status": "error",
+            "connected": False,
+            "proxy_version": PROXY_VERSION,
+            "error_type": type(exc).__name__,
+            "message": "Database connection failed.",
+        }
+
+
+# ============================================================
 # AUTHENTICATION
 # ============================================================
 
@@ -16683,13 +16755,16 @@ def health() -> dict[str, Any]:
         "version": PROXY_VERSION,
         "vedastro_key_configured": bool(VEDASTRO_API_KEY),
         "proxy_key_configured": bool(PROXY_API_KEY),
+        "database_url_configured": bool(DATABASE_URL),
+        "database_driver_available": psycopg is not None,
+        "database_checkpoint": "DB1 connectivity only; no tables created",
         "ayanamsa": "Lahiri",
         "engine": "VedAstro.Python",
         "planet_parameter_shape": "nested PlanetName object",
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 correction patch",
+        "response_mode": "prediction-grade compact v2 + database checkpoint DB1",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -16734,6 +16809,19 @@ def health() -> dict[str, Any]:
         "maximum_attempts_per_method": VEDASTRO_MAX_RETRIES,
         "parallel_workers": VEDASTRO_MAX_WORKERS,
     }
+
+
+
+
+@app.get("/database-health")
+def database_health() -> dict[str, Any]:
+    """
+    Public, non-secret connectivity check for the setup process.
+    """
+    result = database_connection_status()
+    if not result.get("connected"):
+        raise HTTPException(status_code=503, detail=result)
+    return result
 
 
 # ============================================================
