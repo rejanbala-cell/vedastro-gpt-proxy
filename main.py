@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import threading
 import time
@@ -34,7 +35,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.18.0"
+PROXY_VERSION = "1.19.0"
 
 
 # ============================================================
@@ -448,7 +449,7 @@ SENSITIVE_CUSP_DETAILS = {
 
 # Gambler's Dharma Chapter 4 stolen-cusp method.
 #
-# PDF pages 108-114 in the uploaded complete PDF:
+# Printed book pages 93-99:
 # - power cusps: 1/7, 6/12 and 4/10
 # - neutral cusps: 3/9 and 5/11
 # - power-to-neutral weakens a planet's cusp effect
@@ -475,7 +476,7 @@ STOLEN_CUSP_AXIS_BY_POWER_HOUSE = {
     4: "10/4",
 }
 
-STOLEN_CUSP_PDF_PAGES = [108, 109, 110, 111, 112, 113, 114]
+STOLEN_CUSP_PDF_PAGES = [93, 94, 95, 96, 97, 98, 99]
 
 
 # Gambler's Dharma Chapter 5 exact Navamsha geometry.
@@ -643,10 +644,10 @@ TIER1_DIG_BALA_HOUSES = {
 }
 
 TIER1_PDF_PAGES = {
-    "victory_houses": [54, 55, 62, 63, 64, 65, 66, 173, 174, 175],
-    "sky_pky": [55, 56, 57, 59, 60, 61, 173],
-    "parivartana": [67, 68, 70],
-    "planetary_war": [67, 68, 70],
+    "victory_houses": [39, 40, 47, 48, 49, 50, 51, 158, 159, 160],
+    "sky_pky": [40, 41, 42, 44, 45, 46, 158],
+    "parivartana": [52, 53, 55],
+    "planetary_war": [52, 53, 55],
 }
 
 
@@ -658,6 +659,16 @@ TIER1_PDF_PAGES = {
 #   Tier 3 D9 cusp strength > Tier 2 rashi cusp/SKY/PKY >
 #   Tier 1 victory houses and D9 combinations.
 # Table 6.5 later values a Navamsha combination at 5 points.
+# Book point ranges are kept as intervals. They are never collapsed to
+# invented exact scores. Printed pages 158-159.
+BOOK_TIER_POINT_INTERVALS = {
+    1: [2.0, 4.0],
+    2: [7.0, 9.0],
+    3: [14.0, 18.0],
+}
+
+DECISION_SIDES = {"Favourite", "Underdog"}
+
 NAVAMSHA_INTERPRETATION_PDF_PAGES = {
     "principle": [108, 109],
     "cusp_method": [109, 112, 113, 114, 115, 116],
@@ -766,20 +777,20 @@ D9_INVISIBLE_CUSP_BODIES = {
 
 # Gambler's Dharma reliability and sandhi audit.
 #
-# Printed PDF pages:
-# - 38: do not wager when planets are kutila/stationary
-# - 41-43: fixed, mixed and nonfixed karma; rule of three
-# - 47: understand major sandhis and avoid prediction
-# - 232-234: sunrise/sunset, eclipses, solar ingress and stationary planets
+# Printed book pages:
+# - 23: do not wager when planets are kutila/stationary
+# - 26-28: fixed, mixed and nonfixed karma; rule of three
+# - 32: understand major sandhis and avoid prediction
+# - 217-219: sunrise/sunset, eclipses, solar ingress and stationary planets
 RELIABILITY_AUDIT_PDF_PAGES = [
-    38,
-    41,
-    42,
-    43,
-    47,
-    232,
-    233,
-    234,
+    23,
+    26,
+    27,
+    28,
+    32,
+    217,
+    218,
+    219,
 ]
 
 RELIABILITY_SWISS_BODY_IDS = {
@@ -1006,16 +1017,16 @@ NAMA_PADA_TABLE = {
 }
 
 NAMA_PADA_PDF_PAGES = {
-    "chapter_opening": 182,
-    "table_7_1": 184,
-    "main_house10_rule": 185,
-    "third_tier_points_example": 187,
-    "planet_resonance": 189,
-    "sun_research_rule": 190,
-    "compound_name_rule": 191,
-    "diphthong_rule": 192,
-    "nasal_guidance": 194,
-    "summary": 198,
+    "chapter_opening": 167,
+    "table_7_1": 169,
+    "main_house10_rule": 170,
+    "third_tier_points_example": 172,
+    "planet_resonance": 174,
+    "sun_research_rule": 175,
+    "compound_name_rule": 176,
+    "diphthong_rule": 177,
+    "nasal_guidance": 179,
+    "summary": 183,
 }
 
 # These substitutions are explicitly described by Chapter 7. They are used
@@ -6477,7 +6488,7 @@ def compact_tier1_combinations_layer(
 def compact_navamsha_interpretation_layer(
     layer: dict[str, Any],
 ) -> dict[str, Any]:
-    """Preserve every decision-bearing Chapter 5 result compactly."""
+    """Preserve decision-bearing Chapter 5 results and v1.19 audits."""
 
     concise_d9_contacts = []
 
@@ -6500,6 +6511,21 @@ def compact_navamsha_interpretation_layer(
                 effect.get("supports")
                 or contact.get("supports")
             ),
+            "decision_eligible": effect.get(
+                "decision_eligible"
+            ),
+            "research_only": effect.get(
+                "research_only"
+            ),
+            "automatic_decision_use": effect.get(
+                "automatic_decision_use"
+            ),
+            "decision_reason": effect.get(
+                "decision_reason"
+            ),
+            "orb_strength": effect.get(
+                "orb_strength"
+            ),
             "reliability": (
                 effect.get("reliability")
                 or contact.get("reliability")
@@ -6507,6 +6533,9 @@ def compact_navamsha_interpretation_layer(
             "book_point_range": (
                 effect.get("book_point_range")
                 or contact.get("book_point_range")
+            ),
+            "signed_interval": effect.get(
+                "signed_interval"
             ),
             "exact_points_applied": False,
         })
@@ -6522,9 +6551,11 @@ def compact_navamsha_interpretation_layer(
             "effective_cusp": contact.get(
                 "effective_cusp"
             ),
+            "axis": contact.get("axis"),
             "angular_distance": contact.get(
                 "angular_distance"
             ),
+            "orb_limit": contact.get("orb_limit"),
             "direction": (
                 effect.get("direction")
                 or contact.get("direction")
@@ -6533,6 +6564,27 @@ def compact_navamsha_interpretation_layer(
                 effect.get("supports")
                 or contact.get("supports")
             ),
+            "decision_eligible": effect.get(
+                "decision_eligible"
+            ),
+            "research_only": effect.get(
+                "research_only"
+            ),
+            "automatic_decision_use": effect.get(
+                "automatic_decision_use"
+            ),
+            "decision_reason": effect.get(
+                "decision_reason"
+            ),
+            "book_point_range": effect.get(
+                "book_point_range"
+            ),
+            "signed_interval": effect.get(
+                "signed_interval"
+            ),
+            "orb_strength": effect.get(
+                "orb_strength"
+            ),
             "stolen_type": (
                 effect.get("stolen_type")
                 or contact.get("stolen_type")
@@ -6540,6 +6592,15 @@ def compact_navamsha_interpretation_layer(
             "contact_strength": (
                 effect.get("contact_strength")
                 or contact.get("contact_strength")
+            ),
+            "node_axis_duplicate": effect.get(
+                "node_axis_duplicate"
+            ),
+            "node_axis_group": effect.get(
+                "node_axis_group"
+            ),
+            "duplicate_of": effect.get(
+                "duplicate_of"
             ),
         })
 
@@ -6556,8 +6617,13 @@ def compact_navamsha_interpretation_layer(
                 "supports",
                 "rule_grade",
                 "book_points",
+                "raw_signed_favourite_points",
                 "signed_favourite_points",
+                "points_candidate",
                 "points_applied",
+                "overlap_cluster_id",
+                "overlap_suppressed",
+                "suppressed_reason",
                 "manual_review_required",
                 "pdf_pages",
             )
@@ -6569,8 +6635,12 @@ def compact_navamsha_interpretation_layer(
 
     return compact_recursive({
         "status": layer.get("status"),
+        "method": layer.get("method"),
         "assignment": layer.get("assignment"),
         "tier_hierarchy": layer.get("tier_hierarchy"),
+        "decision_grade_policy": layer.get(
+            "decision_grade_policy"
+        ),
         "d9_cusp_contacts": concise_d9_contacts,
         "d9_cusp_summary": layer.get(
             "d9_cusp_summary"
@@ -6579,10 +6649,20 @@ def compact_navamsha_interpretation_layer(
             "status": combos.get("status"),
             "houses": combos.get("houses"),
             "combinations": concise_combos,
+            "raw_signed_favourite_total": combos.get(
+                "raw_signed_favourite_total"
+            ),
             "signed_favourite_total": combos.get(
                 "signed_favourite_total"
             ),
             "indication": combos.get("indication"),
+            "overlap_clusters": combos.get(
+                "overlap_clusters",
+                [],
+            ),
+            "overlapping_pair_policy": combos.get(
+                "overlapping_pair_policy"
+            ),
             "unavailable_planets": combos.get(
                 "unavailable_planets",
                 [],
@@ -6590,12 +6670,18 @@ def compact_navamsha_interpretation_layer(
             "error": combos.get("error"),
         },
         "d1_cusp_contacts": concise_d1_contacts,
+        "d1_cusp_summary": layer.get(
+            "d1_cusp_summary"
+        ),
         "d1_summary": layer.get("d1_summary"),
         "d9_summary": layer.get("d9_summary"),
         "d1_d9_relationship": layer.get(
             "d1_d9_relationship"
         ),
         "double_whammy": layer.get("double_whammy"),
+        "node_axis_deduplication": layer.get(
+            "node_axis_deduplication"
+        ),
         "signed_points": layer.get("signed_points"),
         "unavailable_d9_bodies": layer.get(
             "unavailable_d9_bodies",
@@ -6604,12 +6690,35 @@ def compact_navamsha_interpretation_layer(
         "optional_body_coverage_status": layer.get(
             "optional_body_coverage_status"
         ),
+        "research_or_undefined_d1_contacts": [
+            {
+                "body": item.get("body"),
+                "cusp": item.get("cusp"),
+                "reason": (
+                    (item.get("book_effect") or {}).get(
+                        "decision_reason"
+                    )
+                    or item.get("reason")
+                ),
+            }
+            for item in (
+                layer.get(
+                    "research_or_undefined_d1_contacts",
+                    [],
+                )
+                or []
+            )
+            if isinstance(item, dict)
+        ],
         "research_or_undefined_d9_contacts": [
             {
                 "body": item.get("body"),
                 "cusp": item.get("cusp"),
                 "reason": (
-                    (item.get("book_effect") or {}).get("note")
+                    (item.get("book_effect") or {}).get(
+                        "decision_reason"
+                    )
+                    or (item.get("book_effect") or {}).get("note")
                     or item.get("reason")
                 ),
             }
@@ -6626,7 +6735,7 @@ def compact_navamsha_interpretation_layer(
         "pdf_pages": layer.get("pdf_pages"),
         "points_applied": layer.get("points_applied"),
         "error": layer.get("error"),
-    }, list_limit=20, string_limit=160)
+    }, list_limit=24, string_limit=180)
 
 
 def compact_reliability_audit_layer(
@@ -6989,6 +7098,7 @@ def compact_reliability_audit_layer(
             key: item.get(key)
             for key in (
                 "source",
+                "family",
                 "tier",
                 "supports",
                 "value",
@@ -6996,6 +7106,8 @@ def compact_reliability_audit_layer(
                 "body",
                 "cusp",
                 "planets",
+                "independence_key",
+                "overlap_cluster_id",
             )
             if key in item
         })
@@ -7159,8 +7271,14 @@ def compact_reliability_audit_layer(
                 original_evidence_total
             ),
             "counts": karma.get("counts"),
+            "family_direction": karma.get(
+                "family_direction"
+            ),
             "rule_of_three_reached": karma.get(
                 "rule_of_three_reached"
+            ),
+            "rule_of_three_basis": karma.get(
+                "rule_of_three_basis"
             ),
             "automatic_karma_classification": None,
             "automatic_classification_allowed": False,
@@ -8553,6 +8671,11 @@ def action_compact_v2(
                 compacted.get("navamsha_interpretation", {})
             )
         ),
+        "chart_correlation": compact_recursive(
+            compacted.get("chart_correlation", {}),
+            list_limit=6,
+            string_limit=120,
+        ),
         "reliability_audit": compact_reliability_audit_layer(
             compacted.get("reliability_audit", {})
         ),
@@ -8576,7 +8699,7 @@ def action_compact_v2(
             "proxy_version": PROXY_VERSION,
             "standard_ayanamsa": "Lahiri",
             "kp_ayanamsa": "Krishnamurti",
-            "response_profile": "prediction-grade compact v2",
+            "response_profile": "prediction-grade compact v2; v1.19 aggregation",
         },
         "response_compaction": {
             "applied": True,
@@ -9554,6 +9677,12 @@ def final_action_response_ceiling(
             "tier_hierarchy": nav.get(
                 "tier_hierarchy"
             ),
+            "decision_grade_policy": nav.get(
+                "decision_grade_policy"
+            ),
+            "d1_cusp_summary": nav.get(
+                "d1_cusp_summary"
+            ),
             "d9_cusp_summary": nav.get(
                 "d9_cusp_summary"
             ),
@@ -9568,6 +9697,21 @@ def final_action_response_ceiling(
             "double_whammy": nav.get(
                 "double_whammy"
             ),
+            "node_axis_deduplication": nav.get(
+                "node_axis_deduplication"
+            ),
+            "research_or_undefined_d1_contact_count": len(
+                nav.get(
+                    "research_or_undefined_d1_contacts",
+                    [],
+                )
+            ),
+            "research_or_undefined_d9_contact_count": len(
+                nav.get(
+                    "research_or_undefined_d9_contacts",
+                    [],
+                )
+            ),
             "signed_points": nav.get(
                 "signed_points"
             ),
@@ -9576,6 +9720,9 @@ def final_action_response_ceiling(
             ),
             "error": nav.get("error"),
         },
+        "chart_correlation": payload.get(
+            "chart_correlation"
+        ),
         "reliability_audit": reliability,
         "nakshatra_taras": payload.get(
             "nakshatra_taras"
@@ -9602,10 +9749,259 @@ def final_action_response_ceiling(
         },
     }
 
-    return compact_recursive(
+    final_compacted = compact_recursive(
         compacted,
-        list_limit=4,
-        string_limit=60,
+        list_limit=2,
+        string_limit=50,
+    )
+
+    if (
+        len(json.dumps(
+            final_compacted,
+            ensure_ascii=False,
+            default=str,
+        ))
+        <= ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS
+    ):
+        return final_compacted
+
+    # Absolute decision kernel. This branch is intentionally small and keeps
+    # validation, hierarchy, reliability, de-duplication and correlation
+    # decisions while replacing repeated contact rows with counts.
+    nav = final_compacted.get(
+        "navamsha_interpretation",
+        {},
+    )
+    reliability = final_compacted.get(
+        "reliability_audit",
+        {},
+    )
+
+    kernel = {
+        "status": final_compacted.get("status"),
+        "strict_prediction_allowed": final_compacted.get(
+            "strict_prediction_allowed"
+        ),
+        "essential_failures": final_compacted.get(
+            "essential_failures",
+            [],
+        ),
+        "event": final_compacted.get("event"),
+        "core": final_compacted.get("core"),
+        "rashi_placidus": final_compacted.get(
+            "rashi_placidus"
+        ),
+        "tier1_combinations": final_compacted.get(
+            "tier1_combinations"
+        ),
+        "planet_cusp_contacts": {
+            "status": final_compacted.get(
+                "planet_cusp_contacts",
+                {},
+            ).get("status"),
+            "qualifying_contact_count": len(
+                final_compacted.get(
+                    "planet_cusp_contacts",
+                    {},
+                ).get("qualifying_contacts", [])
+            ),
+            "qualifying_contacts": final_compacted.get(
+                "planet_cusp_contacts",
+                {},
+            ).get("qualifying_contacts", [])[:1],
+        },
+        "navamsha_cusps": {
+            "status": final_compacted.get(
+                "navamsha_cusps",
+                {},
+            ).get("status"),
+            "lagna": final_compacted.get(
+                "navamsha_cusps",
+                {},
+            ).get("lagna"),
+            "seventh_cusp": final_compacted.get(
+                "navamsha_cusps",
+                {},
+            ).get("seventh_cusp"),
+            "axis_validation": final_compacted.get(
+                "navamsha_cusps",
+                {},
+            ).get("axis_validation"),
+            "qualifying_contacts": final_compacted.get(
+                "navamsha_cusps",
+                {},
+            ).get("qualifying_contacts", [])[:1],
+        },
+        "kp_sublords": final_compacted.get(
+            "kp_sublords"
+        ),
+        "outer_planets": {
+            "status": final_compacted.get(
+                "outer_planets",
+                {},
+            ).get("status"),
+            "qualifying_contacts": final_compacted.get(
+                "outer_planets",
+                {},
+            ).get("qualifying_contacts", [])[:1],
+            "unavailable_bodies": final_compacted.get(
+                "outer_planets",
+                {},
+            ).get("unavailable_bodies", []),
+        },
+        "special_points": {
+            "status": final_compacted.get(
+                "special_points",
+                {},
+            ).get("status"),
+            "qualifying_rashi_contacts": final_compacted.get(
+                "special_points",
+                {},
+            ).get("qualifying_rashi_contacts", [])[:1],
+            "qualifying_d9_contacts": final_compacted.get(
+                "special_points",
+                {},
+            ).get("qualifying_d9_contacts", [])[:1],
+            "unavailable_points": final_compacted.get(
+                "special_points",
+                {},
+            ).get("unavailable_points", []),
+        },
+        "stolen_cusps": {
+            "status": final_compacted.get(
+                "stolen_cusps",
+                {},
+            ).get("status"),
+            "audit_summary": final_compacted.get(
+                "stolen_cusps",
+                {},
+            ).get("audit_summary"),
+            "stolen_cusps": final_compacted.get(
+                "stolen_cusps",
+                {},
+            ).get("stolen_cusps", [])[:1],
+            "qualifying_contacts": final_compacted.get(
+                "stolen_cusps",
+                {},
+            ).get("qualifying_contacts", [])[:1],
+        },
+        "navamsha_interpretation": {
+            "status": nav.get("status"),
+            "assignment": nav.get("assignment"),
+            "tier_hierarchy": nav.get(
+                "tier_hierarchy"
+            ),
+            "decision_grade_policy": nav.get(
+                "decision_grade_policy"
+            ),
+            "d1_cusp_summary": nav.get(
+                "d1_cusp_summary"
+            ),
+            "d9_cusp_summary": nav.get(
+                "d9_cusp_summary"
+            ),
+            "navamsha_combinations": {
+                key: (
+                    nav.get(
+                        "navamsha_combinations",
+                        {},
+                    ).get(key)
+                )
+                for key in (
+                    "status",
+                    "raw_signed_favourite_total",
+                    "signed_favourite_total",
+                    "indication",
+                    "overlapping_pair_policy",
+                    "overlap_clusters",
+                )
+            },
+            "d1_summary": nav.get("d1_summary"),
+            "d9_summary": nav.get("d9_summary"),
+            "d1_d9_relationship": nav.get(
+                "d1_d9_relationship"
+            ),
+            "double_whammy": nav.get(
+                "double_whammy"
+            ),
+            "node_axis_deduplication": nav.get(
+                "node_axis_deduplication"
+            ),
+            "signed_points": nav.get(
+                "signed_points"
+            ),
+            "research_or_undefined_d1_contacts": nav.get(
+                "research_or_undefined_d1_contacts",
+                [],
+            )[:1],
+            "research_or_undefined_d9_contacts": nav.get(
+                "research_or_undefined_d9_contacts",
+                [],
+            )[:1],
+            "completeness": nav.get(
+                "completeness"
+            ),
+            "error": nav.get("error"),
+        },
+        "chart_correlation": final_compacted.get(
+            "chart_correlation"
+        ),
+        "reliability_audit": {
+            key: reliability.get(key)
+            for key in (
+                "status",
+                "policy_mode",
+                "strict_book_hard_veto",
+                "strict_book_prediction_allowed",
+                "strict_book_hard_veto_reasons",
+                "practical_hard_veto",
+                "practical_prediction_allowed",
+                "practical_hard_veto_reasons",
+                "hard_veto",
+                "strict_prediction_allowed_by_reliability",
+                "decision",
+                "confidence_cap",
+                "hard_veto_reasons",
+                "warning_reasons",
+                "stationary_kutila",
+                "eclipses",
+                "solar_sankranti",
+                "sunrise_sunset",
+                "karma_fixity",
+                "error",
+            )
+        },
+        "nakshatra_taras": final_compacted.get(
+            "nakshatra_taras"
+        ),
+        "navamsha_name_sounds": final_compacted.get(
+            "navamsha_name_sounds"
+        ),
+        "houses": final_compacted.get("houses"),
+        "planets": final_compacted.get("planets"),
+        "provenance": final_compacted.get(
+            "provenance"
+        ),
+        "response_compaction": {
+            "applied": True,
+            "profile": (
+                "action-compact-v2-absolute-decision-kernel"
+            ),
+            "final_ceiling_applied": True,
+            "full_calculation_performed": True,
+            "safety_target_characters": (
+                ACTION_RESPONSE_SAFETY_TARGET_CHARACTERS
+            ),
+            "payload_target_characters": (
+                ACTION_RESPONSE_PAYLOAD_TARGET_CHARACTERS
+            ),
+        },
+    }
+
+    return compact_recursive(
+        kernel,
+        list_limit=1,
+        string_limit=45,
     )
 
 
@@ -9664,6 +10060,11 @@ def compact_action_response(
                 response.get("navamsha_interpretation", {})
             )
         ),
+        "chart_correlation": compact_recursive(
+            response.get("chart_correlation", {}),
+            list_limit=8,
+            string_limit=160,
+        ),
         "reliability_audit": compact_reliability_audit_layer(
             response.get("reliability_audit", {})
         ),
@@ -9688,7 +10089,7 @@ def compact_action_response(
             "standard_ayanamsa": "Lahiri",
             "kp_ayanamsa": "Krishnamurti",
             "response_profile": (
-                "prediction-grade compact v2; calculations unchanged"
+                "prediction-grade compact v2; v1.19 decision-grade aggregation"
             ),
         },
         "response_compaction": {
@@ -11601,6 +12002,286 @@ def d9_house_for_longitude(
     )
 
 
+
+def contact_orb_strength(
+    angular_distance: Any,
+) -> str:
+    """
+    Classify only the exact book-stated cusp thresholds.
+
+    Printed pages 72-73:
+    - within 0°30' is extra-special
+    - under 1° is very strong
+    - otherwise the contact remains within the normal book orb
+
+    No invented outer-edge percentage or automatic point adjustment is used.
+    """
+
+    if not isinstance(angular_distance, (int, float)):
+        return "Unknown"
+
+    distance = abs(float(angular_distance))
+
+    if distance <= 0.5 + 1e-9:
+        return "Exceptional (within 0°30')"
+
+    if distance < 1.0 - 1e-9:
+        return "Very strong (under 1°)"
+
+    return "Within book orb"
+
+
+def signed_interval_for_effect(
+    effect: dict[str, Any],
+) -> list[float] | None:
+    """
+    Convert one book range into favourite-signed interval form.
+
+    Positive supports the favourite; negative supports the underdog.
+    Research-only, weakened or otherwise non-decision-grade testimony is not
+    assigned a numerical interval.
+    """
+
+    if (
+        effect.get("decision_eligible") is not True
+        or effect.get("automatic_decision_use") is False
+        or effect.get("research_only") is True
+    ):
+        return None
+
+    supports = effect.get("supports")
+    point_range = effect.get("book_point_range")
+
+    if (
+        supports not in DECISION_SIDES
+        or not isinstance(point_range, (list, tuple))
+        or len(point_range) != 2
+        or not all(
+            isinstance(value, (int, float))
+            for value in point_range
+        )
+    ):
+        return None
+
+    low = float(min(point_range))
+    high = float(max(point_range))
+
+    if supports == "Favourite":
+        return [round(low, 4), round(high, 4)]
+
+    return [round(-high, 4), round(-low, 4)]
+
+
+def finalise_contact_effect(
+    effect: dict[str, Any],
+    *,
+    body: str,
+    cusp: str,
+    family: str,
+    angular_distance: Any,
+    orb_limit: Any,
+) -> dict[str, Any]:
+    """Add common decision-grade and audit metadata to one cusp effect."""
+
+    result = dict(effect)
+    supports = result.get("supports")
+
+    eligible = bool(
+        result.get(
+            "decision_eligible",
+            supports in DECISION_SIDES,
+        )
+    )
+
+    if (
+        result.get("automatic_decision_use") is False
+        or result.get("research_only") is True
+        or supports not in DECISION_SIDES
+    ):
+        eligible = False
+
+    result["decision_eligible"] = eligible
+    result.setdefault("research_only", not eligible)
+    result.setdefault(
+        "automatic_decision_use",
+        eligible,
+    )
+    result["orb_strength"] = contact_orb_strength(
+        angular_distance
+    )
+    result["independence_family"] = family
+    result["independence_key"] = (
+        f"{family}:{body}:{cusp}"
+    )
+    result["angular_distance"] = angular_distance
+    result["orb_limit"] = orb_limit
+    result["signed_interval"] = signed_interval_for_effect(
+        result
+    )
+
+    return result
+
+
+def deduplicate_d1_node_axis_contacts(
+    contacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Count Rahu/Ketu once per rashi axis and supported side.
+
+    Printed page 67 says Rahu and Ketu are always opposite and, in practice,
+    their opposite cusp effects are taken as one. Geometry is retained for
+    both nodes, but only the tighter same-direction testimony is eligible for
+    automatic aggregation. If stolen-cusp redirection makes the nodes support
+    opposite sides, both directions remain visible.
+    """
+
+    groups: dict[
+        tuple[str, str],
+        list[tuple[int, dict[str, Any]]],
+    ] = {}
+
+    for index, contact in enumerate(contacts):
+        body = contact.get("body")
+        effect = contact.get("book_effect") or {}
+        axis = contact.get("axis") or effect.get("axis")
+        supports = effect.get("supports")
+
+        if (
+            body not in {"Rahu", "Ketu"}
+            or axis not in {"1/7", "6/12", "10/4"}
+            or supports not in DECISION_SIDES
+            or effect.get("decision_eligible") is not True
+        ):
+            continue
+
+        groups.setdefault(
+            (str(axis), str(supports)),
+            [],
+        ).append((index, contact))
+
+    for (axis, supports), grouped in groups.items():
+        if len(grouped) <= 1:
+            _, only = grouped[0]
+            effect = dict(only.get("book_effect") or {})
+            effect["node_axis_counted_once"] = True
+            effect["node_axis_group"] = (
+                f"{axis}:{supports}"
+            )
+            only["book_effect"] = effect
+            continue
+
+        grouped.sort(
+            key=lambda item: (
+                float(
+                    item[1].get("angular_distance")
+                    if isinstance(
+                        item[1].get("angular_distance"),
+                        (int, float),
+                    )
+                    else 999
+                ),
+                0 if item[1].get("body") == "Rahu" else 1,
+            )
+        )
+        retained_index, retained = grouped[0]
+        retained_effect = dict(
+            retained.get("book_effect") or {}
+        )
+        retained_effect.update({
+            "node_axis_counted_once": True,
+            "node_axis_group": f"{axis}:{supports}",
+            "node_axis_duplicate_count": len(grouped) - 1,
+        })
+        retained["book_effect"] = retained_effect
+
+        retained_label = (
+            f"{retained.get('body')}@"
+            f"{retained.get('cusp')}"
+        )
+
+        for duplicate_index, duplicate in grouped[1:]:
+            duplicate_effect = dict(
+                duplicate.get("book_effect") or {}
+            )
+            duplicate_effect.update({
+                "decision_eligible_before_node_dedup": (
+                    duplicate_effect.get(
+                        "decision_eligible"
+                    )
+                ),
+                "decision_eligible": False,
+                "automatic_decision_use": False,
+                "node_axis_counted_once": False,
+                "node_axis_duplicate": True,
+                "node_axis_group": f"{axis}:{supports}",
+                "duplicate_of": retained_label,
+                "signed_interval": None,
+                "decision_reason": (
+                    "Rahu/Ketu opposite-axis testimony is "
+                    "counted once under printed page 67."
+                ),
+            })
+            duplicate["book_effect"] = duplicate_effect
+
+    return contacts
+
+
+def contact_to_indicator(
+    contact: dict[str, Any],
+    *,
+    source: str,
+    tier: int,
+) -> dict[str, Any]:
+    """Project one contact into the tier-aware aggregation format."""
+
+    effect = contact.get("book_effect") or {}
+
+    return {
+        "source": source,
+        "body": contact.get("body"),
+        "cusp": contact.get("cusp"),
+        "effective_cusp": contact.get(
+            "effective_cusp"
+        ),
+        "tier": tier,
+        "supports": effect.get("supports"),
+        "decision_eligible": effect.get(
+            "decision_eligible"
+        ),
+        "research_only": effect.get(
+            "research_only",
+            False,
+        ),
+        "automatic_decision_use": effect.get(
+            "automatic_decision_use",
+            True,
+        ),
+        "book_point_range": effect.get(
+            "book_point_range"
+        ),
+        "signed_interval": effect.get(
+            "signed_interval"
+        ),
+        "orb_strength": effect.get(
+            "orb_strength"
+        ),
+        "angular_distance": contact.get(
+            "angular_distance"
+        ),
+        "contact_strength": effect.get(
+            "contact_strength"
+        ),
+        "independence_family": effect.get(
+            "independence_family"
+        ),
+        "independence_key": effect.get(
+            "independence_key"
+        ),
+        "decision_reason": effect.get(
+            "decision_reason"
+        ),
+    }
+
 def d9_cusp_effect(
     body_name: str,
     cusp_name: str,
@@ -11608,10 +12289,11 @@ def d9_cusp_effect(
     motion: str | None = None,
 ) -> dict[str, Any]:
     """
-    Apply Table 5.3 and the adjacent Chapter 5 text to one D9 1/7 contact.
+    Apply Table 5.3 and adjacent Chapter 5 text to one D9 1/7 contact.
 
-    This function returns direction and the book's point range. It does not
-    fabricate one exact point value inside the 14-18 or 12-15 ranges.
+    Research-caution or undefined bodies remain visible but are excluded from
+    automatic direction and point intervals. Exact point values inside the
+    book's 14-18 and 12-15 ranges are never invented.
     """
 
     represented_side = (
@@ -11619,7 +12301,9 @@ def d9_cusp_effect(
         if cusp_name == "D9Lagna"
         else "Underdog"
     )
-    opposing_side = opposite_contest_side(represented_side)
+    opposing_side = opposite_contest_side(
+        represented_side
+    )
     normalised_motion = (
         motion.strip().lower()
         if isinstance(motion, str)
@@ -11631,6 +12315,11 @@ def d9_cusp_effect(
     supports = None
     rule_status = "Not defined by book"
     reliability = "Unavailable"
+    decision_eligible = False
+    research_only = True
+    decision_reason = (
+        "No decision-grade standalone D9 rule is available."
+    )
     note = None
 
     if body_name == "Sun":
@@ -11639,54 +12328,82 @@ def d9_cusp_effect(
         supports = opposing_side
         rule_status = "Book-defined"
         reliability = "Moderate"
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Table 5.3 rule."
     elif body_name == "Moon":
         direction = "Harms cusp side"
         effect = "Lazy or unstable influence."
         supports = opposing_side
         rule_status = "Book-defined with research caution"
         reliability = "Research caution"
+        decision_reason = (
+            "Printed page 113 says more research is needed; "
+            "report only, do not auto-score."
+        )
     elif body_name == "Mars":
         direction = "Harms cusp side"
         effect = "Frustration, anger and self-undoing."
         supports = opposing_side
         rule_status = "Book-defined"
         reliability = "Strong"
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Table 5.3 rule."
     elif body_name == "Rahu":
         direction = "Supports cusp side"
         effect = "Ambition and desire to win."
         supports = represented_side
         rule_status = "Book-defined"
         reliability = "Reduced shadow-graha force"
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Table 5.3 rule."
     elif body_name == "Jupiter":
         direction = "Supports cusp side"
         effect = "Grace, luck and a positive attitude."
         supports = represented_side
         rule_status = "Book-defined"
         reliability = "Strong"
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Table 5.3 rule."
     elif body_name == "Saturn":
         direction = "Harms cusp side"
         effect = "Restricts, slows and depresses the team."
         supports = opposing_side
         rule_status = "Book-defined"
         reliability = "Strong"
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Table 5.3 rule."
     elif body_name == "Mercury":
         direction = "Supports cusp side"
         effect = "Skill, speed and cleverness."
         supports = represented_side
         rule_status = "Book-defined"
         reliability = "Strong"
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Table 5.3 rule."
     elif body_name == "Ketu":
         direction = "Harms cusp side"
         effect = "Confusion and unusual circumstances leading to defeat."
         supports = opposing_side
         rule_status = "Book-defined"
         reliability = "Reduced shadow-graha force"
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Table 5.3 rule."
     elif body_name == "Venus":
         direction = "Harms cusp side"
         effect = "Laziness, complacency and inattention."
         supports = opposing_side
         rule_status = "Book-defined"
         reliability = "Milder negative"
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Table 5.3 rule."
     elif body_name == "Uranus":
         if normalised_motion == "direct":
             direction = "Supports cusp side"
@@ -11694,18 +12411,25 @@ def d9_cusp_effect(
             supports = represented_side
             rule_status = "Book-defined"
             reliability = "Research-sensitive outer planet"
+            decision_eligible = True
+            research_only = False
+            decision_reason = "Explicit direct-motion Chapter 5 rule."
         elif normalised_motion == "retrograde":
             direction = "Harms cusp side"
             effect = "Retrograde current reverses the normal boost."
             supports = opposing_side
             rule_status = "Book-defined"
             reliability = "Research-sensitive outer planet"
+            decision_eligible = True
+            research_only = False
+            decision_reason = "Explicit retrograde Chapter 5 rule."
         else:
             direction = "Uncertain"
             effect = "Stationary or unknown Uranus is not a clean signal."
             supports = None
             rule_status = "Book caution"
             reliability = "Uncertain/kutila"
+            decision_reason = "Stationary or unknown motion is not decision-grade."
     elif body_name == "Neptune":
         if normalised_motion == "retrograde":
             direction = "Supports cusp side"
@@ -11713,50 +12437,71 @@ def d9_cusp_effect(
             supports = represented_side
             rule_status = "Book-defined"
             reliability = "Research-sensitive outer planet"
+            decision_eligible = True
+            research_only = False
+            decision_reason = "Explicit retrograde Chapter 5 rule."
         elif normalised_motion == "direct":
             direction = "Harms cusp side"
             effect = "Sleep, smoke and confusion."
             supports = opposing_side
             rule_status = "Book-defined"
             reliability = "Research-sensitive outer planet"
+            decision_eligible = True
+            research_only = False
+            decision_reason = "Explicit direct-motion Chapter 5 rule."
         else:
             direction = "Uncertain"
             effect = "Stationary or unknown Neptune is not a clean signal."
             supports = None
             rule_status = "Book caution"
             reliability = "Uncertain/kutila"
+            decision_reason = "Stationary or unknown motion is not decision-grade."
     elif body_name == "Pluto":
         direction = "Harms cusp side"
         effect = "Heaviness, intensity and misfortune."
         supports = opposing_side
         rule_status = "Book-defined with research caution"
         reliability = "Research-sensitive outer planet"
+        decision_reason = (
+            "Printed page 114 says more research is needed; "
+            "report only, do not auto-score."
+        )
     elif body_name == "Upaketu":
         direction = "Harms cusp side"
         effect = "Acts like Ketu and spoils the represented team's luck."
         supports = opposing_side
         rule_status = "Book-defined"
         reliability = "Invisible upagraha"
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Chapter 5 rule."
     elif body_name == "Gulika":
         direction = "Harms cusp side"
         effect = "Indicates defeat for the represented side."
         supports = opposing_side
         rule_status = "Book-defined"
         reliability = "Invisible upagraha"
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Chapter 5 rule."
     elif body_name == "Chiron":
         if normalised_motion == "retrograde":
             direction = "Harms cusp side"
             effect = (
-                "Retrograde Chiron is negative when a very tight D1 "
+                "Retrograde Chiron is negative only when a very tight D1 "
                 "contact transfers into D9."
             )
             supports = opposing_side
             rule_status = "Book-defined double-whammy example"
             reliability = "Transfer-only rule"
+            decision_reason = (
+                "Not a standalone D9 rule; eligible only through an "
+                "independently detected double whammy."
+            )
         else:
             note = (
                 "Chapter 5 does not give a standalone direct-Chiron D9 "
-                "cusp rule; do not infer one from Chapter 4."
+                "cusp rule."
             )
     elif body_name == "Ceres":
         note = (
@@ -11764,7 +12509,13 @@ def d9_cusp_effect(
         )
 
     invisible = body_name in D9_INVISIBLE_CUSP_BODIES
-    point_range = [12, 15] if invisible else [14, 18]
+    point_range = (
+        [12.0, 15.0]
+        if invisible and decision_eligible
+        else [14.0, 18.0]
+        if decision_eligible
+        else None
+    )
 
     return {
         "body": body_name,
@@ -11778,12 +12529,18 @@ def d9_cusp_effect(
         "motion": motion,
         "tier": 3,
         "book_point_range": point_range,
+        "decision_eligible": decision_eligible,
+        "research_only": research_only,
+        "automatic_decision_use": decision_eligible,
+        "decision_reason": decision_reason,
         "exact_points_applied": False,
         "exact_point_reason": (
             "The book gives a range and says orb tightness and planetary "
             "quality require judgment; no exact value is invented."
+            if decision_eligible
+            else "Research-only or undefined testimony is not scored."
         ),
-        "pdf_pages": [112, 113, 114, 115, 116, 173],
+        "pdf_pages": [112, 113, 114, 115, 116, 158, 159],
         "note": note,
     }
 
@@ -11792,7 +12549,13 @@ def d1_classical_cusp_effect(
     body_name: str,
     cusp_name: str,
 ) -> dict[str, Any]:
-    """Apply the explicit Chapter 4 classical-planet cusp rule."""
+    """
+    Apply explicit Chapter 4 classical-planet cusp rules.
+
+    Mercury, Moon and Mars on 4/10 are retained as research testimony but
+    excluded from automatic scoring. Rahu and Ketu use the book's reduced
+    invisible-graha rashi value of 7 rather than the visible 7-9 range.
+    """
 
     metadata = SENSITIVE_CUSP_DETAILS.get(cusp_name)
 
@@ -11803,6 +12566,10 @@ def d1_classical_cusp_effect(
             "direction": "Undefined",
             "supports": None,
             "rule_status": "Cusp is outside the six primary axes.",
+            "decision_eligible": False,
+            "research_only": True,
+            "automatic_decision_use": False,
+            "book_point_range": None,
         }
 
     side = metadata["side"]
@@ -11812,70 +12579,116 @@ def d1_classical_cusp_effect(
     supports = None
     rule_status = "Not defined by book"
     effect = "No automatic interpretation."
+    decision_eligible = False
+    research_only = True
+    decision_reason = "No decision-grade rule."
+    point_range: list[float] | None = None
 
     if body_name == "Sun":
         direction = "Harms cusp side"
         supports = opposing_side
         rule_status = "Book-defined"
         effect = "Burns every contacted cusp."
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Chapter 4 rule."
+        point_range = [7.0, 9.0]
     elif body_name == "Moon":
         direction = "Harms cusp side"
         supports = opposing_side
         rule_status = "Book-defined with research caution"
         effect = "Lazy and lacklustre influence."
+        decision_reason = (
+            "The book says Moon is weaker and research-sensitive; "
+            "report only, do not auto-score."
+        )
     elif body_name == "Mars":
         if axis in {"1/7", "6/12"}:
             direction = "Supports cusp side"
             supports = side
             rule_status = "Book-defined"
             effect = "Galvanizes the team."
+            decision_eligible = True
+            research_only = False
+            decision_reason = "Explicit Chapter 4 rule."
+            point_range = [7.0, 9.0]
         else:
             direction = "Harms cusp side"
             supports = opposing_side
             rule_status = "Book-defined with research caution"
             effect = "Mars appears negative on the 4/10 axis."
+            decision_reason = (
+                "Printed page 67 says more research is needed; "
+                "report only, do not auto-score."
+            )
     elif body_name == "Rahu":
         direction = "Supports cusp side"
         supports = side
         rule_status = "Book-defined"
         effect = "Force and ambition, but weaker than visible planets."
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Chapter 4 rule."
+        point_range = [7.0, 7.0]
     elif body_name == "Jupiter":
         direction = "Supports cusp side"
         supports = side
         rule_status = "Book-defined"
         effect = "Grants favour and victory."
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Chapter 4 rule."
+        point_range = [7.0, 9.0]
     elif body_name == "Saturn":
         if axis == "1/7":
             direction = "Harms cusp side"
             supports = opposing_side
-            rule_status = "Book-defined"
             effect = "Slows and handicaps the represented team."
         else:
             direction = "Supports cusp side"
             supports = side
-            rule_status = "Book-defined"
             effect = "Supports the 6/12 and 4/10 axes."
+        rule_status = "Book-defined"
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Chapter 4 rule."
+        point_range = [7.0, 9.0]
     elif body_name == "Mercury":
         if axis == "6/12":
             direction = "Supports cusp side"
             supports = side
-            rule_status = "Book-defined with research caution"
-            effect = "May be positive on the 6/12 axis."
+            rule_status = "Research-only; rulership required"
+            effect = (
+                "May be positive on 6/12, but the book says Mercury "
+                "requires more research and should be judged by rulership."
+            )
         else:
             direction = "Uncertain"
             supports = None
             rule_status = "Book says further research is needed"
             effect = "Judge Mercury through house rulership; not automatic."
+        decision_reason = (
+            "No automatic Mercury score without explicit relevant "
+            "house-rulership confirmation."
+        )
     elif body_name == "Ketu":
         direction = "Harms cusp side"
         supports = opposing_side
         rule_status = "Book-defined"
         effect = "Unilaterally negative on a cusp."
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Chapter 4 rule."
+        point_range = [7.0, 7.0]
     elif body_name == "Venus":
         direction = "Supports cusp side"
         supports = side
         rule_status = "Book-defined"
         effect = "Positive but mild influence."
+        decision_eligible = True
+        research_only = False
+        decision_reason = "Explicit Chapter 4 rule."
+        point_range = [7.0, 9.0]
 
     return {
         "body": body_name,
@@ -11887,9 +12700,13 @@ def d1_classical_cusp_effect(
         "effect": effect,
         "rule_status": rule_status,
         "tier": 2,
-        "book_point_range": [7, 9],
+        "book_point_range": point_range,
+        "decision_eligible": decision_eligible,
+        "research_only": research_only,
+        "automatic_decision_use": decision_eligible,
+        "decision_reason": decision_reason,
         "exact_points_applied": False,
-        "pdf_pages": [63, 64, 66, 67, 68, 72, 73],
+        "pdf_pages": [63, 64, 66, 67, 68, 72, 73, 158, 159],
     }
 
 
@@ -11917,13 +12734,45 @@ def d1_contact_effect(
                 effect.get("represented_side")
             )
 
+        motion_key = (
+            str(motion or "Unknown")
+            .strip()
+            .lower()
+            .replace("-", " ")
+        )
+        motion_is_clean = motion_key in {
+            "direct",
+            "retrograde",
+        }
+        decision_eligible = bool(
+            supports in DECISION_SIDES
+            and motion_is_clean
+        )
+
         return {
             **effect,
             "supports": supports,
             "tier": 2,
-            "book_point_range": [7, 7],
+            "book_point_range": (
+                [7.0, 7.0]
+                if decision_eligible
+                else None
+            ),
+            "decision_eligible": decision_eligible,
+            "research_only": not decision_eligible,
+            "automatic_decision_use": decision_eligible,
+            "decision_reason": (
+                "Explicit Chapter 4 outer-body rule with "
+                "clean direct/retrograde motion."
+                if decision_eligible
+                else (
+                    "Undefined axis or stationary/unknown outer-body "
+                    "motion is not decision-grade."
+                )
+            ),
+            "reliability": "Research-sensitive outer planet",
             "exact_points_applied": False,
-            "pdf_pages": [68, 69, 70, 72, 73],
+            "pdf_pages": [68, 69, 70, 72, 73, 158, 159],
         }
 
     if category == "Special point":
@@ -11931,13 +12780,30 @@ def d1_contact_effect(
             body_name,
             cusp_name,
         )
+        decision_eligible = (
+            effect.get("supports") in DECISION_SIDES
+            and effect.get("rule_status") == "Book-defined"
+        )
+
         return {
             **effect,
             "body": body_name,
             "tier": 2,
-            "book_point_range": [7, 7],
+            "book_point_range": (
+                [7.0, 7.0]
+                if decision_eligible
+                else None
+            ),
+            "decision_eligible": decision_eligible,
+            "research_only": not decision_eligible,
+            "automatic_decision_use": decision_eligible,
+            "decision_reason": (
+                "Explicit Chapter 4 special-point rule."
+                if decision_eligible
+                else "The book does not define this special-point axis."
+            ),
             "exact_points_applied": False,
-            "pdf_pages": [68, 72, 73],
+            "pdf_pages": [68, 72, 73, 158, 159],
         }
 
     return d1_classical_cusp_effect(
@@ -11986,9 +12852,18 @@ def collect_d9_axis_contacts(
         if not planet or cusp not in {"D9Lagna", "D9House7"}:
             continue
 
-        effect = d9_cusp_effect(
-            planet,
-            cusp,
+        distance = raw.get("angular_distance")
+        orb_limit = raw.get("orb_limit")
+        effect = finalise_contact_effect(
+            d9_cusp_effect(
+                planet,
+                cusp,
+            ),
+            body=planet,
+            cusp=cusp,
+            family="D9_cusp",
+            angular_distance=distance,
+            orb_limit=orb_limit,
         )
         contacts.append({
             "body": planet,
@@ -12001,10 +12876,8 @@ def collect_d9_axis_contacts(
             "cusp_d9_longitude": raw.get(
                 "cusp_d9_longitude"
             ),
-            "angular_distance": raw.get(
-                "angular_distance"
-            ),
-            "orb_limit": raw.get("orb_limit"),
+            "angular_distance": distance,
+            "orb_limit": orb_limit,
             "rank_on_cusp": raw.get(
                 "rank_on_cusp"
             ),
@@ -12051,10 +12924,17 @@ def collect_d9_axis_contacts(
             if distance > OUTER_CUSP_ORB_DEGREES + 1e-9:
                 continue
 
-            effect = d9_cusp_effect(
-                body_name,
-                cusp_name,
-                motion=body.get("motion"),
+            effect = finalise_contact_effect(
+                d9_cusp_effect(
+                    body_name,
+                    cusp_name,
+                    motion=body.get("motion"),
+                ),
+                body=body_name,
+                cusp=cusp_name,
+                family="D9_cusp",
+                angular_distance=round(distance, 8),
+                orb_limit=OUTER_CUSP_ORB_DEGREES,
             )
             contacts.append({
                 "body": body_name,
@@ -12089,9 +12969,18 @@ def collect_d9_axis_contacts(
         if not point or cusp not in {"D9Lagna", "D9House7"}:
             continue
 
-        effect = d9_cusp_effect(
-            point,
-            cusp,
+        distance = raw.get("angular_distance")
+        orb_limit = raw.get("orb_limit")
+        effect = finalise_contact_effect(
+            d9_cusp_effect(
+                point,
+                cusp,
+            ),
+            body=point,
+            cusp=cusp,
+            family="D9_cusp",
+            angular_distance=distance,
+            orb_limit=orb_limit,
         )
         contacts.append({
             "body": point,
@@ -12108,17 +12997,22 @@ def collect_d9_axis_contacts(
             "cusp_d9_longitude": raw.get(
                 "cusp_d9_longitude"
             ),
-            "angular_distance": raw.get(
-                "angular_distance"
-            ),
-            "orb_limit": raw.get("orb_limit"),
+            "angular_distance": distance,
+            "orb_limit": orb_limit,
             "book_effect": effect,
         })
 
     contacts.sort(
         key=lambda item: (
             0 if item["cusp"] == "D9Lagna" else 1,
-            float(item.get("angular_distance") or 999),
+            float(
+                item.get("angular_distance")
+                if isinstance(
+                    item.get("angular_distance"),
+                    (int, float),
+                )
+                else 999
+            ),
             PLANET_ORDER.get(item["body"], 999),
             item["body"],
         )
@@ -12130,7 +13024,14 @@ def collect_d9_axis_contacts(
 def calculate_d9_combinations(
     navamsha_cusps: dict[str, Any],
 ) -> dict[str, Any]:
-    """Detect the Chapter 5 combinations in D9 House 1 and House 7."""
+    """
+    Detect Chapter 5 D9 House 1/7 combinations without pairwise over-counting.
+
+    When multiple listed pairs share a planet, they form one overlap cluster.
+    - same-direction cluster: count one five-point testimony
+    - conflicting cluster: score none; mark unresolved
+    - disjoint pairs: each may count independently
+    """
 
     if navamsha_cusps.get("status") not in {"Pass", "Partial"}:
         return {
@@ -12139,7 +13040,9 @@ def calculate_d9_combinations(
             "book_tier": 1,
             "houses": {},
             "combinations": [],
+            "raw_signed_favourite_total": 0.0,
             "signed_favourite_total": 0.0,
+            "overlap_clusters": [],
             "error": "Exact D9 geometry is unavailable.",
         }
 
@@ -12153,7 +13056,9 @@ def calculate_d9_combinations(
             "book_tier": 1,
             "houses": {},
             "combinations": [],
+            "raw_signed_favourite_total": 0.0,
             "signed_favourite_total": 0.0,
+            "overlap_clusters": [],
             "error": "D9 Lagna longitude is unavailable.",
         }
 
@@ -12193,7 +13098,6 @@ def calculate_d9_combinations(
         )
 
     combinations: list[dict[str, Any]] = []
-    signed_total = 0.0
 
     for house_number, planet_list in occupancy.items():
         side = (
@@ -12225,7 +13129,6 @@ def calculate_d9_combinations(
                         if supports == "Favourite"
                         else -points
                     )
-                    signed_total += signed_points
 
                     combinations.append({
                         "planets": sorted(
@@ -12243,11 +13146,15 @@ def calculate_d9_combinations(
                             "rule_grade"
                         ],
                         "book_points": points,
-                        "signed_favourite_points": round(
+                        "raw_signed_favourite_points": round(
                             signed_points,
                             2,
                         ),
-                        "points_applied": points > 0,
+                        "signed_favourite_points": 0.0,
+                        "points_candidate": points > 0,
+                        "points_applied": False,
+                        "overlap_suppressed": False,
+                        "manual_review_required": points <= 0,
                         "pdf_pages": selected_rule[
                             "pdf_pages"
                         ],
@@ -12280,11 +13187,195 @@ def calculate_d9_combinations(
                     "supports": supports,
                     "rule_grade": tendency,
                     "book_points": 0.0,
+                    "raw_signed_favourite_points": 0.0,
                     "signed_favourite_points": 0.0,
+                    "points_candidate": False,
                     "points_applied": False,
                     "manual_review_required": True,
                     "pdf_pages": [124],
                 })
+
+    raw_signed_total = round(sum(
+        float(item.get("raw_signed_favourite_points") or 0.0)
+        for item in combinations
+        if item.get("points_candidate")
+    ), 2)
+
+    overlap_clusters: list[dict[str, Any]] = []
+    signed_total = 0.0
+    cluster_counter = 0
+
+    for house_number in (1, 7):
+        house_name = f"House{house_number}"
+        candidate_indexes = [
+            index
+            for index, item in enumerate(combinations)
+            if (
+                item.get("d9_house") == house_name
+                and item.get("points_candidate")
+            )
+        ]
+
+        # Connected components by shared planet.
+        unvisited = set(candidate_indexes)
+
+        while unvisited:
+            seed = min(unvisited)
+            component = {seed}
+            frontier = [seed]
+            unvisited.remove(seed)
+
+            while frontier:
+                current = frontier.pop()
+                current_planets = set(
+                    combinations[current].get(
+                        "planets",
+                        [],
+                    )
+                )
+
+                linked = [
+                    index
+                    for index in list(unvisited)
+                    if current_planets.intersection(
+                        combinations[index].get(
+                            "planets",
+                            [],
+                        )
+                    )
+                ]
+
+                for index in linked:
+                    unvisited.remove(index)
+                    component.add(index)
+                    frontier.append(index)
+
+            cluster_counter += 1
+            cluster_id = f"D9C{cluster_counter}"
+            members = sorted(component)
+            supports_set = {
+                combinations[index].get("supports")
+                for index in members
+            }
+            planets_set = sorted({
+                planet
+                for index in members
+                for planet in combinations[index].get(
+                    "planets",
+                    []
+                )
+            }, key=lambda name: (
+                PLANET_ORDER.get(name, 999),
+                name,
+            ))
+
+            if len(members) == 1:
+                chosen = members[0]
+                status = "Independent pair scored"
+                cluster_supports = combinations[
+                    chosen
+                ].get("supports")
+                combinations[chosen][
+                    "points_applied"
+                ] = True
+                combinations[chosen][
+                    "signed_favourite_points"
+                ] = combinations[chosen].get(
+                    "raw_signed_favourite_points",
+                    0.0,
+                )
+                signed_total += float(
+                    combinations[chosen].get(
+                        "signed_favourite_points"
+                    ) or 0.0
+                )
+            elif len(supports_set) == 1:
+                # Same-direction overlapping pairs are one testimony, not
+                # multiple independent five-point scores.
+                chosen = min(
+                    members,
+                    key=lambda index: tuple(
+                        combinations[index].get(
+                            "planets",
+                            [],
+                        )
+                    ),
+                )
+                cluster_supports = next(iter(supports_set))
+                status = (
+                    "Overlapping same-direction pairs collapsed "
+                    "to one five-point testimony"
+                )
+                combinations[chosen][
+                    "points_applied"
+                ] = True
+                combinations[chosen][
+                    "signed_favourite_points"
+                ] = combinations[chosen].get(
+                    "raw_signed_favourite_points",
+                    0.0,
+                )
+                signed_total += float(
+                    combinations[chosen].get(
+                        "signed_favourite_points"
+                    ) or 0.0
+                )
+
+                for index in members:
+                    if index == chosen:
+                        continue
+                    combinations[index].update({
+                        "overlap_suppressed": True,
+                        "manual_review_required": True,
+                        "suppressed_reason": (
+                            "Shares a planet with another same-direction "
+                            "combination; counted once."
+                        ),
+                    })
+            else:
+                chosen = None
+                cluster_supports = "Conflicting"
+                status = (
+                    "Overlapping contradictory pairs unresolved; "
+                    "no automatic points"
+                )
+
+                for index in members:
+                    combinations[index].update({
+                        "overlap_suppressed": True,
+                        "manual_review_required": True,
+                        "suppressed_reason": (
+                            "Shares planets with an opposing listed "
+                            "combination; automatic stacking disabled."
+                        ),
+                    })
+
+            for index in members:
+                combinations[index][
+                    "overlap_cluster_id"
+                ] = cluster_id
+
+            overlap_clusters.append({
+                "cluster_id": cluster_id,
+                "d9_house": house_name,
+                "planets": planets_set,
+                "member_pairs": [
+                    combinations[index].get("planets")
+                    for index in members
+                ],
+                "supports": cluster_supports,
+                "status": status,
+                "chosen_pair": (
+                    combinations[chosen].get("planets")
+                    if chosen is not None
+                    else None
+                ),
+                "automatic_points_applied": (
+                    5.0 if chosen is not None else 0.0
+                ),
+            })
+
+    signed_total = round(signed_total, 2)
 
     side_summaries: dict[str, Any] = {}
 
@@ -12307,7 +13398,12 @@ def calculate_d9_combinations(
             "house": f"House{house_number}",
             "occupants": occupancy[house_number],
             "combination_count": len(relevant),
-            "scored_combination_count": len(applied),
+            "raw_scored_candidate_count": sum(
+                1
+                for item in relevant
+                if item.get("points_candidate")
+            ),
+            "independent_scored_combination_count": len(applied),
             "supports_favourite_count": sum(
                 1
                 for item in relevant
@@ -12325,7 +13421,7 @@ def calculate_d9_combinations(
     elif signed_total < 0:
         indication = "Underdog"
     elif combinations:
-        indication = "Balanced or conflicting combinations"
+        indication = "Balanced, unresolved or research-only combinations"
     else:
         indication = "No listed combination"
 
@@ -12345,21 +13441,20 @@ def calculate_d9_combinations(
         ),
         "houses": side_summaries,
         "combinations": combinations,
-        "signed_favourite_total": round(
-            signed_total,
-            2,
-        ),
+        "raw_signed_favourite_total": raw_signed_total,
+        "signed_favourite_total": signed_total,
         "indication": indication,
-        "overlapping_pair_warning": (
-            "When three or more planets share a D9 house, pairwise "
-            "combinations can overlap. The response lists every pair "
-            "instead of silently collapsing contradictory testimony."
+        "overlap_clusters": overlap_clusters,
+        "overlapping_pair_policy": (
+            "Pairs sharing a planet are one correlated cluster. "
+            "Same-direction clusters count once; contradictory clusters "
+            "remain unresolved."
         ),
         "unavailable_planets": sorted(
             set(unavailable_planets),
             key=lambda name: PLANET_ORDER.get(name, 999),
         ),
-        "pdf_pages": [124, 126, 127, 173],
+        "pdf_pages": [124, 126, 127, 158, 159],
         "error": (
             None
             if not unavailable_planets
@@ -12484,6 +13579,8 @@ def collect_d1_directional_contacts(
         if not body or cusp not in SENSITIVE_CUSP_DETAILS:
             continue
 
+        distance = raw.get("angular_distance")
+        orb_limit = raw.get("orb_limit")
         effect = d1_contact_effect(
             body,
             cusp,
@@ -12493,16 +13590,22 @@ def collect_d1_directional_contacts(
             effect,
             lookup.get((body, cusp)),
         )
+        effect = finalise_contact_effect(
+            effect,
+            body=body,
+            cusp=cusp,
+            family="D1_cusp",
+            angular_distance=distance,
+            orb_limit=orb_limit,
+        )
         contacts.append({
             "body": body,
             "category": "Classical planet",
             "cusp": cusp,
             "axis": raw.get("axis"),
             "represented_side": raw.get("side"),
-            "angular_distance": raw.get(
-                "angular_distance"
-            ),
-            "orb_limit": raw.get("orb_limit"),
+            "angular_distance": distance,
+            "orb_limit": orb_limit,
             "book_effect": effect,
         })
         seen.add((body, cusp))
@@ -12518,6 +13621,8 @@ def collect_d1_directional_contacts(
             continue
 
         motion = raw.get("motion")
+        distance = raw.get("angular_distance")
+        orb_limit = raw.get("orb_limit")
         effect = d1_contact_effect(
             body,
             cusp,
@@ -12528,16 +13633,22 @@ def collect_d1_directional_contacts(
             effect,
             lookup.get((body, cusp)),
         )
+        effect = finalise_contact_effect(
+            effect,
+            body=body,
+            cusp=cusp,
+            family="D1_cusp",
+            angular_distance=distance,
+            orb_limit=orb_limit,
+        )
         contacts.append({
             "body": body,
             "category": "Outer planet",
             "cusp": cusp,
             "axis": raw.get("axis"),
             "represented_side": raw.get("side"),
-            "angular_distance": raw.get(
-                "angular_distance"
-            ),
-            "orb_limit": raw.get("orb_limit"),
+            "angular_distance": distance,
+            "orb_limit": orb_limit,
             "motion": motion,
             "book_effect": effect,
         })
@@ -12553,6 +13664,8 @@ def collect_d1_directional_contacts(
         if not body or cusp not in SENSITIVE_CUSP_DETAILS:
             continue
 
+        distance = raw.get("angular_distance")
+        orb_limit = raw.get("orb_limit")
         effect = d1_contact_effect(
             body,
             cusp,
@@ -12562,16 +13675,22 @@ def collect_d1_directional_contacts(
             effect,
             lookup.get((body, cusp)),
         )
+        effect = finalise_contact_effect(
+            effect,
+            body=body,
+            cusp=cusp,
+            family="D1_cusp",
+            angular_distance=distance,
+            orb_limit=orb_limit,
+        )
         contacts.append({
             "body": body,
             "category": "Special point",
             "cusp": cusp,
             "axis": raw.get("axis"),
             "represented_side": raw.get("side"),
-            "angular_distance": raw.get(
-                "angular_distance"
-            ),
-            "orb_limit": raw.get("orb_limit"),
+            "angular_distance": distance,
+            "orb_limit": orb_limit,
             "book_effect": effect,
         })
         seen.add((body, cusp))
@@ -12611,6 +13730,8 @@ def collect_d1_directional_contacts(
             "Classical planet",
         )
         motion = raw.get("body_motion")
+        distance = raw.get("angular_distance")
+        orb_limit = raw.get("orb_limit")
         effect = d1_contact_effect(
             body,
             effective_cusp,
@@ -12620,6 +13741,14 @@ def collect_d1_directional_contacts(
         effect = interpret_stolen_contact(
             effect,
             raw,
+        )
+        effect = finalise_contact_effect(
+            effect,
+            body=body,
+            cusp=source_cusp,
+            family="D1_cusp",
+            angular_distance=distance,
+            orb_limit=orb_limit,
         )
 
         contacts.append({
@@ -12633,17 +13762,26 @@ def collect_d1_directional_contacts(
             "represented_side": SENSITIVE_CUSP_DETAILS[
                 effective_cusp
             ]["side"],
-            "angular_distance": raw.get(
-                "angular_distance"
-            ),
-            "orb_limit": raw.get("orb_limit"),
+            "angular_distance": distance,
+            "orb_limit": orb_limit,
             "motion": motion,
             "book_effect": effect,
         })
 
+    contacts = deduplicate_d1_node_axis_contacts(
+        contacts
+    )
+
     contacts.sort(
         key=lambda item: (
-            float(item.get("angular_distance") or 999),
+            float(
+                item.get("angular_distance")
+                if isinstance(
+                    item.get("angular_distance"),
+                    (int, float),
+                )
+                else 999
+            ),
             item.get("cusp") or "",
             item.get("body") or "",
         )
@@ -12655,42 +13793,218 @@ def collect_d1_directional_contacts(
 def directional_summary(
     indicators: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    decisive = [
-        item
-        for item in indicators
-        if item.get("supports") in {
-            "Favourite",
-            "Underdog",
-        }
-    ]
-    favourite_count = sum(
-        1
-        for item in decisive
-        if item.get("supports") == "Favourite"
-    )
-    underdog_count = sum(
-        1
-        for item in decisive
-        if item.get("supports") == "Underdog"
-    )
+    """
+    Summarize only decision-grade testimony at the highest available tier.
 
-    if favourite_count and not underdog_count:
-        direction = "Favourite"
-    elif underdog_count and not favourite_count:
-        direction = "Underdog"
-    elif favourite_count and underdog_count:
+    The previous implementation counted every indicator equally. This version:
+    - excludes research-only, weakened and de-duplicated testimony
+    - honours Tier 3 > Tier 2 > Tier 1
+    - preserves the book's point ranges as intervals
+    - returns Mixed when intervals overlap zero or unscored opposition remains
+    """
+
+    eligible: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+
+    for item in indicators:
+        supports = item.get("supports")
+        decision_eligible = item.get(
+            "decision_eligible",
+            supports in DECISION_SIDES,
+        )
+
+        reason = None
+
+        if supports not in DECISION_SIDES:
+            reason = "No directional side"
+        elif decision_eligible is not True:
+            reason = "Not decision-eligible"
+        elif item.get("research_only") is True:
+            reason = "Research-only"
+        elif item.get("automatic_decision_use") is False:
+            reason = "Automatic decision use disabled"
+
+        if reason:
+            excluded.append({
+                "source": item.get("source"),
+                "body": item.get("body"),
+                "cusp": item.get("cusp"),
+                "supports": supports,
+                "reason": reason,
+            })
+            continue
+
+        eligible.append(item)
+
+    if eligible:
+        highest_tier = max(
+            int(item.get("tier") or 0)
+            for item in eligible
+        )
+        active = [
+            item
+            for item in eligible
+            if int(item.get("tier") or 0)
+            == highest_tier
+        ]
+    else:
+        highest_tier = None
+        active = []
+
+    intervals: list[list[float]] = []
+    unscored_active: list[dict[str, Any]] = []
+
+    for item in active:
+        interval = item.get("signed_interval")
+
+        if (
+            not isinstance(interval, (list, tuple))
+            or len(interval) != 2
+            or not all(
+                isinstance(value, (int, float))
+                for value in interval
+            )
+        ):
+            point_range = item.get(
+                "book_point_range"
+            )
+            supports = item.get("supports")
+
+            if (
+                isinstance(point_range, (list, tuple))
+                and len(point_range) == 2
+                and all(
+                    isinstance(value, (int, float))
+                    for value in point_range
+                )
+            ):
+                low = float(min(point_range))
+                high = float(max(point_range))
+                interval = (
+                    [low, high]
+                    if supports == "Favourite"
+                    else [-high, -low]
+                )
+
+        if (
+            isinstance(interval, (list, tuple))
+            and len(interval) == 2
+            and all(
+                isinstance(value, (int, float))
+                for value in interval
+            )
+        ):
+            intervals.append([
+                float(interval[0]),
+                float(interval[1]),
+            ])
+        else:
+            unscored_active.append(item)
+
+    signed_interval = None
+
+    if intervals:
+        signed_interval = [
+            round(sum(item[0] for item in intervals), 4),
+            round(sum(item[1] for item in intervals), 4),
+        ]
+
+    active_supports = {
+        item.get("supports")
+        for item in active
+        if item.get("supports") in DECISION_SIDES
+    }
+
+    if signed_interval is not None:
+        low, high = signed_interval
+
+        if low > 0:
+            direction = "Favourite"
+        elif high < 0:
+            direction = "Underdog"
+        else:
+            direction = "Mixed"
+
+        # A same-tier unscored testimony opposing the interval prevents a
+        # false clean direction.
+        unscored_supports = {
+            item.get("supports")
+            for item in unscored_active
+            if item.get("supports") in DECISION_SIDES
+        }
+
+        if (
+            direction == "Favourite"
+            and "Underdog" in unscored_supports
+        ) or (
+            direction == "Underdog"
+            and "Favourite" in unscored_supports
+        ):
+            direction = "Mixed"
+    elif len(active_supports) == 1:
+        direction = next(iter(active_supports))
+    elif len(active_supports) > 1:
         direction = "Mixed"
     else:
         direction = "None"
 
+    closest = None
+    contacts_with_distance = [
+        item
+        for item in active
+        if isinstance(
+            item.get("angular_distance"),
+            (int, float),
+        )
+    ]
+
+    if contacts_with_distance:
+        closest_item = min(
+            contacts_with_distance,
+            key=lambda item: float(
+                item["angular_distance"]
+            ),
+        )
+        closest = {
+            "source": closest_item.get("source"),
+            "body": closest_item.get("body"),
+            "cusp": closest_item.get("cusp"),
+            "supports": closest_item.get("supports"),
+            "angular_distance": closest_item.get(
+                "angular_distance"
+            ),
+            "orb_strength": closest_item.get(
+                "orb_strength"
+            ),
+        }
+
     return {
         "direction": direction,
-        "favourite_indicator_count": favourite_count,
-        "underdog_indicator_count": underdog_count,
-        "uncertain_or_weakened_count": (
-            len(indicators) - len(decisive)
+        "highest_decisive_tier": highest_tier,
+        "signed_interval": signed_interval,
+        "decision_eligible_count": len(eligible),
+        "active_highest_tier_count": len(active),
+        "favourite_indicator_count": sum(
+            1
+            for item in active
+            if item.get("supports") == "Favourite"
         ),
+        "underdog_indicator_count": sum(
+            1
+            for item in active
+            if item.get("supports") == "Underdog"
+        ),
+        "unscored_active_count": len(
+            unscored_active
+        ),
+        "excluded_count": len(excluded),
+        "excluded": excluded,
+        "closest_decision_contact": closest,
         "indicator_count": len(indicators),
+        "aggregation_policy": (
+            "Highest tier first; book ranges retained as intervals; "
+            "research-only and de-duplicated testimony excluded."
+        ),
     }
 
 
@@ -12708,21 +14022,70 @@ def tier1_yoga_indicators(
         pky = result.get("pky", {})
 
         if sky.get("formed"):
+            condition = sky.get("condition")
+            point_range = (
+                [7.0, 9.0]
+                if condition == "Full"
+                else None
+            )
             indicators.append({
                 "source": "SKY",
                 "tier": 2,
                 "represented_side": side,
                 "supports": side,
-                "condition": sky.get("condition"),
+                "condition": condition,
+                "decision_eligible": True,
+                "research_only": False,
+                "automatic_decision_use": True,
+                "book_point_range": point_range,
+                "signed_interval": (
+                    point_range
+                    if side == "Favourite"
+                    and point_range
+                    else (
+                        [-point_range[1], -point_range[0]]
+                        if point_range
+                        else None
+                    )
+                ),
+                "independence_family": "SKY_PKY",
+                "independence_key": f"SKY:{side}",
+                "decision_reason": (
+                    "Full SKY uses the general Tier 2 range."
+                    if point_range
+                    else (
+                        "Afflicted/diminished SKY is directional but "
+                        "left unscored because the exact reduction "
+                        "requires judgment."
+                    )
+                ),
             })
 
         if pky.get("formed"):
+            condition = pky.get("condition")
+            point_range = [7.0, 9.0]
+            supports = opposite_contest_side(side)
             indicators.append({
                 "source": "PKY",
                 "tier": 2,
                 "represented_side": side,
-                "supports": opposite_contest_side(side),
-                "condition": pky.get("condition"),
+                "supports": supports,
+                "condition": condition,
+                "decision_eligible": True,
+                "research_only": False,
+                "automatic_decision_use": True,
+                "book_point_range": point_range,
+                "signed_interval": (
+                    point_range
+                    if supports == "Favourite"
+                    else [-point_range[1], -point_range[0]]
+                ),
+                "independence_family": "SKY_PKY",
+                "independence_key": f"PKY:{side}",
+                "decision_reason": (
+                    "The book gives SKY/PKY a general Tier 2 range; "
+                    "exact strength remains contextual."
+                ),
             })
 
     return indicators
@@ -12807,21 +14170,14 @@ def strongest_d1_direction(
     tier1_combinations: dict[str, Any],
     d1_contacts: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    cusp_indicators = []
-
-    for contact in d1_contacts:
-        effect = contact.get("book_effect", {})
-        cusp_indicators.append({
-            "source": "Rashi cusp",
-            "body": contact.get("body"),
-            "cusp": contact.get("cusp"),
-            "tier": 2,
-            "supports": effect.get("supports"),
-            "contact_strength": effect.get(
-                "contact_strength",
-                "Normal",
-            ),
-        })
+    cusp_indicators = [
+        contact_to_indicator(
+            contact,
+            source="Rashi cusp",
+            tier=2,
+        )
+        for contact in d1_contacts
+    ]
 
     yoga_indicators = tier1_yoga_indicators(
         tier1_combinations
@@ -12874,16 +14230,11 @@ def strongest_d9_direction(
     combinations: dict[str, Any],
 ) -> dict[str, Any]:
     cusp_indicators = [
-        {
-            "source": "D9 cusp",
-            "body": contact.get("body"),
-            "cusp": contact.get("cusp"),
-            "tier": 3,
-            "supports": contact.get(
-                "book_effect",
-                {},
-            ).get("supports"),
-        }
+        contact_to_indicator(
+            contact,
+            source="D9 cusp",
+            tier=3,
+        )
         for contact in d9_contacts
     ]
     cusp_summary = directional_summary(
@@ -13018,11 +14369,10 @@ def calculate_navamsha_interpretation(
     stolen_cusps: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Complete the Chapter 5 contest layer:
-    - D9 1/7 cusp effects
-    - D9 House1/House7 combinations
-    - D1/D9 reinforcement or reversal
-    - same-body double-whammy transfer
+    Complete the Chapter 5 contest layer with decision-grade filtering.
+
+    Research-only contacts remain visible, but only explicit book-defined
+    testimony enters tier direction or point intervals.
     """
 
     combinations = calculate_d9_combinations(
@@ -13058,13 +14408,71 @@ def calculate_navamsha_interpretation(
         d9_summary,
     )
 
-    failed_d9_effects = [
+    d1_indicators = [
+        contact_to_indicator(
+            contact,
+            source="Rashi cusp",
+            tier=2,
+        )
+        for contact in d1_contacts
+    ]
+    d9_indicators = [
+        contact_to_indicator(
+            contact,
+            source="D9 cusp",
+            tier=3,
+        )
+        for contact in d9_contacts
+    ]
+    d1_cusp_summary = directional_summary(
+        d1_indicators
+    )
+    d9_cusp_summary = directional_summary(
+        d9_indicators
+    )
+
+    research_d1_effects = [
+        contact
+        for contact in d1_contacts
+        if (
+            (contact.get("book_effect") or {}).get(
+                "decision_eligible"
+            ) is not True
+            or (contact.get("book_effect") or {}).get(
+                "research_only"
+            ) is True
+            or (contact.get("book_effect") or {}).get(
+                "automatic_decision_use"
+            ) is False
+        )
+    ]
+    research_d9_effects = [
         contact
         for contact in d9_contacts
-        if contact.get(
-            "book_effect",
-            {},
-        ).get("supports") is None
+        if (
+            (contact.get("book_effect") or {}).get(
+                "decision_eligible"
+            ) is not True
+            or (contact.get("book_effect") or {}).get(
+                "research_only"
+            ) is True
+            or (contact.get("book_effect") or {}).get(
+                "automatic_decision_use"
+            ) is False
+        )
+    ]
+
+    node_rows = [
+        contact
+        for contact in d1_contacts
+        if contact.get("body") in {"Rahu", "Ketu"}
+    ]
+    node_duplicates = [
+        contact
+        for contact in node_rows
+        if (contact.get("book_effect") or {}).get(
+            "node_axis_duplicate"
+        )
     ]
 
     if navamsha_cusps.get("status") == "Fail":
@@ -13088,7 +14496,7 @@ def calculate_navamsha_interpretation(
 
     return {
         "status": status,
-        "method": "BookLockedChapter5NavamshaInterpretation",
+        "method": "BookLockedChapter5NavamshaInterpretationV119",
         "book_chapter": 5,
         "ayanamsa": "Lahiri",
         "assignment": {
@@ -13100,18 +14508,18 @@ def calculate_navamsha_interpretation(
             "Tier2": "Rashi cusp strength and SKY/PKY",
             "Tier1": "Victory houses and D9 combinations",
         },
+        "decision_grade_policy": {
+            "research_contacts_auto_scored": False,
+            "ranges_preserved_as_intervals": True,
+            "rahu_ketu_rashi_axis_counted_once": True,
+            "overlapping_d9_pairs_stacked": False,
+            "highest_tier_controls_direction": True,
+        },
         "d9_cusp_contacts": d9_contacts,
-        "d9_cusp_summary": directional_summary([
-            {
-                "supports": contact.get(
-                    "book_effect",
-                    {},
-                ).get("supports")
-            }
-            for contact in d9_contacts
-        ]),
+        "d9_cusp_summary": d9_cusp_summary,
         "navamsha_combinations": combinations,
         "d1_cusp_contacts": d1_contacts,
+        "d1_cusp_summary": d1_cusp_summary,
         "d1_summary": d1_summary,
         "d9_summary": d9_summary,
         "d1_d9_relationship": hierarchy,
@@ -13122,10 +14530,32 @@ def calculate_navamsha_interpretation(
                 "The same body is within orb of the corresponding D1 "
                 "and D9 1/7 cusps."
             ),
+            "points_applied": False,
             "pdf_pages": [131, 132],
         },
+        "node_axis_deduplication": {
+            "rashi_node_contact_count": len(node_rows),
+            "duplicates_excluded_from_automatic_aggregation": len(
+                node_duplicates
+            ),
+            "policy": (
+                "Rahu/Ketu same-axis, same-direction testimony is counted "
+                "once; all geometry remains visible."
+            ),
+            "pdf_pages": [67],
+        },
         "signed_points": {
-            "navamsha_combination_total": combinations.get(
+            "d1_tier2_interval": d1_cusp_summary.get(
+                "signed_interval"
+            ),
+            "d9_tier3_interval": d9_cusp_summary.get(
+                "signed_interval"
+            ),
+            "navamsha_combination_raw_total": combinations.get(
+                "raw_signed_favourite_total",
+                0.0,
+            ),
+            "navamsha_combination_deduplicated_total": combinations.get(
                 "signed_favourite_total",
                 0.0,
             ),
@@ -13142,7 +14572,8 @@ def calculate_navamsha_interpretation(
             if not unavailable_d9_bodies
             else "Partial"
         ),
-        "research_or_undefined_d9_contacts": failed_d9_effects,
+        "research_or_undefined_d1_contacts": research_d1_effects,
+        "research_or_undefined_d9_contacts": research_d9_effects,
         "completeness": {
             "d9_axis_geometry_available": (
                 navamsha_cusps.get("status")
@@ -13157,6 +14588,9 @@ def calculate_navamsha_interpretation(
             "d1_d9_hierarchy_completed": True,
             "double_whammy_checked": True,
             "exact_d9_cusp_points_mechanical": False,
+            "research_contact_filtering_completed": True,
+            "node_axis_deduplication_completed": True,
+            "d9_overlap_deduplication_completed": True,
         },
         "pdf_pages": sorted({
             page
@@ -13173,6 +14607,204 @@ def calculate_navamsha_interpretation(
         "error": error,
     }
 
+
+
+def calculate_chart_correlation_signature(
+    rashi_placidus: dict[str, Any],
+    navamsha_cusps: dict[str, Any],
+    kp_sublords: dict[str, Any],
+    navamsha_interpretation: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Return deterministic fine and slate-cluster signatures.
+
+    The proxy is stateless and cannot count other events. A batch caller can
+    group matching cluster_signature values so similar same-time charts are
+    not mistaken for independent validation.
+    """
+
+    def rounded_step(
+        value: Any,
+        step: float,
+    ) -> float | None:
+        if not isinstance(value, (int, float)):
+            return None
+
+        return round(
+            round(float(value) / step) * step,
+            4,
+        )
+
+    rashi_cusps = rashi_placidus.get(
+        "cusps",
+        {},
+    )
+    d9_lagna = navamsha_cusps.get(
+        "lagna",
+        {},
+    ).get("d9_sidereal_longitude")
+    d9_seventh = navamsha_cusps.get(
+        "seventh_cusp",
+        {},
+    ).get("d9_sidereal_longitude")
+    kp_cusps = kp_sublords.get(
+        "cusp_sublords",
+        {},
+    )
+
+    def build_payload(step: float) -> dict[str, Any]:
+        return {
+            "rashi_sensitive_cusps": {
+                house: rounded_step(
+                    (
+                        rashi_cusps.get(house, {})
+                        or {}
+                    ).get("sidereal_longitude"),
+                    step,
+                )
+                for house in (
+                    "House1",
+                    "House7",
+                    "House4",
+                    "House10",
+                    "House6",
+                    "House12",
+                )
+            },
+            "d9_axis": {
+                "lagna": rounded_step(
+                    d9_lagna,
+                    step,
+                ),
+                "house7": rounded_step(
+                    d9_seventh,
+                    step,
+                ),
+            },
+            "kp_main_sublords": {
+                house: (
+                    kp_cusps.get(house, {})
+                    or {}
+                ).get("sublord")
+                for house in (
+                    "House1",
+                    "House7",
+                    "House4",
+                    "House10",
+                )
+            },
+            "d1_contacts": sorted([
+                {
+                    "body": item.get("body"),
+                    "cusp": item.get("cusp"),
+                    "supports": (
+                        item.get("book_effect")
+                        or {}
+                    ).get("supports"),
+                    "eligible": (
+                        item.get("book_effect")
+                        or {}
+                    ).get("decision_eligible"),
+                    "distance": rounded_step(
+                        item.get("angular_distance"),
+                        step,
+                    ),
+                }
+                for item in navamsha_interpretation.get(
+                    "d1_cusp_contacts",
+                    [],
+                )
+                if isinstance(item, dict)
+            ], key=lambda item: (
+                str(item.get("body")),
+                str(item.get("cusp")),
+                str(item.get("supports")),
+            )),
+            "d9_contacts": sorted([
+                {
+                    "body": item.get("body"),
+                    "cusp": item.get("cusp"),
+                    "supports": (
+                        item.get("book_effect")
+                        or {}
+                    ).get("supports"),
+                    "eligible": (
+                        item.get("book_effect")
+                        or {}
+                    ).get("decision_eligible"),
+                    "distance": rounded_step(
+                        item.get("angular_distance"),
+                        step,
+                    ),
+                }
+                for item in navamsha_interpretation.get(
+                    "d9_cusp_contacts",
+                    [],
+                )
+                if isinstance(item, dict)
+            ], key=lambda item: (
+                str(item.get("body")),
+                str(item.get("cusp")),
+                str(item.get("supports")),
+            )),
+            "hierarchy_direction": (
+                navamsha_interpretation.get(
+                    "d1_d9_relationship",
+                    {},
+                ).get("hierarchy_direction")
+            ),
+        }
+
+    fine_payload = build_payload(0.05)
+    cluster_payload = build_payload(0.5)
+
+    def digest(payload: dict[str, Any]) -> str:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+
+        return hashlib.sha256(encoded).hexdigest()[:20]
+
+    return {
+        "status": "Pass",
+        "method": "Deterministic chart-correlation signatures",
+        "fine_signature": digest(fine_payload),
+        "cluster_signature": digest(cluster_payload),
+        "fine_rounding_degrees": 0.05,
+        "cluster_rounding_degrees": 0.5,
+        "batch_use": (
+            "Group equal cluster_signature values. Repeated outcomes in one "
+            "cluster are correlated tests, not independent confirmations."
+        ),
+        "same_time_event_count": None,
+        "same_time_event_count_reason": (
+            "The Action is stateless; the batch caller must count matching "
+            "signatures across events."
+        ),
+        "payload_summary": {
+            "rashi_sensitive_cusps": cluster_payload[
+                "rashi_sensitive_cusps"
+            ],
+            "d9_axis": cluster_payload["d9_axis"],
+            "kp_main_sublords": cluster_payload[
+                "kp_main_sublords"
+            ],
+            "hierarchy_direction": cluster_payload[
+                "hierarchy_direction"
+            ],
+            "d1_contact_count": len(
+                cluster_payload["d1_contacts"]
+            ),
+            "d9_contact_count": len(
+                cluster_payload["d9_contacts"]
+            ),
+        },
+        "pdf_pages": [26, 27, 28],
+    }
 
 def extract_motion_label(
     planet_result: dict[str, Any] | None,
@@ -14180,13 +15812,34 @@ def calculate_karma_fixity_evidence(
     kp_sublords: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Gather independent directional testimony for a manual karma audit.
+    Build raw and independent-family Rule-of-Three ledgers.
 
-    The book defines fixed/mixed/nonfixed karma qualitatively and gives the
-    rule of three, but it does not provide a complete mechanical classifier.
+    Printed page 28 asks for repeated indications. It does not say that every
+    derived output from one planet or one geometry is independent. Therefore
+    the automatic Rule of Three uses distinct technique families, while every
+    raw testimony remains visible for audit.
     """
 
-    evidence: list[dict[str, Any]] = []
+    raw_evidence: list[dict[str, Any]] = []
+
+    def add_evidence(
+        *,
+        source: str,
+        family: str,
+        tier: int,
+        supports: str | None,
+        **extra: Any,
+    ) -> None:
+        if supports not in DECISION_SIDES:
+            return
+
+        raw_evidence.append({
+            "source": source,
+            "family": family,
+            "tier": tier,
+            "supports": supports,
+            **extra,
+        })
 
     tier1_total = tier1_combinations.get(
         "automatic_signed_total"
@@ -14194,19 +15847,21 @@ def calculate_karma_fixity_evidence(
 
     if isinstance(tier1_total, (int, float)):
         if tier1_total > 0:
-            evidence.append({
-                "source": "Victory-house signed total",
-                "tier": 1,
-                "supports": "Favourite",
-                "value": tier1_total,
-            })
+            add_evidence(
+                source="Victory-house signed total",
+                family="Victory houses",
+                tier=1,
+                supports="Favourite",
+                value=tier1_total,
+            )
         elif tier1_total < 0:
-            evidence.append({
-                "source": "Victory-house signed total",
-                "tier": 1,
-                "supports": "Underdog",
-                "value": tier1_total,
-            })
+            add_evidence(
+                source="Victory-house signed total",
+                family="Victory houses",
+                tier=1,
+                supports="Underdog",
+                value=tier1_total,
+            )
 
     for side, result in tier1_combinations.get(
         "sky_pky",
@@ -14216,56 +15871,68 @@ def calculate_karma_fixity_evidence(
         pky = result.get("pky", {})
 
         if sky.get("formed"):
-            evidence.append({
-                "source": f"{side} SKY",
-                "tier": 2,
-                "supports": side,
-                "condition": sky.get("condition"),
-            })
+            add_evidence(
+                source=f"{side} SKY",
+                family="SKY/PKY",
+                tier=2,
+                supports=side,
+                condition=sky.get("condition"),
+            )
 
         if pky.get("formed"):
-            evidence.append({
-                "source": f"{side} PKY",
-                "tier": 2,
-                "supports": opposite_contest_side(side),
-                "condition": pky.get("condition"),
-            })
+            add_evidence(
+                source=f"{side} PKY",
+                family="SKY/PKY",
+                tier=2,
+                supports=opposite_contest_side(side),
+                condition=pky.get("condition"),
+            )
 
     for contact in navamsha_interpretation.get(
         "d1_cusp_contacts",
         [],
     ):
-        supports = contact.get(
-            "book_effect",
-            {},
-        ).get("supports") or contact.get("supports")
+        effect = contact.get("book_effect", {})
 
-        if supports in {"Favourite", "Underdog"}:
-            evidence.append({
-                "source": "D1 cusp contact",
-                "tier": 2,
-                "supports": supports,
-                "body": contact.get("body"),
-                "cusp": contact.get("cusp"),
-            })
+        if (
+            effect.get("decision_eligible") is True
+            and effect.get("automatic_decision_use") is not False
+            and effect.get("research_only") is not True
+        ):
+            add_evidence(
+                source="D1 cusp contact",
+                family="D1 cusps",
+                tier=2,
+                supports=effect.get("supports"),
+                body=contact.get("body"),
+                cusp=contact.get("cusp"),
+                independence_key=effect.get(
+                    "independence_key"
+                ),
+            )
 
     for contact in navamsha_interpretation.get(
         "d9_cusp_contacts",
         [],
     ):
-        supports = contact.get(
-            "book_effect",
-            {},
-        ).get("supports") or contact.get("supports")
+        effect = contact.get("book_effect", {})
 
-        if supports in {"Favourite", "Underdog"}:
-            evidence.append({
-                "source": "D9 cusp contact",
-                "tier": 3,
-                "supports": supports,
-                "body": contact.get("body"),
-                "cusp": contact.get("cusp"),
-            })
+        if (
+            effect.get("decision_eligible") is True
+            and effect.get("automatic_decision_use") is not False
+            and effect.get("research_only") is not True
+        ):
+            add_evidence(
+                source="D9 cusp contact",
+                family="D9 cusps",
+                tier=3,
+                supports=effect.get("supports"),
+                body=contact.get("body"),
+                cusp=contact.get("cusp"),
+                independence_key=effect.get(
+                    "independence_key"
+                ),
+            )
 
     combos = navamsha_interpretation.get(
         "navamsha_combinations",
@@ -14275,15 +15942,18 @@ def calculate_karma_fixity_evidence(
     for combo in combos.get("combinations", []) or []:
         if (
             combo.get("points_applied")
-            and combo.get("supports")
-            in {"Favourite", "Underdog"}
+            and combo.get("supports") in DECISION_SIDES
         ):
-            evidence.append({
-                "source": "D9 combination",
-                "tier": 1,
-                "supports": combo.get("supports"),
-                "planets": combo.get("planets"),
-            })
+            add_evidence(
+                source="D9 combination",
+                family="D9 combinations",
+                tier=1,
+                supports=combo.get("supports"),
+                planets=combo.get("planets"),
+                overlap_cluster_id=combo.get(
+                    "overlap_cluster_id"
+                ),
+            )
 
     kp = kp_sublords.get(
         "main_sublord_comparison",
@@ -14291,63 +15961,132 @@ def calculate_karma_fixity_evidence(
     )
     kp_indication = kp.get("indication")
 
-    if kp_indication in {"Favourite", "Underdog"}:
-        evidence.append({
-            "source": "KP main sublord comparison",
-            "tier": 2,
-            "supports": kp_indication,
-            "value": kp.get(
+    if kp_indication in DECISION_SIDES:
+        add_evidence(
+            source="KP main sublord comparison",
+            family="KP sublords",
+            tier=2,
+            supports=kp_indication,
+            value=kp.get(
                 "signed_favourite_differential"
             ),
+        )
+
+    # One family can support both sides and therefore remain contradictory.
+    family_direction: dict[str, dict[str, Any]] = {}
+
+    for family in sorted({
+        item["family"]
+        for item in raw_evidence
+    }):
+        family_items = [
+            item
+            for item in raw_evidence
+            if item["family"] == family
+        ]
+        sides = sorted({
+            item["supports"]
+            for item in family_items
         })
 
-    counts = {
-        side: {
-            "total": sum(
+        if sides == ["Favourite"]:
+            direction = "Favourite"
+        elif sides == ["Underdog"]:
+            direction = "Underdog"
+        else:
+            direction = "Mixed"
+
+        family_direction[family] = {
+            "direction": direction,
+            "raw_testimony_count": len(family_items),
+            "favourite_raw_count": sum(
                 1
-                for item in evidence
-                if item["supports"] == side
+                for item in family_items
+                if item["supports"] == "Favourite"
             ),
-            "tier3": sum(
+            "underdog_raw_count": sum(
                 1
-                for item in evidence
-                if item["supports"] == side
-                and item.get("tier") == 3
+                for item in family_items
+                if item["supports"] == "Underdog"
             ),
-            "tier2": sum(
-                1
-                for item in evidence
-                if item["supports"] == side
-                and item.get("tier") == 2
-            ),
-            "tier1": sum(
-                1
-                for item in evidence
-                if item["supports"] == side
-                and item.get("tier") == 1
+            "highest_tier": max(
+                item.get("tier", 0)
+                for item in family_items
             ),
         }
-        for side in ("Favourite", "Underdog")
-    }
+
+    counts: dict[str, dict[str, Any]] = {}
+
+    for side in ("Favourite", "Underdog"):
+        raw_side = [
+            item
+            for item in raw_evidence
+            if item["supports"] == side
+        ]
+        supporting_families = [
+            family
+            for family, result in family_direction.items()
+            if result["direction"] == side
+        ]
+        mixed_families = [
+            family
+            for family, result in family_direction.items()
+            if result["direction"] == "Mixed"
+        ]
+
+        counts[side] = {
+            "raw_testimony_count": len(raw_side),
+            "independent_family_count": len(
+                supporting_families
+            ),
+            "supporting_families": supporting_families,
+            "mixed_families_not_counted": mixed_families,
+            "tier3_raw_count": sum(
+                1
+                for item in raw_side
+                if item.get("tier") == 3
+            ),
+            "tier2_raw_count": sum(
+                1
+                for item in raw_side
+                if item.get("tier") == 2
+            ),
+            "tier1_raw_count": sum(
+                1
+                for item in raw_side
+                if item.get("tier") == 1
+            ),
+        }
 
     return {
         "status": "Pass",
-        "method": "Book rule-of-three evidence ledger",
-        "evidence": evidence,
+        "method": "Book rule-of-three independent-family ledger",
+        "raw_evidence": raw_evidence,
+        # Backward-compatible key used by compactors and older prompts.
+        "evidence": raw_evidence,
+        "family_direction": family_direction,
         "counts": counts,
         "rule_of_three_reached": {
-            side: counts[side]["total"] >= 3
+            side: (
+                counts[side][
+                    "independent_family_count"
+                ] >= 3
+            )
             for side in ("Favourite", "Underdog")
         },
+        "rule_of_three_basis": (
+            "Distinct technique families, not raw derived rows."
+        ),
         "automatic_karma_classification": None,
         "automatic_classification_allowed": False,
         "manual_classification_required": True,
         "reason": (
             "The book defines fixed, mixed and nonfixed karma and recommends "
             "repeated testimony, but it does not provide a complete numerical "
-            "algorithm that can be applied without judgment."
+            "classifier. Correlated outputs from one technique family are "
+            "not counted as independent."
         ),
-        "pdf_pages": [41, 42, 43],
+        "pdf_pages": [26, 27, 28],
     }
 
 
@@ -14950,7 +16689,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2",
+        "response_mode": "prediction-grade compact v2 correction patch",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -14973,6 +16712,12 @@ def health() -> dict[str, Any]:
             "stolen_cusps": True,
             "tier1_combinations": True,
             "navamsha_interpretation": True,
+            "decision_grade_contact_filtering": True,
+            "rahu_ketu_axis_deduplication": True,
+            "d9_overlap_deduplication": True,
+            "independent_rule_of_three": True,
+            "chart_correlation_signature": True,
+            "printed_page_reference_correction": True,
             "reliability_audit": True,
         },
         "outer_planet_engine": {
@@ -15188,6 +16933,15 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         stolen_cusps,
     )
 
+    # Correlation signature for batch slates. The Action remains stateless;
+    # the caller groups matching cluster signatures across events.
+    chart_correlation = calculate_chart_correlation_signature(
+        rashi_placidus,
+        navamsha_cusps,
+        kp_sublords,
+        navamsha_interpretation,
+    )
+
     # Chapters 2 and 9: kutila/stationary veto, eclipse sandhi,
     # solar ingress, sunrise/sunset timing and karma-fixity evidence.
     reliability_audit = calculate_reliability_audit(
@@ -15339,6 +17093,7 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         "special_points": special_points,
         "stolen_cusps": stolen_cusps,
         "navamsha_interpretation": navamsha_interpretation,
+        "chart_correlation": chart_correlation,
         "reliability_audit": reliability_audit,
         "nakshatra_taras": nakshatra_taras,
         "navamsha_name_sounds": navamsha_name_sounds,
@@ -15392,7 +17147,14 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
             "navamsha_interpretation": (
                 "Chapter 5 D9 1/7 cusp effects, House1/House7 combinations, "
                 "D1/D9 hierarchy and double-whammy transfer calculated from "
-                "the already verified Lahiri D1 and exact D9 geometry."
+                "the already verified Lahiri D1 and exact D9 geometry. "
+                "Research-only contacts are excluded from automatic scoring; "
+                "node-axis and overlapping-pair testimony is de-duplicated."
+            ),
+            "chart_correlation": (
+                "Deterministic fine and slate-cluster signatures built from "
+                "rashi cusps, D9 axis, KP sublords and active contacts. The "
+                "batch caller counts matching signatures."
             ),
             "reliability_audit": (
                 "Chapters 2 and 9 reliability gate using VedAstro motion "
