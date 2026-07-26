@@ -47,7 +47,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db7a"
+PROXY_VERSION = "1.20.0-db7b"
 
 
 # ============================================================
@@ -18184,6 +18184,88 @@ def clear_unverified_fixture_timezones_once() -> dict[str, Any]:
         }
 
 
+def _utc_offset_text(value: datetime) -> str | None:
+    offset = value.utcoffset()
+    if offset is None:
+        return None
+
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    absolute_minutes = abs(total_minutes)
+    hours, minutes = divmod(absolute_minutes, 60)
+    return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+def _fixture_time_views(
+    *,
+    kickoff_utc: Any,
+    venue_timezone_name: Any,
+) -> dict[str, Any]:
+    """
+    Return separate display-local and venue-local time representations.
+
+    `kickoff_local` is kept as a backward-compatible alias for the display
+    timezone. Astrology must use `kickoff_venue_local` or `vedastro_std_time`.
+    """
+    if not isinstance(kickoff_utc, datetime):
+        return {
+            "kickoff_utc": (
+                str(kickoff_utc) if kickoff_utc is not None else None
+            ),
+            "kickoff_local": None,
+            "kickoff_local_semantics": "display_timezone",
+            "kickoff_display_local": None,
+            "display_timezone": SOCCER_DISPLAY_TIMEZONE,
+            "kickoff_venue_local": None,
+            "venue_utc_offset": None,
+            "vedastro_std_time": None,
+            "venue_timezone_conversion_valid": False,
+        }
+
+    aware_utc = kickoff_utc
+    if aware_utc.tzinfo is None:
+        aware_utc = aware_utc.replace(tzinfo=timezone.utc)
+    else:
+        aware_utc = aware_utc.astimezone(timezone.utc)
+
+    display_local = aware_utc.astimezone(_display_timezone())
+
+    venue_local = None
+    venue_offset = None
+    vedastro_std_time = None
+    venue_conversion_valid = False
+
+    if isinstance(venue_timezone_name, str) and venue_timezone_name.strip():
+        try:
+            venue_zone = ZoneInfo(venue_timezone_name.strip())
+        except ZoneInfoNotFoundError:
+            venue_zone = None
+
+        if venue_zone is not None:
+            venue_local = aware_utc.astimezone(venue_zone)
+            venue_offset = _utc_offset_text(venue_local)
+            if venue_offset is not None:
+                vedastro_std_time = (
+                    f"{venue_local:%H:%M %d/%m/%Y} {venue_offset}"
+                )
+                venue_conversion_valid = True
+
+    return {
+        "kickoff_utc": aware_utc.isoformat(),
+        # Backward compatibility: this remains the user's display timezone.
+        "kickoff_local": display_local.isoformat(),
+        "kickoff_local_semantics": "display_timezone",
+        "kickoff_display_local": display_local.isoformat(),
+        "display_timezone": SOCCER_DISPLAY_TIMEZONE,
+        "kickoff_venue_local": (
+            venue_local.isoformat() if venue_local is not None else None
+        ),
+        "venue_utc_offset": venue_offset,
+        "vedastro_std_time": vedastro_std_time,
+        "venue_timezone_conversion_valid": venue_conversion_valid,
+    }
+
+
 def list_stored_fixtures(
     *,
     window: str,
@@ -18254,14 +18336,14 @@ def list_stored_fixtures(
             "message": "Stored fixtures could not be read.",
         }
 
-    tz = _display_timezone()
     fixtures = []
     for row in rows:
-        kickoff_utc = row[7]
-        kickoff_local = (
-            kickoff_utc.astimezone(tz)
-            if isinstance(kickoff_utc, datetime)
-            else None
+        time_views = _fixture_time_views(
+            kickoff_utc=row[7],
+            venue_timezone_name=row[10],
+        )
+        venue_time_valid = bool(
+            time_views["venue_timezone_conversion_valid"]
         )
         fixtures.append({
             "database_fixture_id": row[0],
@@ -18271,20 +18353,13 @@ def list_stored_fixtures(
             "season": row[4],
             "home_team": row[5],
             "away_team": row[6],
-            "kickoff_utc": (
-                kickoff_utc.isoformat()
-                if isinstance(kickoff_utc, datetime)
-                else str(kickoff_utc)
-            ),
-            "kickoff_local": (
-                kickoff_local.isoformat()
-                if kickoff_local is not None
-                else None
-            ),
+            **time_views,
             "venue_name": row[8],
             "venue_city": row[9],
             "venue_timezone": row[10],
-            "venue_timezone_verified": row[10] is not None,
+            "venue_timezone_verified": (
+                row[10] is not None and venue_time_valid
+            ),
             "fixture_status": row[11],
             "latitude": row[12],
             "longitude": row[13],
@@ -18307,16 +18382,24 @@ def list_stored_fixtures(
                 and row[13] is not None
                 and row[14] is not None
                 and row[16] is not None
+                and venue_time_valid
             ),
             "prediction_blockers": [
                 blocker
                 for blocker, missing in (
                     ("venue_name_missing", row[8] is None),
-                    ("venue_timezone_unverified", row[10] is None),
+                    (
+                        "venue_timezone_unverified",
+                        row[10] is None or not venue_time_valid,
+                    ),
                     ("latitude_missing", row[12] is None),
                     ("longitude_missing", row[13] is None),
                     ("location_source_missing", row[14] is None),
                     ("location_verification_missing", row[16] is None),
+                    (
+                        "venue_local_time_unavailable",
+                        not venue_time_valid,
+                    ),
                 )
                 if missing
             ],
@@ -18328,6 +18411,12 @@ def list_stored_fixtures(
         "window": window,
         "include_completed": include_completed,
         "display_timezone": SOCCER_DISPLAY_TIMEZONE,
+        "time_semantics": {
+            "kickoff_local": "display_timezone",
+            "kickoff_display_local": SOCCER_DISPLAY_TIMEZONE,
+            "kickoff_venue_local": "verified venue timezone",
+            "vedastro_std_time": "HH:MM DD/MM/YYYY +HH:MM",
+        },
         "range_utc": {
             "start": start_utc.isoformat(),
             "end_exclusive": end_utc.isoformat(),
@@ -18402,23 +18491,27 @@ def get_stored_fixture_by_id(
             "message": "No stored soccer fixture has this database ID.",
         }
 
-    kickoff_utc = row[7]
-    tz = _display_timezone()
-    kickoff_local = (
-        kickoff_utc.astimezone(tz)
-        if isinstance(kickoff_utc, datetime)
-        else None
+    time_views = _fixture_time_views(
+        kickoff_utc=row[7],
+        venue_timezone_name=row[10],
+    )
+    venue_time_valid = bool(
+        time_views["venue_timezone_conversion_valid"]
     )
 
     blockers = [
         blocker
         for blocker, missing in (
             ("venue_name_missing", row[8] is None),
-            ("venue_timezone_unverified", row[10] is None),
+            (
+                "venue_timezone_unverified",
+                row[10] is None or not venue_time_valid,
+            ),
             ("latitude_missing", row[12] is None),
             ("longitude_missing", row[13] is None),
             ("location_source_missing", row[14] is None),
             ("location_verification_missing", row[16] is None),
+            ("venue_local_time_unavailable", not venue_time_valid),
         )
         if missing
     ]
@@ -18431,20 +18524,13 @@ def get_stored_fixture_by_id(
         "season": row[4],
         "home_team": row[5],
         "away_team": row[6],
-        "kickoff_utc": (
-            kickoff_utc.isoformat()
-            if isinstance(kickoff_utc, datetime)
-            else str(kickoff_utc)
-        ),
-        "kickoff_local": (
-            kickoff_local.isoformat()
-            if kickoff_local is not None
-            else None
-        ),
+        **time_views,
         "venue_name": row[8],
         "venue_city": row[9],
         "venue_timezone": row[10],
-        "venue_timezone_verified": row[10] is not None,
+        "venue_timezone_verified": (
+            row[10] is not None and venue_time_valid
+        ),
         "fixture_status": row[11],
         "latitude": row[12],
         "longitude": row[13],
@@ -18467,6 +18553,12 @@ def get_stored_fixture_by_id(
     return {
         "status": "ok",
         "ready": True,
+        "time_semantics": {
+            "kickoff_local": "display_timezone",
+            "kickoff_display_local": SOCCER_DISPLAY_TIMEZONE,
+            "kickoff_venue_local": "verified venue timezone",
+            "vedastro_std_time": "HH:MM DD/MM/YYYY +HH:MM",
+        },
         "fixture": fixture,
     }
 
@@ -20657,7 +20749,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB7A exact fixture detail endpoint",
+        "database_checkpoint": "DB7B separate display and venue-local kickoff times",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -20746,6 +20838,15 @@ def health() -> dict[str, Any]:
             "path_template": "/fixtures/{database_fixture_id}",
             "avoids_list_limit_truncation": True,
         },
+        "fixture_time_semantics": {
+            "kickoff_local": "backward-compatible display timezone",
+            "kickoff_display_local": SOCCER_DISPLAY_TIMEZONE,
+            "kickoff_venue_local": "verified venue timezone",
+            "venue_utc_offset_included": True,
+            "vedastro_std_time_enabled": True,
+            "vedastro_std_time_format": "HH:MM DD/MM/YYYY +HH:MM",
+            "venue_local_time_required_for_prediction_ready": True,
+        },
         "locationiq_public_attribution_required": True,
         "ayanamsa": "Lahiri",
         "engine": "VedAstro.Python",
@@ -20753,7 +20854,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + fixture detail DB7A",
+        "response_mode": "prediction-grade compact v2 + venue-local time DB7B",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
