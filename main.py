@@ -47,7 +47,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db5"
+PROXY_VERSION = "1.20.0-db6"
 
 
 # ============================================================
@@ -63,7 +63,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DATABASE_CONNECT_TIMEOUT_SECONDS = int(
     os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "8")
 )
-DATABASE_SCHEMA_VERSION = "1.20.0-db2"
+DATABASE_SCHEMA_VERSION = "1.20.0-db6"
 
 # API-Football connectivity checkpoint.
 # This version verifies the provider account through GET /status only.
@@ -111,6 +111,19 @@ LOCATIONIQ_HEALTH_TEST_QUERY = os.getenv(
     "Sydney Opera House, Sydney, Australia",
 ).strip()
 
+# DB6 safely previews one real stored venue. It never writes coordinates into
+# fixtures yet. The preview is cached permanently in PostgreSQL.
+LOCATION_PREVIEW_AUTO_RUN = os.getenv(
+    "LOCATION_PREVIEW_AUTO_RUN",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+LOCATION_PREVIEW_LOOKAHEAD_DAYS = int(
+    os.getenv("LOCATION_PREVIEW_LOOKAHEAD_DAYS", "7")
+)
+LOCATION_PREVIEW_AUTO_APPROVE_SCORE = float(
+    os.getenv("LOCATION_PREVIEW_AUTO_APPROVE_SCORE", "75")
+)
+
 DATABASE_EXPECTED_TABLES = (
     "app_metadata",
     "fixtures",
@@ -122,6 +135,7 @@ DATABASE_EXPECTED_TABLES = (
     "post_match_audits",
     "model_versions",
     "training_runs",
+    "venue_geocodes",
 )
 
 # This is the MINIMUM delay between the START of upstream calls.
@@ -16855,6 +16869,57 @@ def database_schema_statements() -> list[str]:
             ON fixtures (fixture_status, kickoff_utc)
         """,
         """
+        ALTER TABLE fixtures
+            ADD COLUMN IF NOT EXISTS location_source TEXT
+        """,
+        """
+        ALTER TABLE fixtures
+            ADD COLUMN IF NOT EXISTS location_confidence NUMERIC(6,3)
+        """,
+        """
+        ALTER TABLE fixtures
+            ADD COLUMN IF NOT EXISTS location_verified_at TIMESTAMPTZ
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS venue_geocodes (
+            id BIGSERIAL PRIMARY KEY,
+            query_hash TEXT NOT NULL UNIQUE,
+            provider TEXT NOT NULL,
+            query_text TEXT NOT NULL,
+            venue_name TEXT,
+            expected_city TEXT,
+            expected_country TEXT,
+            provider_place_id TEXT,
+            display_name TEXT,
+            latitude DOUBLE PRECISION NOT NULL,
+            longitude DOUBLE PRECISION NOT NULL,
+            timezone_name TEXT,
+            candidate_country TEXT,
+            candidate_country_code TEXT,
+            candidate_city TEXT,
+            venue_token_overlap NUMERIC(6,3),
+            confidence_score NUMERIC(6,3) NOT NULL,
+            country_match BOOLEAN NOT NULL DEFAULT FALSE,
+            city_match BOOLEAN NOT NULL DEFAULT FALSE,
+            sports_place_match BOOLEAN NOT NULL DEFAULT FALSE,
+            decision_status TEXT NOT NULL CHECK (
+                decision_status IN (
+                    'PREVIEW',
+                    'AUTO_APPROVED',
+                    'REJECTED',
+                    'MANUALLY_APPROVED'
+                )
+            ),
+            raw_response_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_venue_geocodes_status
+            ON venue_geocodes (decision_status, confidence_score DESC)
+        """,
+        """
         CREATE TABLE IF NOT EXISTS odds_snapshots (
             id BIGSERIAL PRIMARY KEY,
             fixture_id BIGINT NOT NULL REFERENCES fixtures(id)
@@ -17080,6 +17145,15 @@ def database_schema_statements() -> list[str]:
         """
         CREATE TRIGGER fixtures_touch_updated_at
         BEFORE UPDATE ON fixtures
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at()
+        """,
+        """
+        DROP TRIGGER IF EXISTS venue_geocodes_touch_updated_at
+            ON venue_geocodes
+        """,
+        """
+        CREATE TRIGGER venue_geocodes_touch_updated_at
+        BEFORE UPDATE ON venue_geocodes
         FOR EACH ROW EXECUTE FUNCTION touch_updated_at()
         """,
         """
@@ -18308,6 +18382,603 @@ def locationiq_connection_status(
 
 
 # ============================================================
+# ONE-FIXTURE LOCATION PREVIEW — CHECKPOINT DB6
+# ============================================================
+
+COUNTRY_NAME_ALIASES = {
+    "czech republic": {"czech republic", "czechia", "cz"},
+    "usa": {"usa", "united states", "united states of america", "us"},
+    "uk": {"uk", "united kingdom", "great britain", "gb"},
+    "south korea": {"south korea", "republic of korea", "kr"},
+    "north korea": {"north korea", "democratic peoples republic of korea", "kp"},
+    "russia": {"russia", "russian federation", "ru"},
+    "iran": {"iran", "islamic republic of iran", "ir"},
+    "bolivia": {"bolivia", "plurinational state of bolivia", "bo"},
+    "venezuela": {"venezuela", "bolivarian republic of venezuela", "ve"},
+}
+
+
+def _normalise_lookup_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text_value = unicodedata.normalize("NFKD", str(value))
+    text_value = "".join(
+        character
+        for character in text_value
+        if not unicodedata.combining(character)
+    )
+    text_value = re.sub(r"[^a-z0-9]+", " ", text_value.lower())
+    return " ".join(text_value.split())
+
+
+def _country_aliases(value: Any) -> set[str]:
+    normalised = _normalise_lookup_text(value)
+    if not normalised:
+        return set()
+    for canonical, aliases in COUNTRY_NAME_ALIASES.items():
+        if normalised == canonical or normalised in aliases:
+            return {_normalise_lookup_text(item) for item in aliases | {canonical}}
+    return {normalised}
+
+
+def _significant_tokens(value: Any) -> set[str]:
+    stopwords = {
+        "stadium", "stade", "arena", "park", "field", "ground",
+        "sports", "sport", "centre", "center", "complex", "oval",
+        "the", "of", "fc", "club", "football", "artificial", "grass",
+    }
+    return {
+        token
+        for token in _normalise_lookup_text(value).split()
+        if len(token) >= 3 and token not in stopwords
+    }
+
+
+def _locationiq_address(candidate: dict[str, Any]) -> dict[str, Any]:
+    address = candidate.get("address")
+    return address if isinstance(address, dict) else {}
+
+
+def _candidate_city(address: dict[str, Any]) -> str | None:
+    for key in (
+        "city", "town", "village", "municipality", "county",
+        "state_district", "suburb",
+    ):
+        value = address.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _evaluate_location_candidate(
+    *,
+    candidate: Any,
+    venue_name: str,
+    expected_city: str | None,
+    expected_country: str | None,
+) -> dict[str, Any] | None:
+    safe = _safe_locationiq_candidate(candidate)
+    if safe is None:
+        return None
+
+    candidate_dict = candidate if isinstance(candidate, dict) else {}
+    address = _locationiq_address(candidate_dict)
+
+    candidate_country = (
+        str(address.get("country"))
+        if address.get("country") is not None
+        else None
+    )
+    candidate_country_code = (
+        str(address.get("country_code")).lower()
+        if address.get("country_code") is not None
+        else None
+    )
+    candidate_city = _candidate_city(address)
+
+    expected_country_aliases = _country_aliases(expected_country)
+    candidate_country_aliases = (
+        _country_aliases(candidate_country)
+        | _country_aliases(candidate_country_code)
+    )
+    country_match = bool(
+        expected_country_aliases
+        and candidate_country_aliases
+        and expected_country_aliases.intersection(candidate_country_aliases)
+    )
+
+    expected_city_norm = _normalise_lookup_text(expected_city)
+    candidate_city_norm = _normalise_lookup_text(candidate_city)
+    display_norm = _normalise_lookup_text(safe.get("display_name"))
+    city_match = bool(
+        expected_city_norm
+        and (
+            expected_city_norm == candidate_city_norm
+            or expected_city_norm in display_norm
+            or candidate_city_norm in expected_city_norm
+        )
+    )
+
+    venue_tokens = _significant_tokens(venue_name)
+    display_tokens = _significant_tokens(safe.get("display_name"))
+    if venue_tokens:
+        venue_overlap = len(
+            venue_tokens.intersection(display_tokens)
+        ) / len(venue_tokens)
+    else:
+        venue_overlap = 0.0
+
+    place_type = _normalise_lookup_text(safe.get("place_type"))
+    category = _normalise_lookup_text(safe.get("category"))
+    sports_place_match = (
+        place_type in {
+            "stadium", "sports centre", "sports_center", "pitch",
+            "recreation ground", "recreation_ground",
+        }
+        or category in {"leisure", "sport"}
+        or "stadium" in display_norm
+    )
+
+    score = 0.0
+    if expected_country:
+        score += 35.0 if country_match else 0.0
+    else:
+        score += 20.0
+
+    if expected_city:
+        score += 25.0 if city_match else 0.0
+    else:
+        score += 10.0
+
+    score += min(30.0, venue_overlap * 30.0)
+    if sports_place_match:
+        score += 10.0
+
+    if expected_country and not country_match:
+        score = min(score, 39.0)
+
+    auto_approved = (
+        score >= LOCATION_PREVIEW_AUTO_APPROVE_SCORE
+        and (not expected_country or country_match)
+        and (
+            not expected_city
+            or city_match
+            or venue_overlap >= 0.60
+        )
+        and safe.get("timezone_lookup_successful") is True
+    )
+
+    return {
+        **safe,
+        "provider_place_id": candidate_dict.get("place_id"),
+        "candidate_country": candidate_country,
+        "candidate_country_code": candidate_country_code,
+        "candidate_city": candidate_city,
+        "venue_token_overlap": round(venue_overlap, 3),
+        "country_match": country_match,
+        "city_match": city_match,
+        "sports_place_match": sports_place_match,
+        "confidence_score": round(score, 3),
+        "decision_status": (
+            "AUTO_APPROVED" if auto_approved else "PREVIEW"
+        ),
+    }
+
+
+def _fixture_location_query(fixture: dict[str, Any]) -> str:
+    parts = [
+        fixture.get("venue_name"),
+        fixture.get("venue_city"),
+        fixture.get("competition_country"),
+    ]
+    return ", ".join(str(part).strip() for part in parts if part)
+
+
+def _load_fixture_for_location_preview(
+    fixture_id: int | None = None,
+) -> dict[str, Any] | None:
+    if not DATABASE_URL or psycopg is None:
+        return None
+
+    with psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+        autocommit=True,
+    ) as connection:
+        with connection.cursor() as cursor:
+            if fixture_id is not None:
+                cursor.execute(
+                    """
+                    SELECT
+                        id, provider_fixture_id, competition_name,
+                        competition_country, home_team, away_team,
+                        kickoff_utc, venue_name, venue_city,
+                        latitude, longitude, timezone_name, fixture_status
+                    FROM fixtures
+                    WHERE id = %s
+                    """,
+                    (fixture_id,),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT
+                        id, provider_fixture_id, competition_name,
+                        competition_country, home_team, away_team,
+                        kickoff_utc, venue_name, venue_city,
+                        latitude, longitude, timezone_name, fixture_status
+                    FROM fixtures
+                    WHERE sport = 'soccer'
+                      AND fixture_status = 'scheduled'
+                      AND kickoff_utc >= NOW()
+                      AND kickoff_utc < NOW() + (%s * INTERVAL '1 day')
+                      AND venue_name IS NOT NULL
+                      AND venue_city IS NOT NULL
+                      AND competition_country IS NOT NULL
+                      AND latitude IS NULL
+                      AND longitude IS NULL
+                    ORDER BY kickoff_utc, id
+                    LIMIT 1
+                    """,
+                    (LOCATION_PREVIEW_LOOKAHEAD_DAYS,),
+                )
+            row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "database_fixture_id": int(row[0]),
+        "provider_fixture_id": row[1],
+        "competition": row[2],
+        "competition_country": row[3],
+        "home_team": row[4],
+        "away_team": row[5],
+        "kickoff_utc": (
+            row[6].isoformat()
+            if isinstance(row[6], datetime)
+            else str(row[6])
+        ),
+        "venue_name": row[7],
+        "venue_city": row[8],
+        "latitude": row[9],
+        "longitude": row[10],
+        "venue_timezone": row[11],
+        "fixture_status": row[12],
+    }
+
+
+def _cached_geocode_preview(query_hash: str) -> dict[str, Any] | None:
+    with psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+        autocommit=True,
+    ) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    provider, query_text, venue_name, expected_city,
+                    expected_country, provider_place_id, display_name,
+                    latitude, longitude, timezone_name,
+                    candidate_country, candidate_country_code,
+                    candidate_city, venue_token_overlap,
+                    confidence_score, country_match, city_match,
+                    sports_place_match, decision_status, created_at
+                FROM venue_geocodes
+                WHERE query_hash = %s
+                """,
+                (query_hash,),
+            )
+            row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "provider": row[0],
+        "query_text": row[1],
+        "venue_name": row[2],
+        "expected_city": row[3],
+        "expected_country": row[4],
+        "provider_place_id": row[5],
+        "display_name": row[6],
+        "latitude": float(row[7]),
+        "longitude": float(row[8]),
+        "timezone_name": row[9],
+        "candidate_country": row[10],
+        "candidate_country_code": row[11],
+        "candidate_city": row[12],
+        "venue_token_overlap": float(row[13]),
+        "confidence_score": float(row[14]),
+        "country_match": bool(row[15]),
+        "city_match": bool(row[16]),
+        "sports_place_match": bool(row[17]),
+        "decision_status": row[18],
+        "cached_at": (
+            row[19].isoformat()
+            if isinstance(row[19], datetime)
+            else str(row[19])
+        ),
+        "cached": True,
+    }
+
+
+def preview_fixture_location(
+    *,
+    fixture_id: int | None = None,
+) -> dict[str, Any]:
+    """
+    Geocode exactly one stored fixture and cache the best candidate.
+
+    This DB6 checkpoint never updates the fixture coordinates. A later step
+    will commit only an approved candidate.
+    """
+    if not LOCATIONIQ_KEY:
+        return {
+            "status": "error",
+            "previewed": False,
+            "message": "LOCATIONIQ_KEY is not configured.",
+        }
+    if timezone_at is None:
+        return {
+            "status": "error",
+            "previewed": False,
+            "message": "timezonefinder is unavailable.",
+        }
+    if not DATABASE_URL or psycopg is None:
+        return {
+            "status": "error",
+            "previewed": False,
+            "message": "Database is unavailable.",
+        }
+
+    fixture = _load_fixture_for_location_preview(fixture_id)
+    if fixture is None:
+        return {
+            "status": "no_candidate",
+            "previewed": False,
+            "message": (
+                "No suitable stored fixture with venue, city and country "
+                "was found."
+            ),
+        }
+
+    query_text = _fixture_location_query(fixture)
+    query_hash = hashlib.sha256(
+        _normalise_lookup_text(query_text).encode("utf-8")
+    ).hexdigest()
+
+    cached = _cached_geocode_preview(query_hash)
+    if cached is not None:
+        return {
+            "status": "ok",
+            "previewed": True,
+            "provider_call_made": False,
+            "fixture": fixture,
+            "preview": cached,
+            "fixture_updated": False,
+        }
+
+    try:
+        response = requests.get(
+            f"{LOCATIONIQ_BASE_URL}/search",
+            params={
+                "key": LOCATIONIQ_KEY,
+                "q": query_text,
+                "format": "json",
+                "addressdetails": 1,
+                "normalizecity": 1,
+                "dedupe": 1,
+                "limit": 3,
+            },
+            headers={
+                "Accept": "application/json",
+                "User-Agent": f"VedAstro-GPT-Proxy/{PROXY_VERSION}",
+            },
+            timeout=LOCATIONIQ_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        return {
+            "status": "error",
+            "previewed": False,
+            "error_type": type(exc).__name__,
+            "message": "LocationIQ could not be reached.",
+        }
+
+    if response.status_code != 200:
+        return {
+            "status": "error",
+            "previewed": False,
+            "http_status": response.status_code,
+            "message": "LocationIQ returned a non-200 response.",
+        }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return {
+            "status": "error",
+            "previewed": False,
+            "message": "LocationIQ returned invalid JSON.",
+        }
+
+    candidates = payload if isinstance(payload, list) else []
+    evaluated = [
+        item
+        for item in (
+            _evaluate_location_candidate(
+                candidate=candidate,
+                venue_name=str(fixture["venue_name"]),
+                expected_city=fixture.get("venue_city"),
+                expected_country=fixture.get("competition_country"),
+            )
+            for candidate in candidates
+        )
+        if item is not None
+    ]
+
+    if not evaluated:
+        return {
+            "status": "no_match",
+            "previewed": False,
+            "fixture": fixture,
+            "query_text": query_text,
+            "message": "No usable geocoding candidate was returned.",
+        }
+
+    best = max(
+        evaluated,
+        key=lambda item: (
+            float(item.get("confidence_score") or 0.0),
+            float(item.get("importance") or 0.0),
+        ),
+    )
+
+    with _database_connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO venue_geocodes (
+                    query_hash,
+                    provider,
+                    query_text,
+                    venue_name,
+                    expected_city,
+                    expected_country,
+                    provider_place_id,
+                    display_name,
+                    latitude,
+                    longitude,
+                    timezone_name,
+                    candidate_country,
+                    candidate_country_code,
+                    candidate_city,
+                    venue_token_overlap,
+                    confidence_score,
+                    country_match,
+                    city_match,
+                    sports_place_match,
+                    decision_status,
+                    raw_response_json
+                )
+                VALUES (
+                    %s, 'locationiq', %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s::jsonb
+                )
+                ON CONFLICT (query_hash) DO UPDATE SET
+                    provider_place_id = EXCLUDED.provider_place_id,
+                    display_name = EXCLUDED.display_name,
+                    latitude = EXCLUDED.latitude,
+                    longitude = EXCLUDED.longitude,
+                    timezone_name = EXCLUDED.timezone_name,
+                    candidate_country = EXCLUDED.candidate_country,
+                    candidate_country_code = EXCLUDED.candidate_country_code,
+                    candidate_city = EXCLUDED.candidate_city,
+                    venue_token_overlap = EXCLUDED.venue_token_overlap,
+                    confidence_score = EXCLUDED.confidence_score,
+                    country_match = EXCLUDED.country_match,
+                    city_match = EXCLUDED.city_match,
+                    sports_place_match = EXCLUDED.sports_place_match,
+                    decision_status = EXCLUDED.decision_status,
+                    raw_response_json = EXCLUDED.raw_response_json
+                """,
+                (
+                    query_hash,
+                    query_text,
+                    fixture.get("venue_name"),
+                    fixture.get("venue_city"),
+                    fixture.get("competition_country"),
+                    (
+                        str(best.get("provider_place_id"))
+                        if best.get("provider_place_id") is not None
+                        else None
+                    ),
+                    best.get("display_name"),
+                    best["latitude"],
+                    best["longitude"],
+                    best.get("derived_timezone"),
+                    best.get("candidate_country"),
+                    best.get("candidate_country_code"),
+                    best.get("candidate_city"),
+                    best.get("venue_token_overlap"),
+                    best.get("confidence_score"),
+                    best.get("country_match"),
+                    best.get("city_match"),
+                    best.get("sports_place_match"),
+                    best.get("decision_status"),
+                    json.dumps(
+                        {
+                            "query": query_text,
+                            "best_candidate": best,
+                            "candidate_count": len(evaluated),
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                ),
+            )
+        connection.commit()
+
+    safe_best = {
+        key: value
+        for key, value in best.items()
+        if key not in {"raw_response_json"}
+    }
+
+    return {
+        "status": "ok",
+        "previewed": True,
+        "provider_call_made": True,
+        "fixture": fixture,
+        "query_text": query_text,
+        "candidate_count": len(evaluated),
+        "preview": {
+            **safe_best,
+            "cached": False,
+        },
+        "fixture_updated": False,
+        "next_action": (
+            "Review this candidate. DB6 does not commit coordinates."
+        ),
+    }
+
+
+LOCATION_PREVIEW_STARTUP_STATUS: dict[str, Any] = {
+    "status": "not_started",
+    "previewed": False,
+}
+
+
+@app.on_event("startup")
+def preview_one_fixture_location_on_startup() -> None:
+    """
+    Preview one future fixture exactly once per unique venue query.
+
+    The geocoding result is cached in PostgreSQL. Fixture coordinates remain
+    untouched.
+    """
+    global LOCATION_PREVIEW_STARTUP_STATUS
+
+    if not LOCATION_PREVIEW_AUTO_RUN:
+        LOCATION_PREVIEW_STARTUP_STATUS = {
+            "status": "disabled",
+            "previewed": False,
+        }
+        return
+
+    if not DATABASE_URL or not LOCATIONIQ_KEY or timezone_at is None:
+        LOCATION_PREVIEW_STARTUP_STATUS = {
+            "status": "not_configured",
+            "previewed": False,
+        }
+        return
+
+    LOCATION_PREVIEW_STARTUP_STATUS = preview_fixture_location()
+
+
+# ============================================================
 # AUTHENTICATION
 # ============================================================
 
@@ -18343,7 +19014,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB5 LocationIQ and offline-timezone connectivity",
+        "database_checkpoint": "DB6 one-fixture geocode preview cache",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -18367,10 +19038,14 @@ def health() -> dict[str, Any]:
         "locationiq_key_configured": bool(LOCATIONIQ_KEY),
         "timezonefinder_available": timezone_at is not None,
         "location_checkpoint": (
-            "DB5 connectivity only; fixture coordinates are not enriched yet"
+            "DB6 previews one real fixture; fixture coordinates remain untouched"
         ),
         "location_health_cache_seconds": (
             LOCATIONIQ_HEALTH_CACHE_SECONDS
+        ),
+        "location_preview_auto_run": LOCATION_PREVIEW_AUTO_RUN,
+        "location_preview_startup_status": (
+            LOCATION_PREVIEW_STARTUP_STATUS
         ),
         "locationiq_public_attribution_required": True,
         "ayanamsa": "Lahiri",
@@ -18379,7 +19054,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + location checkpoint DB5",
+        "response_mode": "prediction-grade compact v2 + location preview DB6",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -18471,6 +19146,39 @@ def location_health() -> dict[str, Any]:
     """
     result = locationiq_connection_status()
     if not result.get("connected"):
+        raise HTTPException(status_code=503, detail=result)
+    return result
+
+
+@app.get("/location-preview-status")
+def location_preview_status() -> dict[str, Any]:
+    """
+    Show the latest one-fixture preview. This does not expose API keys.
+    """
+    return {
+        "status": "ok",
+        "proxy_version": PROXY_VERSION,
+        "fixture_coordinates_committed": False,
+        "startup_status": LOCATION_PREVIEW_STARTUP_STATUS,
+    }
+
+
+@app.post("/fixtures/{fixture_id}/location-preview")
+def fixture_location_preview(
+    fixture_id: int,
+    x_proxy_key: str | None = Header(
+        default=None,
+        alias="x-proxy-key",
+    ),
+) -> dict[str, Any]:
+    """
+    Protected manual preview for one stored fixture.
+
+    Results are cached. This endpoint never updates fixture coordinates.
+    """
+    verify_proxy_key(x_proxy_key)
+    result = preview_fixture_location(fixture_id=fixture_id)
+    if result.get("status") not in {"ok", "no_candidate", "no_match"}:
         raise HTTPException(status_code=503, detail=result)
     return result
 
