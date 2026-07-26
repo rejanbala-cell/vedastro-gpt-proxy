@@ -47,7 +47,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db6c"
+PROXY_VERSION = "1.20.0-db6d"
 
 
 # ============================================================
@@ -136,6 +136,15 @@ LOCATION_CITY_VIEWBOX_LAT_DELTA = float(
 )
 LOCATION_MAX_CITY_DISTANCE_KM = float(
     os.getenv("LOCATION_MAX_CITY_DISTANCE_KM", "75")
+)
+
+# A bounded search can legitimately return HTTP 404 when no place was found.
+# DB6D caches that negative result and advances through a small startup batch.
+LOCATION_PREVIEW_STARTUP_MAX_FIXTURES = int(
+    os.getenv("LOCATION_PREVIEW_STARTUP_MAX_FIXTURES", "3")
+)
+LOCATION_PREVIEW_STARTUP_MAX_PROVIDER_CALLS = int(
+    os.getenv("LOCATION_PREVIEW_STARTUP_MAX_PROVIDER_CALLS", "6")
 )
 
 DATABASE_EXPECTED_TABLES = (
@@ -19585,6 +19594,47 @@ def preview_fixture_location(
             "message": "Bounded venue search could not reach LocationIQ.",
         }
 
+    if response.status_code == 404:
+        # LocationIQ documents HTTP 404 as "no location or places were
+        # found", not as an authentication or transport failure.
+        _record_location_attempt(
+            query_hash=query_hash,
+            fixture_id=fixture.get("database_fixture_id"),
+            query_text=query_text,
+            status="NO_BOUNDED_RESULTS_404",
+            provider_call_count=provider_call_count,
+            message=(
+                "LocationIQ found no venue inside the verified city bounds."
+            ),
+            raw_response={
+                "strategy_version": LOCATION_GEOCODE_STRATEGY_VERSION,
+                "city_context": city_context,
+                "viewbox": viewbox,
+                "bounded": True,
+                "country_filter_applied": bool(country_code),
+                "http_status": 404,
+            },
+        )
+        return {
+            "status": "no_match",
+            "previewed": False,
+            "http_status": 404,
+            "provider_empty_result": True,
+            "provider_call_count": provider_call_count,
+            "strategy_version": LOCATION_GEOCODE_STRATEGY_VERSION,
+            "fixture": fixture,
+            "query_text": query_text,
+            "city_context": city_context,
+            "viewbox": viewbox,
+            "bounded_search": True,
+            "country_filter_applied": bool(country_code),
+            "fixture_updated": False,
+            "message": (
+                "No venue was found inside the verified city bounds. "
+                "The negative result was cached."
+            ),
+        }
+
     if response.status_code != 200:
         return {
             "status": "error",
@@ -19774,6 +19824,140 @@ def preview_fixture_location(
     }
 
 
+def _location_preview_attempt_summary(
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    fixture = result.get("fixture")
+    fixture_dict = fixture if isinstance(fixture, dict) else {}
+    preview = result.get("preview")
+    preview_dict = preview if isinstance(preview, dict) else {}
+
+    return {
+        "status": result.get("status"),
+        "database_fixture_id": fixture_dict.get("database_fixture_id"),
+        "fixture": (
+            f"{fixture_dict.get('home_team')} vs "
+            f"{fixture_dict.get('away_team')}"
+            if fixture_dict
+            else None
+        ),
+        "venue_name": fixture_dict.get("venue_name"),
+        "venue_city": fixture_dict.get("venue_city"),
+        "competition_country": fixture_dict.get(
+            "competition_country"
+        ),
+        "provider_call_count": int(
+            result.get("provider_call_count") or 0
+        ),
+        "http_status": result.get("http_status"),
+        "provider_empty_result": bool(
+            result.get("provider_empty_result")
+        ),
+        "decision_status": preview_dict.get("decision_status"),
+        "matched_display_name": preview_dict.get("display_name"),
+        "confidence_score": preview_dict.get("confidence_score"),
+        "message": result.get("message"),
+    }
+
+
+def preview_fixture_location_batch() -> dict[str, Any]:
+    """
+    Advance through a small number of unseen venues at startup.
+
+    Stop at the first AUTO_APPROVED or PREVIEW candidate that needs review.
+    REJECTED and provider-empty results are cached and skipped automatically.
+    Provider/authentication/rate-limit errors stop the batch immediately.
+    """
+    summaries: list[dict[str, Any]] = []
+    selected_result: dict[str, Any] | None = None
+    provider_call_count = 0
+    terminal_error: dict[str, Any] | None = None
+
+    for _ in range(max(1, LOCATION_PREVIEW_STARTUP_MAX_FIXTURES)):
+        if (
+            provider_call_count
+            >= LOCATION_PREVIEW_STARTUP_MAX_PROVIDER_CALLS
+        ):
+            break
+
+        result = preview_fixture_location()
+        call_count = int(result.get("provider_call_count") or 0)
+        provider_call_count += call_count
+        summaries.append(_location_preview_attempt_summary(result))
+
+        status = result.get("status")
+        preview = result.get("preview")
+        preview_dict = preview if isinstance(preview, dict) else {}
+        decision_status = preview_dict.get("decision_status")
+
+        if status == "ok" and decision_status in {
+            "AUTO_APPROVED",
+            "PREVIEW",
+        }:
+            selected_result = result
+            break
+
+        if status == "no_candidate":
+            break
+
+        if status == "error":
+            terminal_error = result
+            break
+
+        # REJECTED and no_match results are already cached, so the next
+        # loop iteration selects a different unseen venue.
+
+    if selected_result is not None:
+        return {
+            "status": "ok",
+            "previewed": True,
+            "batch_mode": True,
+            "fixtures_attempted": len(summaries),
+            "provider_call_count": provider_call_count,
+            "maximum_fixtures": (
+                LOCATION_PREVIEW_STARTUP_MAX_FIXTURES
+            ),
+            "maximum_provider_calls": (
+                LOCATION_PREVIEW_STARTUP_MAX_PROVIDER_CALLS
+            ),
+            "attempts": summaries,
+            "selected_result": selected_result,
+            "fixture_coordinates_committed": False,
+        }
+
+    if terminal_error is not None:
+        return {
+            "status": "error",
+            "previewed": False,
+            "batch_mode": True,
+            "fixtures_attempted": len(summaries),
+            "provider_call_count": provider_call_count,
+            "attempts": summaries,
+            "terminal_error": {
+                "http_status": terminal_error.get("http_status"),
+                "message": terminal_error.get("message"),
+            },
+            "fixture_coordinates_committed": False,
+        }
+
+    return {
+        "status": "no_review_candidate",
+        "previewed": False,
+        "batch_mode": True,
+        "fixtures_attempted": len(summaries),
+        "provider_call_count": provider_call_count,
+        "maximum_fixtures": LOCATION_PREVIEW_STARTUP_MAX_FIXTURES,
+        "maximum_provider_calls": (
+            LOCATION_PREVIEW_STARTUP_MAX_PROVIDER_CALLS
+        ),
+        "attempts": summaries,
+        "message": (
+            "No reviewable venue candidate was found in this startup batch."
+        ),
+        "fixture_coordinates_committed": False,
+    }
+
+
 LOCATION_PREVIEW_STARTUP_STATUS: dict[str, Any] = {
     "status": "not_started",
     "previewed": False,
@@ -19810,7 +19994,7 @@ def preview_one_fixture_location_on_startup() -> None:
         }
         return
 
-    LOCATION_PREVIEW_STARTUP_STATUS = preview_fixture_location()
+    LOCATION_PREVIEW_STARTUP_STATUS = preview_fixture_location_batch()
 
 
 # ============================================================
@@ -19849,7 +20033,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB6C city-bounded venue geocoding preview",
+        "database_checkpoint": "DB6D cache LocationIQ 404 and advance preview batch",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -19905,7 +20089,19 @@ def health() -> dict[str, Any]:
             "bounded_viewbox_required": True,
             "country_code_filter_used_when_available": True,
             "maximum_city_distance_km": LOCATION_MAX_CITY_DISTANCE_KM,
+            "http_404_means_no_match": True,
             "negative_attempts_cached": True,
+            "coordinates_committed": False,
+        },
+        "location_preview_batch_policy": {
+            "maximum_fixtures": (
+                LOCATION_PREVIEW_STARTUP_MAX_FIXTURES
+            ),
+            "maximum_provider_calls": (
+                LOCATION_PREVIEW_STARTUP_MAX_PROVIDER_CALLS
+            ),
+            "continue_after_rejected_or_no_match": True,
+            "stop_for_preview_or_auto_approved": True,
             "coordinates_committed": False,
         },
         "locationiq_public_attribution_required": True,
@@ -19915,7 +20111,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + city-bounded geocoding DB6C",
+        "response_mode": "prediction-grade compact v2 + bounded no-match batch DB6D",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -20039,7 +20235,17 @@ def location_preview_status() -> dict[str, Any]:
             "bounded_viewbox_required": True,
             "country_code_filter_used_when_available": True,
             "maximum_city_distance_km": LOCATION_MAX_CITY_DISTANCE_KM,
+            "http_404_means_no_match": True,
             "negative_attempts_cached": True,
+        },
+        "batch_policy": {
+            "maximum_fixtures": (
+                LOCATION_PREVIEW_STARTUP_MAX_FIXTURES
+            ),
+            "maximum_provider_calls": (
+                LOCATION_PREVIEW_STARTUP_MAX_PROVIDER_CALLS
+            ),
+            "continue_after_rejected_or_no_match": True,
         },
         "startup_status": LOCATION_PREVIEW_STARTUP_STATUS,
     }
