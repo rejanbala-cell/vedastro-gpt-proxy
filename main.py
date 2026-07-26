@@ -48,7 +48,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db8a"
+PROXY_VERSION = "1.20.0-db8b"
 
 
 # ============================================================
@@ -21484,6 +21484,10 @@ def latest_market_status(
         "bookmaker_count": bookmaker_count,
         "minimum_bookmaker_count": MARKET_MIN_BOOKMAKER_COUNT,
         "market_ready": market_ready,
+        "pre_match_capture_valid": pre_match_capture_valid,
+        "historical_research_only": not pre_match_capture_valid,
+        "temporal_validation": temporal_validation,
+        "prediction_use_allowed": False,
         "median_decimal_odds": {
             "home": float(row[3]) if row[3] is not None else None,
             "draw": float(row[4]) if row[4] is not None else None,
@@ -21805,7 +21809,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB8A enforce capture-before-kickoff market validity",
+        "database_checkpoint": "DB8B expose complete market temporal audit",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -21923,6 +21927,7 @@ def health() -> dict[str, Any]:
             "post_kickoff_provider_call_allowed": False,
             "post_kickoff_snapshot_market_ready": False,
             "post_kickoff_snapshot_use": "historical_research_only",
+            "temporal_audit_exposed_by_market_status": True,
         },
         "market_capture_startup_status": (
             MARKET_CAPTURE_STARTUP_STATUS
@@ -21940,7 +21945,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + pre-match time guard DB8A",
+        "response_mode": "prediction-grade compact v2 + market temporal audit DB8B",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
