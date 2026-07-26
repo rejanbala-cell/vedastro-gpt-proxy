@@ -47,7 +47,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db6b"
+PROXY_VERSION = "1.20.0-db6c"
 
 
 # ============================================================
@@ -63,7 +63,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DATABASE_CONNECT_TIMEOUT_SECONDS = int(
     os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "8")
 )
-DATABASE_SCHEMA_VERSION = "1.20.0-db6"
+DATABASE_SCHEMA_VERSION = "1.20.0-db6c"
 
 # API-Football connectivity checkpoint.
 # This version verifies the provider account through GET /status only.
@@ -127,6 +127,17 @@ LOCATION_PREVIEW_QUEUE_SCAN_LIMIT = int(
     os.getenv("LOCATION_PREVIEW_QUEUE_SCAN_LIMIT", "100")
 )
 
+# DB6C uses a two-stage strategy:
+# 1. verify/cache the fixture city and country
+# 2. search for the venue only inside a bounded box around that city
+LOCATION_GEOCODE_STRATEGY_VERSION = "city_bounded_v1"
+LOCATION_CITY_VIEWBOX_LAT_DELTA = float(
+    os.getenv("LOCATION_CITY_VIEWBOX_LAT_DELTA", "0.45")
+)
+LOCATION_MAX_CITY_DISTANCE_KM = float(
+    os.getenv("LOCATION_MAX_CITY_DISTANCE_KM", "75")
+)
+
 DATABASE_EXPECTED_TABLES = (
     "app_metadata",
     "fixtures",
@@ -139,6 +150,8 @@ DATABASE_EXPECTED_TABLES = (
     "model_versions",
     "training_runs",
     "venue_geocodes",
+    "location_contexts",
+    "location_attempts",
 )
 
 # This is the MINIMUM delay between the START of upstream calls.
@@ -16923,6 +16936,50 @@ def database_schema_statements() -> list[str]:
             ON venue_geocodes (decision_status, confidence_score DESC)
         """,
         """
+        CREATE TABLE IF NOT EXISTS location_contexts (
+            id BIGSERIAL PRIMARY KEY,
+            context_hash TEXT NOT NULL UNIQUE,
+            provider TEXT NOT NULL,
+            city_name TEXT NOT NULL,
+            country_name TEXT NOT NULL,
+            provider_place_id TEXT,
+            display_name TEXT,
+            latitude DOUBLE PRECISION NOT NULL,
+            longitude DOUBLE PRECISION NOT NULL,
+            country_code TEXT,
+            candidate_country TEXT,
+            candidate_city TEXT,
+            country_match BOOLEAN NOT NULL DEFAULT FALSE,
+            city_match BOOLEAN NOT NULL DEFAULT FALSE,
+            raw_response_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_location_contexts_city_country
+            ON location_contexts (city_name, country_name)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS location_attempts (
+            id BIGSERIAL PRIMARY KEY,
+            query_hash TEXT NOT NULL UNIQUE,
+            fixture_id BIGINT REFERENCES fixtures(id) ON DELETE SET NULL,
+            strategy_version TEXT NOT NULL,
+            query_text TEXT NOT NULL,
+            attempt_status TEXT NOT NULL,
+            provider_call_count INTEGER NOT NULL DEFAULT 0,
+            message TEXT,
+            raw_response_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_location_attempts_status
+            ON location_attempts (attempt_status, created_at DESC)
+        """,
+        """
         CREATE TABLE IF NOT EXISTS odds_snapshots (
             id BIGSERIAL PRIMARY KEY,
             fixture_id BIGINT NOT NULL REFERENCES fixtures(id)
@@ -17157,6 +17214,24 @@ def database_schema_statements() -> list[str]:
         """
         CREATE TRIGGER venue_geocodes_touch_updated_at
         BEFORE UPDATE ON venue_geocodes
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at()
+        """,
+        """
+        DROP TRIGGER IF EXISTS location_contexts_touch_updated_at
+            ON location_contexts
+        """,
+        """
+        CREATE TRIGGER location_contexts_touch_updated_at
+        BEFORE UPDATE ON location_contexts
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at()
+        """,
+        """
+        DROP TRIGGER IF EXISTS location_attempts_touch_updated_at
+            ON location_attempts
+        """,
+        """
+        CREATE TRIGGER location_attempts_touch_updated_at
+        BEFORE UPDATE ON location_attempts
         FOR EACH ROW EXECUTE FUNCTION touch_updated_at()
         """,
         """
@@ -18459,6 +18534,7 @@ def _evaluate_location_candidate(
     venue_name: str,
     expected_city: str | None,
     expected_country: str | None,
+    city_context: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     safe = _safe_locationiq_candidate(candidate)
     if safe is None:
@@ -18520,7 +18596,38 @@ def _evaluate_location_candidate(
         }
         or category in {"leisure", "sport"}
         or "stadium" in display_norm
+        or "arena" in display_norm
+        or "sports centre" in display_norm
+        or "sports center" in display_norm
     )
+
+    distance_from_city_center_km = None
+    if city_context is not None:
+        city_latitude = _safe_float(city_context.get("latitude"))
+        city_longitude = _safe_float(city_context.get("longitude"))
+        if city_latitude is not None and city_longitude is not None:
+            phi1 = math.radians(city_latitude)
+            phi2 = math.radians(float(safe["latitude"]))
+            delta_phi = math.radians(
+                float(safe["latitude"]) - city_latitude
+            )
+            delta_lambda = math.radians(
+                float(safe["longitude"]) - city_longitude
+            )
+            haversine = (
+                math.sin(delta_phi / 2.0) ** 2
+                + math.cos(phi1)
+                * math.cos(phi2)
+                * math.sin(delta_lambda / 2.0) ** 2
+            )
+            distance_from_city_center_km = (
+                6371.0088
+                * 2.0
+                * math.atan2(
+                    math.sqrt(haversine),
+                    math.sqrt(max(0.0, 1.0 - haversine)),
+                )
+            )
 
     score = 0.0
     if expected_country:
@@ -18533,9 +18640,15 @@ def _evaluate_location_candidate(
     else:
         score += 10.0
 
-    score += min(35.0, venue_overlap * 35.0)
+    score += min(30.0, venue_overlap * 30.0)
     if sports_place_match:
         score += 15.0
+
+    if distance_from_city_center_km is not None:
+        if distance_from_city_center_km <= 25.0:
+            score += 5.0
+        elif distance_from_city_center_km <= LOCATION_MAX_CITY_DISTANCE_KM:
+            score += 2.0
 
     approval_blockers: list[str] = []
 
@@ -18558,6 +18671,12 @@ def _evaluate_location_candidate(
     if safe.get("timezone_lookup_successful") is not True:
         approval_blockers.append("timezone_lookup_failed")
 
+    if (
+        distance_from_city_center_km is not None
+        and distance_from_city_center_km > LOCATION_MAX_CITY_DISTANCE_KM
+    ):
+        approval_blockers.append("outside_city_distance_limit")
+
     auto_approved = (
         score >= LOCATION_PREVIEW_AUTO_APPROVE_SCORE
         and (not expected_country or country_match)
@@ -18565,6 +18684,11 @@ def _evaluate_location_candidate(
         and sports_place_match
         and venue_overlap >= 0.50
         and safe.get("timezone_lookup_successful") is True
+        and (
+            distance_from_city_center_km is None
+            or distance_from_city_center_km
+            <= LOCATION_MAX_CITY_DISTANCE_KM
+        )
     )
 
     rejected = (
@@ -18592,6 +18716,11 @@ def _evaluate_location_candidate(
         "country_match": country_match,
         "city_match": city_match,
         "sports_place_match": sports_place_match,
+        "distance_from_city_center_km": (
+            round(distance_from_city_center_km, 3)
+            if distance_from_city_center_km is not None
+            else None
+        ),
         "confidence_score": round(score, 3),
         "approval_blockers": approval_blockers,
         "decision_status": decision_status,
@@ -18638,9 +18767,22 @@ def _fixture_row_to_location_dict(row: Any) -> dict[str, Any]:
 
 
 def _location_query_hash(query_text: str) -> str:
-    return hashlib.sha256(
-        _normalise_lookup_text(query_text).encode("utf-8")
-    ).hexdigest()
+    payload = (
+        f"{LOCATION_GEOCODE_STRATEGY_VERSION}|"
+        f"{_normalise_lookup_text(query_text)}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _location_context_hash(
+    city_name: str,
+    country_name: str,
+) -> str:
+    payload = (
+        f"city_context_v1|{_normalise_lookup_text(city_name)}|"
+        f"{_normalise_lookup_text(country_name)}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _fixture_location_priority(
@@ -18747,8 +18889,17 @@ def _load_fixture_for_location_preview(
                 SELECT query_hash
                 FROM venue_geocodes
                 WHERE query_hash = ANY(%s)
+                UNION
+                SELECT query_hash
+                FROM location_attempts
+                WHERE query_hash = ANY(%s)
+                  AND strategy_version = %s
                 """,
-                (list(query_hashes),),
+                (
+                    list(query_hashes),
+                    list(query_hashes),
+                    LOCATION_GEOCODE_STRATEGY_VERSION,
+                ),
             )
             cached_hashes = {str(row[0]) for row in cursor.fetchall()}
 
@@ -18932,15 +19083,374 @@ def _cached_geocode_preview(query_hash: str) -> dict[str, Any] | None:
     }
 
 
+def _city_context_viewbox(
+    context: dict[str, Any],
+) -> str:
+    latitude = float(context["latitude"])
+    longitude = float(context["longitude"])
+    lat_delta = LOCATION_CITY_VIEWBOX_LAT_DELTA
+    lon_scale = max(abs(math.cos(math.radians(latitude))), 0.25)
+    lon_delta = min(1.8, lat_delta / lon_scale)
+
+    min_lon = max(-180.0, longitude - lon_delta)
+    max_lon = min(180.0, longitude + lon_delta)
+    min_lat = max(-90.0, latitude - lat_delta)
+    max_lat = min(90.0, latitude + lat_delta)
+
+    return f"{min_lon},{min_lat},{max_lon},{max_lat}"
+
+
+def _cached_location_context(
+    context_hash: str,
+) -> dict[str, Any] | None:
+    with psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+        autocommit=True,
+    ) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    provider, city_name, country_name, provider_place_id,
+                    display_name, latitude, longitude, country_code,
+                    candidate_country, candidate_city,
+                    country_match, city_match, created_at
+                FROM location_contexts
+                WHERE context_hash = %s
+                """,
+                (context_hash,),
+            )
+            row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "provider": row[0],
+        "city_name": row[1],
+        "country_name": row[2],
+        "provider_place_id": row[3],
+        "display_name": row[4],
+        "latitude": float(row[5]),
+        "longitude": float(row[6]),
+        "country_code": row[7],
+        "candidate_country": row[8],
+        "candidate_city": row[9],
+        "country_match": bool(row[10]),
+        "city_match": bool(row[11]),
+        "cached_at": (
+            row[12].isoformat()
+            if isinstance(row[12], datetime)
+            else str(row[12])
+        ),
+        "cached": True,
+    }
+
+
+def _evaluate_city_context_candidate(
+    *,
+    candidate: Any,
+    expected_city: str,
+    expected_country: str,
+) -> dict[str, Any] | None:
+    safe = _safe_locationiq_candidate(candidate)
+    if safe is None:
+        return None
+
+    candidate_dict = candidate if isinstance(candidate, dict) else {}
+    address = _locationiq_address(candidate_dict)
+    candidate_country = (
+        str(address.get("country"))
+        if address.get("country") is not None
+        else None
+    )
+    candidate_country_code = (
+        str(address.get("country_code")).lower()
+        if address.get("country_code") is not None
+        else None
+    )
+    candidate_city = _candidate_city(address)
+
+    expected_country_aliases = _country_aliases(expected_country)
+    candidate_country_aliases = (
+        _country_aliases(candidate_country)
+        | _country_aliases(candidate_country_code)
+    )
+    country_match = bool(
+        expected_country_aliases.intersection(candidate_country_aliases)
+    )
+
+    expected_city_norm = _normalise_lookup_text(expected_city)
+    candidate_city_norm = _normalise_lookup_text(candidate_city)
+    display_norm = _normalise_lookup_text(safe.get("display_name"))
+    city_match = bool(
+        expected_city_norm
+        and (
+            expected_city_norm == candidate_city_norm
+            or expected_city_norm in display_norm
+        )
+    )
+
+    place_type = _normalise_lookup_text(safe.get("place_type"))
+    category = _normalise_lookup_text(safe.get("category"))
+    city_place_match = (
+        place_type in {
+            "city", "town", "municipality", "administrative",
+            "state district", "county",
+        }
+        or category in {"place", "boundary"}
+        or expected_city_norm in display_norm
+    )
+
+    score = 0.0
+    if country_match:
+        score += 45.0
+    if city_match:
+        score += 45.0
+    if city_place_match:
+        score += 10.0
+
+    return {
+        **safe,
+        "provider_place_id": candidate_dict.get("place_id"),
+        "candidate_country": candidate_country,
+        "country_code": candidate_country_code,
+        "candidate_city": candidate_city,
+        "country_match": country_match,
+        "city_match": city_match,
+        "city_place_match": city_place_match,
+        "context_score": round(score, 3),
+    }
+
+
+def _get_or_create_city_context(
+    *,
+    city_name: str,
+    country_name: str,
+) -> dict[str, Any]:
+    context_hash = _location_context_hash(city_name, country_name)
+    cached = _cached_location_context(context_hash)
+    if cached is not None:
+        return {
+            "status": "ok",
+            "provider_call_made": False,
+            "context": cached,
+        }
+
+    query_text = f"{city_name}, {country_name}"
+    try:
+        response = requests.get(
+            f"{LOCATIONIQ_BASE_URL}/search",
+            params={
+                "key": LOCATIONIQ_KEY,
+                "q": query_text,
+                "format": "json",
+                "addressdetails": 1,
+                "normalizecity": 1,
+                "dedupe": 1,
+                "limit": 5,
+            },
+            headers={
+                "Accept": "application/json",
+                "User-Agent": f"VedAstro-GPT-Proxy/{PROXY_VERSION}",
+            },
+            timeout=LOCATIONIQ_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        return {
+            "status": "error",
+            "provider_call_made": True,
+            "error_type": type(exc).__name__,
+            "message": "City context lookup could not reach LocationIQ.",
+        }
+
+    if response.status_code != 200:
+        return {
+            "status": "error",
+            "provider_call_made": True,
+            "http_status": response.status_code,
+            "message": "City context lookup returned a non-200 response.",
+        }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return {
+            "status": "error",
+            "provider_call_made": True,
+            "message": "City context lookup returned invalid JSON.",
+        }
+
+    candidates = payload if isinstance(payload, list) else []
+    evaluated = [
+        item
+        for item in (
+            _evaluate_city_context_candidate(
+                candidate=candidate,
+                expected_city=city_name,
+                expected_country=country_name,
+            )
+            for candidate in candidates
+        )
+        if item is not None
+    ]
+
+    valid = [
+        item
+        for item in evaluated
+        if item["country_match"] and item["city_match"]
+    ]
+    if not valid:
+        return {
+            "status": "no_match",
+            "provider_call_made": True,
+            "message": "No verified city/country context was found.",
+            "candidate_count": len(evaluated),
+        }
+
+    best = max(
+        valid,
+        key=lambda item: (
+            float(item.get("context_score") or 0.0),
+            float(item.get("importance") or 0.0),
+        ),
+    )
+
+    with _database_connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO location_contexts (
+                    context_hash, provider, city_name, country_name,
+                    provider_place_id, display_name, latitude, longitude,
+                    country_code, candidate_country, candidate_city,
+                    country_match, city_match, raw_response_json
+                )
+                VALUES (
+                    %s, 'locationiq', %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s::jsonb
+                )
+                ON CONFLICT (context_hash) DO UPDATE SET
+                    provider_place_id = EXCLUDED.provider_place_id,
+                    display_name = EXCLUDED.display_name,
+                    latitude = EXCLUDED.latitude,
+                    longitude = EXCLUDED.longitude,
+                    country_code = EXCLUDED.country_code,
+                    candidate_country = EXCLUDED.candidate_country,
+                    candidate_city = EXCLUDED.candidate_city,
+                    country_match = EXCLUDED.country_match,
+                    city_match = EXCLUDED.city_match,
+                    raw_response_json = EXCLUDED.raw_response_json
+                """,
+                (
+                    context_hash,
+                    city_name,
+                    country_name,
+                    (
+                        str(best.get("provider_place_id"))
+                        if best.get("provider_place_id") is not None
+                        else None
+                    ),
+                    best.get("display_name"),
+                    best["latitude"],
+                    best["longitude"],
+                    best.get("country_code"),
+                    best.get("candidate_country"),
+                    best.get("candidate_city"),
+                    best.get("country_match"),
+                    best.get("city_match"),
+                    json.dumps(
+                        {
+                            "query": query_text,
+                            "best_candidate": best,
+                            "candidate_count": len(evaluated),
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                ),
+            )
+        connection.commit()
+
+    return {
+        "status": "ok",
+        "provider_call_made": True,
+        "context": {
+            "provider": "locationiq",
+            "city_name": city_name,
+            "country_name": country_name,
+            "provider_place_id": best.get("provider_place_id"),
+            "display_name": best.get("display_name"),
+            "latitude": best["latitude"],
+            "longitude": best["longitude"],
+            "country_code": best.get("country_code"),
+            "candidate_country": best.get("candidate_country"),
+            "candidate_city": best.get("candidate_city"),
+            "country_match": best.get("country_match"),
+            "city_match": best.get("city_match"),
+            "cached": False,
+        },
+    }
+
+
+def _record_location_attempt(
+    *,
+    query_hash: str,
+    fixture_id: int | None,
+    query_text: str,
+    status: str,
+    provider_call_count: int,
+    message: str,
+    raw_response: Any,
+) -> None:
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO location_attempts (
+                        query_hash, fixture_id, strategy_version,
+                        query_text, attempt_status,
+                        provider_call_count, message, raw_response_json
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT (query_hash) DO UPDATE SET
+                        fixture_id = EXCLUDED.fixture_id,
+                        attempt_status = EXCLUDED.attempt_status,
+                        provider_call_count = EXCLUDED.provider_call_count,
+                        message = EXCLUDED.message,
+                        raw_response_json = EXCLUDED.raw_response_json
+                    """,
+                    (
+                        query_hash,
+                        fixture_id,
+                        LOCATION_GEOCODE_STRATEGY_VERSION,
+                        query_text,
+                        status,
+                        provider_call_count,
+                        message,
+                        json.dumps(
+                            raw_response,
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                    ),
+                )
+            connection.commit()
+    except Exception:
+        # A failed audit-cache write must not crash the astronomy service.
+        return
+
+
 def preview_fixture_location(
     *,
     fixture_id: int | None = None,
 ) -> dict[str, Any]:
     """
-    Geocode exactly one stored fixture and cache the best candidate.
+    Preview one venue using a verified city-bounded search.
 
-    This DB6 checkpoint never updates the fixture coordinates. A later step
-    will commit only an approved candidate.
+    DB6C still never updates fixture latitude, longitude or timezone.
     """
     if not LOCATIONIQ_KEY:
         return {
@@ -18981,35 +19491,98 @@ def preview_fixture_location(
             "status": "ok",
             "previewed": True,
             "provider_call_made": False,
+            "provider_call_count": 0,
+            "strategy_version": LOCATION_GEOCODE_STRATEGY_VERSION,
             "fixture": fixture,
             "preview": cached,
             "fixture_updated": False,
         }
 
+    city_name = fixture.get("venue_city")
+    country_name = fixture.get("competition_country")
+    if not city_name or not country_name:
+        _record_location_attempt(
+            query_hash=query_hash,
+            fixture_id=fixture.get("database_fixture_id"),
+            query_text=query_text,
+            status="MISSING_CITY_CONTEXT",
+            provider_call_count=0,
+            message="Fixture city or country is missing.",
+            raw_response={},
+        )
+        return {
+            "status": "no_match",
+            "previewed": False,
+            "fixture": fixture,
+            "query_text": query_text,
+            "message": "Fixture city or country is missing.",
+        }
+
+    context_result = _get_or_create_city_context(
+        city_name=str(city_name),
+        country_name=str(country_name),
+    )
+    provider_call_count = (
+        1 if context_result.get("provider_call_made") else 0
+    )
+
+    if context_result.get("status") != "ok":
+        _record_location_attempt(
+            query_hash=query_hash,
+            fixture_id=fixture.get("database_fixture_id"),
+            query_text=query_text,
+            status="CITY_CONTEXT_NOT_VERIFIED",
+            provider_call_count=provider_call_count,
+            message=str(context_result.get("message") or ""),
+            raw_response=context_result,
+        )
+        return {
+            "status": "no_match",
+            "previewed": False,
+            "strategy_version": LOCATION_GEOCODE_STRATEGY_VERSION,
+            "fixture": fixture,
+            "query_text": query_text,
+            "provider_call_count": provider_call_count,
+            "city_context_result": context_result,
+            "message": "Venue search stopped because city context failed.",
+        }
+
+    city_context = context_result["context"]
+    viewbox = _city_context_viewbox(city_context)
+
+    params = {
+        "key": LOCATIONIQ_KEY,
+        "q": str(fixture["venue_name"]),
+        "format": "json",
+        "addressdetails": 1,
+        "normalizecity": 1,
+        "dedupe": 1,
+        "limit": 10,
+        "viewbox": viewbox,
+        "bounded": 1,
+    }
+    country_code = city_context.get("country_code")
+    if country_code:
+        params["countrycodes"] = str(country_code).lower()
+
     try:
         response = requests.get(
             f"{LOCATIONIQ_BASE_URL}/search",
-            params={
-                "key": LOCATIONIQ_KEY,
-                "q": query_text,
-                "format": "json",
-                "addressdetails": 1,
-                "normalizecity": 1,
-                "dedupe": 1,
-                "limit": 3,
-            },
+            params=params,
             headers={
                 "Accept": "application/json",
                 "User-Agent": f"VedAstro-GPT-Proxy/{PROXY_VERSION}",
             },
             timeout=LOCATIONIQ_TIMEOUT_SECONDS,
         )
+        provider_call_count += 1
     except requests.RequestException as exc:
         return {
             "status": "error",
             "previewed": False,
             "error_type": type(exc).__name__,
-            "message": "LocationIQ could not be reached.",
+            "provider_call_count": provider_call_count,
+            "message": "Bounded venue search could not reach LocationIQ.",
         }
 
     if response.status_code != 200:
@@ -19017,7 +19590,8 @@ def preview_fixture_location(
             "status": "error",
             "previewed": False,
             "http_status": response.status_code,
-            "message": "LocationIQ returned a non-200 response.",
+            "provider_call_count": provider_call_count,
+            "message": "Bounded venue search returned a non-200 response.",
         }
 
     try:
@@ -19026,7 +19600,8 @@ def preview_fixture_location(
         return {
             "status": "error",
             "previewed": False,
-            "message": "LocationIQ returned invalid JSON.",
+            "provider_call_count": provider_call_count,
+            "message": "Bounded venue search returned invalid JSON.",
         }
 
     candidates = payload if isinstance(payload, list) else []
@@ -19036,8 +19611,9 @@ def preview_fixture_location(
             _evaluate_location_candidate(
                 candidate=candidate,
                 venue_name=str(fixture["venue_name"]),
-                expected_city=fixture.get("venue_city"),
-                expected_country=fixture.get("competition_country"),
+                expected_city=str(city_name),
+                expected_country=str(country_name),
+                city_context=city_context,
             )
             for candidate in candidates
         )
@@ -19045,18 +19621,36 @@ def preview_fixture_location(
     ]
 
     if not evaluated:
+        _record_location_attempt(
+            query_hash=query_hash,
+            fixture_id=fixture.get("database_fixture_id"),
+            query_text=query_text,
+            status="NO_BOUNDED_VENUE_MATCH",
+            provider_call_count=provider_call_count,
+            message="No usable venue candidate inside the city viewbox.",
+            raw_response={
+                "city_context": city_context,
+                "viewbox": viewbox,
+                "candidate_count": 0,
+            },
+        )
         return {
             "status": "no_match",
             "previewed": False,
+            "strategy_version": LOCATION_GEOCODE_STRATEGY_VERSION,
             "fixture": fixture,
             "query_text": query_text,
-            "message": "No usable geocoding candidate was returned.",
+            "provider_call_count": provider_call_count,
+            "city_context": city_context,
+            "viewbox": viewbox,
+            "message": "No usable venue candidate inside the city viewbox.",
         }
 
     best = max(
         evaluated,
         key=lambda item: (
             float(item.get("confidence_score") or 0.0),
+            -float(item.get("distance_from_city_center_km") or 9999.0),
             float(item.get("importance") or 0.0),
         ),
     )
@@ -19114,8 +19708,8 @@ def preview_fixture_location(
                     query_hash,
                     query_text,
                     fixture.get("venue_name"),
-                    fixture.get("venue_city"),
-                    fixture.get("competition_country"),
+                    city_name,
+                    country_name,
                     (
                         str(best.get("provider_place_id"))
                         if best.get("provider_place_id") is not None
@@ -19136,7 +19730,13 @@ def preview_fixture_location(
                     best.get("decision_status"),
                     json.dumps(
                         {
+                            "strategy_version": (
+                                LOCATION_GEOCODE_STRATEGY_VERSION
+                            ),
                             "query": query_text,
+                            "city_context": city_context,
+                            "viewbox": viewbox,
+                            "bounded": True,
                             "best_candidate": best,
                             "candidate_count": len(evaluated),
                         },
@@ -19147,18 +19747,20 @@ def preview_fixture_location(
             )
         connection.commit()
 
-    safe_best = {
-        key: value
-        for key, value in best.items()
-        if key not in {"raw_response_json"}
-    }
+    safe_best = dict(best)
 
     return {
         "status": "ok",
         "previewed": True,
-        "provider_call_made": True,
+        "provider_call_made": provider_call_count > 0,
+        "provider_call_count": provider_call_count,
+        "strategy_version": LOCATION_GEOCODE_STRATEGY_VERSION,
         "fixture": fixture,
         "query_text": query_text,
+        "city_context": city_context,
+        "viewbox": viewbox,
+        "bounded_search": True,
+        "country_filter_applied": bool(country_code),
         "candidate_count": len(evaluated),
         "preview": {
             **safe_best,
@@ -19166,7 +19768,8 @@ def preview_fixture_location(
         },
         "fixture_updated": False,
         "next_action": (
-            "Review this candidate. DB6 does not commit coordinates."
+            "Review this city-bounded candidate. DB6C does not commit "
+            "coordinates."
         ),
     }
 
@@ -19246,7 +19849,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB6B skip rejected/cached venues and preview next",
+        "database_checkpoint": "DB6C city-bounded venue geocoding preview",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -19296,6 +19899,15 @@ def health() -> dict[str, Any]:
             "prefer_sports_venue_names": True,
             "coordinates_committed": False,
         },
+        "location_geocode_strategy": {
+            "version": LOCATION_GEOCODE_STRATEGY_VERSION,
+            "city_context_required": True,
+            "bounded_viewbox_required": True,
+            "country_code_filter_used_when_available": True,
+            "maximum_city_distance_km": LOCATION_MAX_CITY_DISTANCE_KM,
+            "negative_attempts_cached": True,
+            "coordinates_committed": False,
+        },
         "locationiq_public_attribution_required": True,
         "ayanamsa": "Lahiri",
         "engine": "VedAstro.Python",
@@ -19303,7 +19915,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + geocode queue DB6B",
+        "response_mode": "prediction-grade compact v2 + city-bounded geocoding DB6C",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -19420,6 +20032,14 @@ def location_preview_status() -> dict[str, Any]:
             "scan_limit": LOCATION_PREVIEW_QUEUE_SCAN_LIMIT,
             "skip_cached_queries": True,
             "prefer_sports_venue_names": True,
+        },
+        "geocode_strategy": {
+            "version": LOCATION_GEOCODE_STRATEGY_VERSION,
+            "city_context_required": True,
+            "bounded_viewbox_required": True,
+            "country_code_filter_used_when_available": True,
+            "maximum_city_distance_km": LOCATION_MAX_CITY_DISTANCE_KM,
+            "negative_attempts_cached": True,
         },
         "startup_status": LOCATION_PREVIEW_STARTUP_STATUS,
     }
