@@ -41,7 +41,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db4"
+PROXY_VERSION = "1.20.0-db4a"
 
 
 # ============================================================
@@ -17238,6 +17238,11 @@ FIXTURE_SYNC_STARTUP_STATUS: dict[str, Any] = {
     "synced": False,
 }
 
+FIXTURE_TIMEZONE_MIGRATION_STATUS: dict[str, Any] = {
+    "status": "not_started",
+    "updated_rows": 0,
+}
+
 
 @app.on_event("startup")
 def import_today_fixtures_on_startup() -> None:
@@ -17247,6 +17252,12 @@ def import_today_fixtures_on_startup() -> None:
     Failures do not stop the astrology service.
     """
     global FIXTURE_SYNC_STARTUP_STATUS
+    global FIXTURE_TIMEZONE_MIGRATION_STATUS
+
+    FIXTURE_TIMEZONE_MIGRATION_STATUS = (
+        clear_unverified_fixture_timezones_once()
+    )
+
     if not DATABASE_URL or not API_FOOTBALL_KEY:
         FIXTURE_SYNC_STARTUP_STATUS = {
             "status": "not_configured",
@@ -17655,11 +17666,10 @@ def _normalise_api_fixture(item: Any) -> dict[str, Any] | None:
             if venue.get("city") is not None
             else None
         ),
-        "timezone_name": (
-            str(fixture.get("timezone"))
-            if fixture.get("timezone") is not None
-            else SOCCER_DISPLAY_TIMEZONE
-        ),
+        # API-Football returns the timezone requested by the caller here.
+        # It is a display/conversion timezone, not verified venue-local time.
+        # Keep venue timezone empty until coordinate/timezone enrichment.
+        "timezone_name": None,
         "fixture_status": canonical_status,
         "provider_status": provider_status,
         "raw_fixture_json": item,
@@ -17872,10 +17882,77 @@ def sync_today_fixtures(
     }
 
 
+def clear_unverified_fixture_timezones_once() -> dict[str, Any]:
+    """
+    Clear DB4 values that represented the website display timezone rather
+    than verified venue-local timezone.
+
+    The migration is idempotent and recorded in app_metadata.
+    """
+    migration_key = "migration_db4a_unverified_fixture_timezone_cleared"
+
+    if not DATABASE_URL or psycopg is None:
+        return {
+            "status": "not_configured",
+            "updated_rows": 0,
+        }
+
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT value FROM app_metadata WHERE key = %s",
+                    (migration_key,),
+                )
+                existing = cursor.fetchone()
+                if existing and existing[0] == "true":
+                    return {
+                        "status": "ok",
+                        "already_applied": True,
+                        "updated_rows": 0,
+                    }
+
+                cursor.execute(
+                    """
+                    UPDATE fixtures
+                    SET timezone_name = NULL,
+                        updated_at = NOW()
+                    WHERE provider = 'api-football'
+                      AND timezone_name = %s
+                    """,
+                    (SOCCER_DISPLAY_TIMEZONE,),
+                )
+                updated_rows = cursor.rowcount
+
+                cursor.execute(
+                    """
+                    INSERT INTO app_metadata (key, value)
+                    VALUES (%s, 'true')
+                    ON CONFLICT (key) DO UPDATE
+                    SET value = EXCLUDED.value, updated_at = NOW()
+                    """,
+                    (migration_key,),
+                )
+            connection.commit()
+
+        return {
+            "status": "ok",
+            "already_applied": False,
+            "updated_rows": updated_rows,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error_type": type(exc).__name__,
+            "updated_rows": 0,
+        }
+
+
 def list_stored_fixtures(
     *,
     window: str,
     limit: int,
+    include_completed: bool = False,
 ) -> dict[str, Any]:
     start_utc, end_utc = _fixture_window_utc(window)
     safe_limit = max(1, min(int(limit), FIXTURE_LIST_MAX_LIMIT))
@@ -17887,6 +17964,13 @@ def list_stored_fixtures(
             autocommit=True,
         ) as connection:
             with connection.cursor() as cursor:
+                now_utc = datetime.now(timezone.utc)
+                effective_start = (
+                    start_utc
+                    if include_completed
+                    else max(start_utc, now_utc)
+                )
+
                 cursor.execute(
                     """
                     SELECT
@@ -17908,10 +17992,19 @@ def list_stored_fixtures(
                     WHERE sport = 'soccer'
                       AND kickoff_utc >= %s
                       AND kickoff_utc < %s
+                      AND (
+                          %s
+                          OR fixture_status = 'scheduled'
+                      )
                     ORDER BY kickoff_utc, competition_name, home_team
                     LIMIT %s
                     """,
-                    (start_utc, end_utc, safe_limit),
+                    (
+                        effective_start,
+                        end_utc,
+                        include_completed,
+                        safe_limit,
+                    ),
                 )
                 rows = cursor.fetchall()
     except Exception as exc:
@@ -17951,7 +18044,8 @@ def list_stored_fixtures(
             ),
             "venue_name": row[8],
             "venue_city": row[9],
-            "timezone": row[10],
+            "venue_timezone": row[10],
+            "venue_timezone_verified": row[10] is not None,
             "fixture_status": row[11],
             "latitude": row[12],
             "longitude": row[13],
@@ -17960,15 +18054,27 @@ def list_stored_fixtures(
             ),
             "prediction_ready": (
                 row[8] is not None
+                and row[10] is not None
                 and row[12] is not None
                 and row[13] is not None
             ),
+            "prediction_blockers": [
+                blocker
+                for blocker, missing in (
+                    ("venue_name_missing", row[8] is None),
+                    ("venue_timezone_unverified", row[10] is None),
+                    ("latitude_missing", row[12] is None),
+                    ("longitude_missing", row[13] is None),
+                )
+                if missing
+            ],
         })
 
     return {
         "status": "ok",
         "ready": True,
         "window": window,
+        "include_completed": include_completed,
         "display_timezone": SOCCER_DISPLAY_TIMEZONE,
         "range_utc": {
             "start": start_utc.isoformat(),
@@ -18016,7 +18122,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB4 today-fixture import and listing",
+        "database_checkpoint": "DB4A upcoming-only listing and timezone semantics fix",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -18031,8 +18137,11 @@ def health() -> dict[str, Any]:
             FIXTURE_SYNC_MIN_INTERVAL_SECONDS
         ),
         "fixture_sync_startup_status": FIXTURE_SYNC_STARTUP_STATUS,
+        "fixture_timezone_migration_status": (
+            FIXTURE_TIMEZONE_MIGRATION_STATUS
+        ),
         "fixture_import_checkpoint": (
-            "today only; tomorrow/7d/30d provider sync comes next"
+            "today imported; default listing now shows upcoming only"
         ),
         "ayanamsa": "Lahiri",
         "engine": "VedAstro.Python",
@@ -18040,7 +18149,7 @@ def health() -> dict[str, Any]:
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + fixture checkpoint DB4",
+        "response_mode": "prediction-grade compact v2 + fixture correction DB4A",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -18136,12 +18245,19 @@ def fixtures(
         ge=1,
         le=FIXTURE_LIST_MAX_LIMIT,
     ),
+    include_completed: bool = Query(default=False),
 ) -> dict[str, Any]:
     """
-    List stored fixtures. DB4 imports today only; later releases fill the
-    longer windows.
+    List stored fixtures.
+
+    Default behaviour is future scheduled fixtures only. Historical/completed
+    rows remain available with include_completed=true for later auditing.
     """
-    result = list_stored_fixtures(window=window, limit=limit)
+    result = list_stored_fixtures(
+        window=window,
+        limit=limit,
+        include_completed=include_completed,
+    )
     if not result.get("ready"):
         raise HTTPException(status_code=503, detail=result)
     return result
@@ -18158,6 +18274,7 @@ def fixtures_sync_status() -> dict[str, Any]:
             FIXTURE_SYNC_MIN_INTERVAL_SECONDS
         ),
         "startup_status": FIXTURE_SYNC_STARTUP_STATUS,
+        "timezone_migration_status": FIXTURE_TIMEZONE_MIGRATION_STATUS,
         "metadata": metadata,
     }
 
