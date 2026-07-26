@@ -40,7 +40,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.20.0-db1"
+PROXY_VERSION = "1.20.0-db2"
 
 
 # ============================================================
@@ -55,6 +55,19 @@ PROXY_API_KEY = os.getenv("PROXY_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DATABASE_CONNECT_TIMEOUT_SECONDS = int(
     os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "8")
+)
+DATABASE_SCHEMA_VERSION = "1.20.0-db2"
+DATABASE_EXPECTED_TABLES = (
+    "app_metadata",
+    "fixtures",
+    "odds_snapshots",
+    "performance_snapshots",
+    "chart_runs",
+    "prediction_runs",
+    "official_results",
+    "post_match_audits",
+    "model_versions",
+    "training_runs",
 )
 
 # This is the MINIMUM delay between the START of upstream calls.
@@ -16662,15 +16675,34 @@ def calculate_planet(
 
 
 # ============================================================
-# DATABASE CONNECTIVITY — CHECKPOINT DB1
+# DATABASE — CHECKPOINT DB2
 # ============================================================
+
+DATABASE_SCHEMA_STARTUP_STATUS: dict[str, Any] = {
+    "status": "not_run",
+    "schema_version": DATABASE_SCHEMA_VERSION,
+}
+
+
+def _database_connect():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured.")
+    if psycopg is None:
+        raise RuntimeError(
+            "The psycopg driver is unavailable. "
+            "Add psycopg[binary]>=3.2,<4 to requirements.txt."
+        )
+    return psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+    )
+
 
 def database_connection_status() -> dict[str, Any]:
     """
     Verify that Render can reach PostgreSQL using DATABASE_URL.
 
-    This checkpoint deliberately performs only SELECT 1. It does not create,
-    update or delete database objects.
+    This check performs SELECT 1 only and never exposes credentials.
     """
     if not DATABASE_URL:
         return {
@@ -16711,7 +16743,6 @@ def database_connection_status() -> dict[str, Any]:
             "operation": "SELECT 1 only",
         }
     except Exception as exc:
-        # Do not expose credentials, hostnames or the connection URL.
         return {
             "status": "error",
             "connected": False,
@@ -16719,6 +16750,455 @@ def database_connection_status() -> dict[str, Any]:
             "error_type": type(exc).__name__,
             "message": "Database connection failed.",
         }
+
+
+def database_schema_statements() -> list[str]:
+    """
+    Return the idempotent PostgreSQL schema used by the automated platform.
+
+    The schema stores immutable pre-match predictions separately from results
+    and audits so a completed event can never rewrite the original forecast.
+    """
+    return [
+        """
+        CREATE TABLE IF NOT EXISTS app_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS fixtures (
+            id BIGSERIAL PRIMARY KEY,
+            provider TEXT NOT NULL,
+            provider_fixture_id TEXT NOT NULL,
+            sport TEXT NOT NULL DEFAULT 'soccer',
+            competition_name TEXT NOT NULL,
+            competition_country TEXT,
+            season TEXT,
+            home_team TEXT NOT NULL,
+            away_team TEXT NOT NULL,
+            kickoff_utc TIMESTAMPTZ NOT NULL,
+            venue_name TEXT,
+            venue_city TEXT,
+            latitude DOUBLE PRECISION,
+            longitude DOUBLE PRECISION,
+            timezone_name TEXT,
+            fixture_status TEXT NOT NULL DEFAULT 'scheduled',
+            neutral_venue BOOLEAN NOT NULL DEFAULT FALSE,
+            raw_fixture_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (provider, provider_fixture_id)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_fixtures_kickoff_utc
+            ON fixtures (kickoff_utc)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_fixtures_status_kickoff
+            ON fixtures (fixture_status, kickoff_utc)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS odds_snapshots (
+            id BIGSERIAL PRIMARY KEY,
+            fixture_id BIGINT NOT NULL REFERENCES fixtures(id)
+                ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            captured_at TIMESTAMPTZ NOT NULL,
+            home_odds NUMERIC(10,4),
+            draw_odds NUMERIC(10,4),
+            away_odds NUMERIC(10,4),
+            no_margin_home NUMERIC(10,6),
+            no_margin_draw NUMERIC(10,6),
+            no_margin_away NUMERIC(10,6),
+            consensus_favourite TEXT CHECK (
+                consensus_favourite IN ('HOME', 'DRAW', 'AWAY', 'PICKEM')
+            ),
+            bookmaker_count INTEGER,
+            raw_odds_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (fixture_id, provider, captured_at)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_odds_fixture_captured
+            ON odds_snapshots (fixture_id, captured_at DESC)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS performance_snapshots (
+            id BIGSERIAL PRIMARY KEY,
+            fixture_id BIGINT NOT NULL REFERENCES fixtures(id)
+                ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            captured_at TIMESTAMPTZ NOT NULL,
+            starting_xi_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+            injuries_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+            home_features JSONB NOT NULL DEFAULT '{}'::jsonb,
+            away_features JSONB NOT NULL DEFAULT '{}'::jsonb,
+            draw_features JSONB NOT NULL DEFAULT '{}'::jsonb,
+            raw_performance_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (fixture_id, provider, captured_at)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_performance_fixture_captured
+            ON performance_snapshots (fixture_id, captured_at DESC)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS chart_runs (
+            id BIGSERIAL PRIMARY KEY,
+            fixture_id BIGINT NOT NULL REFERENCES fixtures(id)
+                ON DELETE CASCADE,
+            event_id TEXT NOT NULL UNIQUE,
+            chart_version INTEGER NOT NULL DEFAULT 1,
+            venue_local_std_time TEXT NOT NULL,
+            venue_name TEXT NOT NULL,
+            latitude DOUBLE PRECISION NOT NULL,
+            longitude DOUBLE PRECISION NOT NULL,
+            favourite_participant TEXT NOT NULL,
+            opponent_participant TEXT NOT NULL,
+            action_input JSONB NOT NULL,
+            action_output JSONB NOT NULL,
+            validation_status TEXT NOT NULL,
+            practical_hard_veto BOOLEAN,
+            confidence_cap TEXT,
+            cluster_signature TEXT,
+            backend_version TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_chart_runs_fixture
+            ON chart_runs (fixture_id, created_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_chart_runs_cluster_signature
+            ON chart_runs (cluster_signature)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS prediction_runs (
+            id BIGSERIAL PRIMARY KEY,
+            fixture_id BIGINT NOT NULL REFERENCES fixtures(id)
+                ON DELETE CASCADE,
+            chart_run_id BIGINT REFERENCES chart_runs(id)
+                ON DELETE RESTRICT,
+            odds_snapshot_id BIGINT REFERENCES odds_snapshots(id)
+                ON DELETE RESTRICT,
+            performance_snapshot_id BIGINT REFERENCES performance_snapshots(id)
+                ON DELETE RESTRICT,
+            event_id TEXT NOT NULL,
+            prediction_version INTEGER NOT NULL DEFAULT 1,
+            prediction_horizon TEXT NOT NULL CHECK (
+                prediction_horizon IN (
+                    'PRELIMINARY', 'FINAL_PREMATCH', 'PERFORMANCE_ONLY'
+                )
+            ),
+            predicted_outcome TEXT NOT NULL CHECK (
+                predicted_outcome IN ('HOME', 'DRAW', 'AWAY')
+            ),
+            market_baseline TEXT CHECK (
+                market_baseline IN ('HOME', 'DRAW', 'AWAY')
+            ),
+            house1_participant TEXT,
+            house7_participant TEXT,
+            confidence TEXT CHECK (
+                confidence IN ('HIGH', 'MEDIUM', 'LOW')
+            ),
+            eligibility TEXT CHECK (
+                eligibility IN ('CONDITIONAL', 'NO', 'RESEARCH_ONLY')
+            ),
+            astrology_reliability TEXT,
+            evidence_strength TEXT,
+            signed_interval_low NUMERIC(12,4),
+            signed_interval_high NUMERIC(12,4),
+            model_version TEXT NOT NULL,
+            instruction_version TEXT NOT NULL,
+            backend_version TEXT NOT NULL,
+            prediction_payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            frozen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (event_id, prediction_version)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_predictions_fixture_created
+            ON prediction_runs (fixture_id, created_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_predictions_outcome
+            ON prediction_runs (predicted_outcome)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS official_results (
+            id BIGSERIAL PRIMARY KEY,
+            fixture_id BIGINT NOT NULL UNIQUE REFERENCES fixtures(id)
+                ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            provider_status TEXT NOT NULL,
+            home_score_90 INTEGER,
+            away_score_90 INTEGER,
+            actual_result_90 TEXT CHECK (
+                actual_result_90 IN ('HOME', 'DRAW', 'AWAY')
+            ),
+            extra_time_played BOOLEAN NOT NULL DEFAULT FALSE,
+            penalties_played BOOLEAN NOT NULL DEFAULT FALSE,
+            verified_at TIMESTAMPTZ NOT NULL,
+            raw_result_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS post_match_audits (
+            id BIGSERIAL PRIMARY KEY,
+            prediction_id BIGINT NOT NULL UNIQUE REFERENCES prediction_runs(id)
+                ON DELETE RESTRICT,
+            result_id BIGINT NOT NULL REFERENCES official_results(id)
+                ON DELETE RESTRICT,
+            prediction_correct BOOLEAN NOT NULL,
+            market_baseline_correct BOOLEAN,
+            error_labels TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+            primary_error_label TEXT,
+            knowable_before_kickoff JSONB NOT NULL DEFAULT '[]'::jsonb,
+            not_knowable_before_kickoff JSONB NOT NULL DEFAULT '[]'::jsonb,
+            strongest_failure_reason TEXT,
+            audit_summary TEXT NOT NULL,
+            rule_change_recommended BOOLEAN NOT NULL DEFAULT FALSE,
+            audit_version TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_audits_primary_error
+            ON post_match_audits (primary_error_label)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS model_versions (
+            id BIGSERIAL PRIMARY KEY,
+            model_name TEXT NOT NULL,
+            model_version TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL CHECK (
+                status IN ('CHAMPION', 'CHALLENGER', 'REJECTED', 'ARCHIVED')
+            ),
+            trained_until TIMESTAMPTZ,
+            training_match_count INTEGER NOT NULL DEFAULT 0,
+            feature_schema_version TEXT,
+            dataset_hash TEXT,
+            metrics_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            model_artifact_uri TEXT,
+            promoted_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS training_runs (
+            id BIGSERIAL PRIMARY KEY,
+            challenger_model_version TEXT NOT NULL,
+            champion_model_version TEXT,
+            training_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            training_completed_at TIMESTAMPTZ,
+            training_match_count INTEGER,
+            validation_match_count INTEGER,
+            test_match_count INTEGER,
+            metrics_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            promotion_decision TEXT CHECK (
+                promotion_decision IN ('PENDING', 'PROMOTE', 'REJECT')
+            ) DEFAULT 'PENDING',
+            notes TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE OR REPLACE FUNCTION touch_updated_at()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            NEW.updated_at = NOW();
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """,
+        """
+        DROP TRIGGER IF EXISTS fixtures_touch_updated_at ON fixtures
+        """,
+        """
+        CREATE TRIGGER fixtures_touch_updated_at
+        BEFORE UPDATE ON fixtures
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at()
+        """,
+        """
+        DROP TRIGGER IF EXISTS results_touch_updated_at ON official_results
+        """,
+        """
+        CREATE TRIGGER results_touch_updated_at
+        BEFORE UPDATE ON official_results
+        FOR EACH ROW EXECUTE FUNCTION touch_updated_at()
+        """,
+        """
+        CREATE OR REPLACE FUNCTION prevent_frozen_prediction_mutation()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF OLD.frozen_at IS NOT NULL THEN
+                RAISE EXCEPTION
+                    'Frozen prediction records are immutable; insert a new version.';
+            END IF;
+            IF TG_OP = 'DELETE' THEN
+                RETURN OLD;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """,
+        """
+        DROP TRIGGER IF EXISTS prediction_runs_immutable
+            ON prediction_runs
+        """,
+        """
+        CREATE TRIGGER prediction_runs_immutable
+        BEFORE UPDATE OR DELETE ON prediction_runs
+        FOR EACH ROW EXECUTE FUNCTION prevent_frozen_prediction_mutation()
+        """,
+        """
+        INSERT INTO app_metadata (key, value)
+        VALUES ('schema_version', %s)
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value, updated_at = NOW()
+        """,
+    ]
+
+
+def ensure_database_schema() -> dict[str, Any]:
+    """
+    Create or update the database schema idempotently.
+
+    An advisory transaction lock prevents concurrent Render workers from
+    attempting the same migration at the same time.
+    """
+    statements = database_schema_statements()
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(%s)", (1200002,))
+                for statement in statements[:-1]:
+                    cursor.execute(statement)
+                cursor.execute(
+                    statements[-1],
+                    (DATABASE_SCHEMA_VERSION,),
+                )
+            connection.commit()
+
+        return {
+            "status": "ok",
+            "initialized": True,
+            "schema_version": DATABASE_SCHEMA_VERSION,
+            "expected_table_count": len(DATABASE_EXPECTED_TABLES),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "initialized": False,
+            "schema_version": DATABASE_SCHEMA_VERSION,
+            "error_type": type(exc).__name__,
+            "message": "Database schema initialization failed.",
+        }
+
+
+def database_schema_status() -> dict[str, Any]:
+    """
+    Verify schema version, expected tables and current row counts.
+    """
+    if not DATABASE_URL or psycopg is None:
+        return {
+            "status": "unavailable",
+            "ready": False,
+            "schema_version": None,
+            "missing_tables": list(DATABASE_EXPECTED_TABLES),
+        }
+
+    try:
+        with psycopg.connect(
+            DATABASE_URL,
+            connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+            autocommit=True,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                      AND table_name = ANY(%s)
+                    ORDER BY table_name
+                    """,
+                    (list(DATABASE_EXPECTED_TABLES),),
+                )
+                present = [row[0] for row in cursor.fetchall()]
+                missing = sorted(set(DATABASE_EXPECTED_TABLES) - set(present))
+
+                cursor.execute(
+                    """
+                    SELECT value
+                    FROM app_metadata
+                    WHERE key = 'schema_version'
+                    """
+                )
+                version_row = cursor.fetchone()
+                schema_version = version_row[0] if version_row else None
+
+                row_counts: dict[str, int] = {}
+                for table_name in DATABASE_EXPECTED_TABLES:
+                    if table_name in present:
+                        cursor.execute(
+                            f'SELECT COUNT(*) FROM "{table_name}"'
+                        )
+                        count_row = cursor.fetchone()
+                        row_counts[table_name] = (
+                            int(count_row[0]) if count_row else 0
+                        )
+
+        return {
+            "status": "ok" if not missing else "incomplete",
+            "ready": (
+                not missing
+                and schema_version == DATABASE_SCHEMA_VERSION
+            ),
+            "schema_version": schema_version,
+            "expected_schema_version": DATABASE_SCHEMA_VERSION,
+            "present_tables": present,
+            "missing_tables": missing,
+            "row_counts": row_counts,
+            "prediction_records_immutable": (
+                "prediction_runs" in present
+            ),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "ready": False,
+            "schema_version": None,
+            "error_type": type(exc).__name__,
+            "message": "Database schema verification failed.",
+        }
+
+
+@app.on_event("startup")
+def initialize_database_on_startup() -> None:
+    """
+    Create the DB2 schema automatically when Render starts this service.
+
+    Failure is recorded but does not stop the astrology API from starting.
+    """
+    global DATABASE_SCHEMA_STARTUP_STATUS
+    if not DATABASE_URL:
+        DATABASE_SCHEMA_STARTUP_STATUS = {
+            "status": "not_configured",
+            "initialized": False,
+            "schema_version": DATABASE_SCHEMA_VERSION,
+        }
+        return
+    DATABASE_SCHEMA_STARTUP_STATUS = ensure_database_schema()
 
 
 # ============================================================
@@ -16757,14 +17237,16 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "DB1 connectivity only; no tables created",
+        "database_checkpoint": "DB2 schema created; storage endpoints not added yet",
+        "database_schema_version": DATABASE_SCHEMA_VERSION,
+        "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "ayanamsa": "Lahiri",
         "engine": "VedAstro.Python",
         "planet_parameter_shape": "nested PlanetName object",
         "vedastro_authentication": (
             "x-api-key header with APIKey body fallback"
         ),
-        "response_mode": "prediction-grade compact v2 + database checkpoint DB1",
+        "response_mode": "prediction-grade compact v2 + database checkpoint DB2",
         "action_response_target_characters": (
             ACTION_RESPONSE_TARGET_CHARACTERS
         ),
@@ -16820,6 +17302,17 @@ def database_health() -> dict[str, Any]:
     """
     result = database_connection_status()
     if not result.get("connected"):
+        raise HTTPException(status_code=503, detail=result)
+    return result
+
+
+@app.get("/database-schema")
+def database_schema() -> dict[str, Any]:
+    """
+    Public, non-secret schema verification for the setup process.
+    """
+    result = database_schema_status()
+    if not result.get("ready"):
         raise HTTPException(status_code=503, detail=result)
     return result
 
