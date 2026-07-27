@@ -8,6 +8,8 @@ import math
 import os
 import threading
 import time
+import traceback
+import difflib
 import re
 import statistics
 import unicodedata
@@ -51,7 +53,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.22.3-predict1c"
+PROXY_VERSION = "1.22.5-predict1e"
 
 
 # ============================================================
@@ -122,6 +124,54 @@ VENUE_IDENTITY_REFRESH_MIN_INTERVAL_SECONDS = max(
         os.getenv(
             "VENUE_IDENTITY_REFRESH_MIN_INTERVAL_SECONDS",
             "21600",
+        )
+    ),
+)
+
+# PREDICT1E independently cross-checks the selected fixture online before
+# geocoding or astrology. API-Football remains the primary fixture source;
+# TheSportsDB is a secondary fixture-specific source, and LocationIQ verifies
+# the physical stadium and derives the venue timezone.
+ONLINE_MATCH_VERIFY_ENABLED = os.getenv(
+    "ONLINE_MATCH_VERIFY_ENABLED",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+THESPORTSDB_API_KEY = os.getenv(
+    "THESPORTSDB_API_KEY",
+    "123",
+).strip()
+THESPORTSDB_BASE_URL = os.getenv(
+    "THESPORTSDB_BASE_URL",
+    "https://www.thesportsdb.com/api/v1/json",
+).rstrip("/")
+THESPORTSDB_TIMEOUT_SECONDS = max(
+    5,
+    int(os.getenv("THESPORTSDB_TIMEOUT_SECONDS", "15")),
+)
+ONLINE_MATCH_VERIFY_MIN_INTERVAL_SECONDS = max(
+    900,
+    int(os.getenv("ONLINE_MATCH_VERIFY_MIN_INTERVAL_SECONDS", "21600")),
+)
+ONLINE_MATCH_VERIFY_TEAM_SIMILARITY = max(
+    0.70,
+    min(
+        float(os.getenv("ONLINE_MATCH_VERIFY_TEAM_SIMILARITY", "0.80")),
+        1.0,
+    ),
+)
+ONLINE_MATCH_VERIFY_VENUE_SIMILARITY = max(
+    0.50,
+    min(
+        float(os.getenv("ONLINE_MATCH_VERIFY_VENUE_SIMILARITY", "0.68")),
+        1.0,
+    ),
+)
+ONLINE_MATCH_VERIFY_MAX_KICKOFF_DELTA_MINUTES = max(
+    30,
+    int(
+        os.getenv(
+            "ONLINE_MATCH_VERIFY_MAX_KICKOFF_DELTA_MINUTES",
+            "180",
         )
     ),
 )
@@ -24777,6 +24827,792 @@ def _predict1_refresh_fixture_identity(
     return result
 
 
+
+PREDICT1_ONLINE_MATCH_VERIFY_PREFIX = "predict1_online_match_verify:"
+
+
+def _predict1_compare_text(value: Any) -> str:
+    text_value = unicodedata.normalize(
+        "NFKD",
+        str(value or ""),
+    ).encode("ascii", "ignore").decode("ascii").lower()
+    text_value = re.sub(r"\b(fc|cf|sc|afc|ac|club)\b", " ", text_value)
+    return " ".join(re.findall(r"[a-z0-9]+", text_value))
+
+
+def _predict1_text_similarity(left: Any, right: Any) -> float:
+    a = _predict1_compare_text(left)
+    b = _predict1_compare_text(right)
+    if not a or not b:
+        return 0.0
+    sequence = difflib.SequenceMatcher(None, a, b).ratio()
+    a_tokens = set(a.split())
+    b_tokens = set(b.split())
+    union = a_tokens | b_tokens
+    token_score = (
+        len(a_tokens & b_tokens) / len(union)
+        if union
+        else 0.0
+    )
+    containment = (
+        min(len(a_tokens), len(b_tokens))
+        / max(len(a_tokens), len(b_tokens))
+        if (a_tokens <= b_tokens or b_tokens <= a_tokens)
+        and a_tokens and b_tokens
+        else 0.0
+    )
+    return round(max(sequence, token_score, containment), 4)
+
+
+def _predict1_online_state(fixture_id: int) -> dict[str, Any] | None:
+    raw = _predict1_metadata_get(
+        f"{PREDICT1_ONLINE_MATCH_VERIFY_PREFIX}{fixture_id}"
+    )
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _predict1_online_state_is_fresh(
+    state: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(state, dict):
+        return False
+    value = state.get("attempted_at")
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        attempted = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+    except Exception:
+        return False
+    if attempted.tzinfo is None:
+        attempted = attempted.replace(tzinfo=timezone.utc)
+    age = (
+        datetime.now(timezone.utc)
+        - attempted.astimezone(timezone.utc)
+    ).total_seconds()
+    return 0 <= age < ONLINE_MATCH_VERIFY_MIN_INTERVAL_SECONDS
+
+
+def _predict1_thesportsdb_get(
+    endpoint: str,
+    params: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not THESPORTSDB_API_KEY:
+        return None, {
+            "status": "disabled",
+            "message": "THESPORTSDB_API_KEY is not configured.",
+        }
+    url = (
+        f"{THESPORTSDB_BASE_URL.rstrip('/')}/"
+        f"{THESPORTSDB_API_KEY}/{endpoint.lstrip('/')}"
+    )
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": f"VedAstro-GPT-Proxy/{PROXY_VERSION}",
+            },
+            timeout=THESPORTSDB_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        return None, {
+            "status": "transport_error",
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:240],
+        }
+    if not response.ok:
+        return None, {
+            "status": "http_error",
+            "http_status": response.status_code,
+            "message": response.text[:240],
+        }
+    try:
+        payload = response.json()
+    except ValueError:
+        return None, {
+            "status": "invalid_json",
+            "http_status": response.status_code,
+        }
+    if not isinstance(payload, dict):
+        return None, {
+            "status": "invalid_payload",
+            "payload_type": type(payload).__name__,
+        }
+    return payload, None
+
+
+def _predict1_thesportsdb_rows(
+    payload: dict[str, Any] | None,
+    *keys: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    for key in keys:
+        rows = payload.get(key)
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+    return []
+
+
+def _predict1_thesportsdb_timestamp(
+    event: dict[str, Any],
+) -> datetime | None:
+    raw = event.get("strTimestamp")
+    if isinstance(raw, str) and raw.strip():
+        parsed = _predict1_parse_provider_datetime(raw.strip())
+        if parsed is not None:
+            return parsed
+    # strTime may be local without an offset. Treating it as UTC can create a
+    # false material-time conflict, so only an explicit strTimestamp is used
+    # for cross-source kickoff comparison.
+    return None
+
+
+def _predict1_select_thesportsdb_event(
+    record: dict[str, Any],
+    payload: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    rows = _predict1_thesportsdb_rows(payload, "event", "events")
+    target_kickoff = _predict1_parse_provider_datetime(
+        record.get("kickoff_utc")
+    )
+    if target_kickoff is None:
+        return None
+    target_dates = {
+        target_kickoff.date().isoformat(),
+        (target_kickoff - timedelta(days=1)).date().isoformat(),
+        (target_kickoff + timedelta(days=1)).date().isoformat(),
+    }
+    selected = None
+    selected_score = -1.0
+    for event in rows:
+        home_name = event.get("strHomeTeam")
+        away_name = event.get("strAwayTeam")
+        if not home_name or not away_name:
+            title = str(event.get("strEvent") or "")
+            parts = re.split(r"\s+vs\.?\s+|\s+v\s+", title, flags=re.I)
+            if len(parts) == 2:
+                home_name, away_name = parts
+        home_similarity = _predict1_text_similarity(
+            record.get("home_team"),
+            home_name,
+        )
+        away_similarity = _predict1_text_similarity(
+            record.get("away_team"),
+            away_name,
+        )
+        event_date = str(event.get("dateEvent") or "").strip()
+        event_timestamp = _predict1_thesportsdb_timestamp(event)
+        kickoff_delta_minutes = None
+        if event_timestamp is not None:
+            kickoff_delta_minutes = abs(
+                (event_timestamp - target_kickoff).total_seconds()
+            ) / 60.0
+        date_ok = event_date in target_dates
+        time_ok = (
+            kickoff_delta_minutes is None
+            or kickoff_delta_minutes
+            <= ONLINE_MATCH_VERIFY_MAX_KICKOFF_DELTA_MINUTES
+        )
+        league_similarity = _predict1_text_similarity(
+            record.get("competition"),
+            event.get("strLeague"),
+        )
+        score = (
+            home_similarity * 0.40
+            + away_similarity * 0.40
+            + (0.15 if date_ok else 0.0)
+            + league_similarity * 0.05
+        )
+        accepted = bool(
+            home_similarity >= ONLINE_MATCH_VERIFY_TEAM_SIMILARITY
+            and away_similarity >= ONLINE_MATCH_VERIFY_TEAM_SIMILARITY
+            and date_ok
+            and time_ok
+        )
+        candidate = {
+            "accepted": accepted,
+            "score": round(score, 4),
+            "home_similarity": home_similarity,
+            "away_similarity": away_similarity,
+            "league_similarity": league_similarity,
+            "event_date": event_date or None,
+            "event_timestamp_utc": (
+                event_timestamp.isoformat()
+                if event_timestamp is not None
+                else None
+            ),
+            "kickoff_delta_minutes": (
+                round(kickoff_delta_minutes, 2)
+                if kickoff_delta_minutes is not None
+                else None
+            ),
+            "id_event": event.get("idEvent"),
+            "event_name": event.get("strEvent"),
+            "home_team": home_name,
+            "away_team": away_name,
+            "league": event.get("strLeague"),
+            "venue_name": str(event.get("strVenue") or "").strip() or None,
+            "venue_city": str(
+                event.get("strCity")
+                or event.get("strVenueCity")
+                or ""
+            ).strip() or None,
+            "country": str(
+                event.get("strCountry")
+                or event.get("strVenueCountry")
+                or ""
+            ).strip() or None,
+            "source_url": (
+                f"https://www.thesportsdb.com/event/{event.get('idEvent')}"
+                if event.get("idEvent")
+                else None
+            ),
+            "raw_event": event,
+        }
+        if accepted and score > selected_score:
+            selected = candidate
+            selected_score = score
+    return selected
+
+
+def _predict1_thesportsdb_venue_details(
+    venue_name: str,
+) -> dict[str, Any]:
+    payload, error = _predict1_thesportsdb_get(
+        "searchvenues.php",
+        {"v": venue_name},
+    )
+    if error:
+        return {
+            "status": "provider_error",
+            "error": error,
+        }
+    rows = _predict1_thesportsdb_rows(payload, "venues", "venue")
+    best = None
+    best_similarity = 0.0
+    for row in rows:
+        candidate_name = (
+            row.get("strVenue")
+            or row.get("strVenueName")
+            or row.get("name")
+        )
+        similarity = _predict1_text_similarity(
+            venue_name,
+            candidate_name,
+        )
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best = row
+    if not isinstance(best, dict):
+        return {"status": "not_found"}
+    return {
+        "status": "ok",
+        "venue_similarity": best_similarity,
+        "venue_name": (
+            best.get("strVenue")
+            or best.get("strVenueName")
+            or venue_name
+        ),
+        "venue_city": (
+            best.get("strCity")
+            or best.get("strVenueCity")
+            or (
+                best.get("strLocation")
+                if _predict1_compare_text(best.get("strLocation"))
+                != _predict1_compare_text(
+                    best.get("strCountry")
+                    or best.get("strVenueCountry")
+                )
+                else None
+            )
+        ),
+        "country": (
+            best.get("strCountry")
+            or best.get("strVenueCountry")
+        ),
+        "venue_id": best.get("idVenue"),
+        "address": best.get("strAddress"),
+        "raw_venue": best,
+    }
+
+
+def _predict1_store_online_venue_identity(
+    fixture_id: int,
+    venue_name: str,
+    venue_city: str,
+    country: str,
+    audit: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE fixtures
+                    SET
+                        venue_name = %s,
+                        venue_city = %s,
+                        competition_country = COALESCE(
+                            NULLIF(competition_country, ''),
+                            %s
+                        ),
+                        latitude = NULL,
+                        longitude = NULL,
+                        timezone_name = NULL,
+                        location_source = %s,
+                        location_confidence = NULL,
+                        location_verified_at = NULL,
+                        updated_at = NOW()
+                    WHERE id = %s
+                      AND sport = 'soccer'
+                      AND kickoff_utc > NOW()
+                    """,
+                    (
+                        venue_name,
+                        venue_city,
+                        country,
+                        (
+                            "online-verified:"
+                            "api-football+thesportsdb:pending-locationiq"
+                        ),
+                        fixture_id,
+                    ),
+                )
+                updated = int(cursor.rowcount or 0)
+            connection.commit()
+    except Exception as exc:
+        return {
+            "status": "database_error",
+            "stored": False,
+            "error_type": type(exc).__name__,
+        }
+    return {
+        "status": "ok" if updated == 1 else "not_updated",
+        "stored": updated == 1,
+        "fixtures_updated": updated,
+        "audit": audit,
+    }
+
+
+def _predict1_online_match_verification(
+    fixture_id: int,
+) -> dict[str, Any]:
+    """
+    Cross-check one selected fixture before venue geocoding or astrology.
+
+    Primary fixture identity and kickoff are refreshed from API-Football.
+    TheSportsDB is used as an independent fixture-specific venue source.
+    LocationIQ remains the physical-place and timezone verifier.
+    """
+    if not ONLINE_MATCH_VERIFY_ENABLED:
+        return {
+            "status": "disabled",
+            "verified": False,
+            "blocking_conflict": False,
+        }
+
+    record = _predict1_fixture_record(fixture_id)
+    if not isinstance(record, dict):
+        return {
+            "status": "fixture_not_found",
+            "verified": False,
+            "blocking_conflict": True,
+        }
+    kickoff = _predict1_parse_provider_datetime(
+        record.get("kickoff_utc")
+    )
+    if kickoff is None or kickoff <= datetime.now(timezone.utc):
+        return {
+            "status": "blocked_after_kickoff",
+            "verified": False,
+            "blocking_conflict": True,
+        }
+
+    state_key = f"{PREDICT1_ONLINE_MATCH_VERIFY_PREFIX}{fixture_id}"
+    previous = _predict1_online_state(fixture_id)
+    if _predict1_online_state_is_fresh(previous):
+        return {
+            **previous,
+            "cached": True,
+        }
+
+    attempted_at = datetime.now(timezone.utc).isoformat()
+    provider_fixture_id = str(
+        record.get("provider_fixture_id") or ""
+    ).strip()
+    primary_refresh: dict[str, Any] = {
+        "status": "not_attempted",
+        "provider_call_made": False,
+    }
+
+    if provider_fixture_id:
+        try:
+            primary_payload = _api_football_get(
+                "/fixtures",
+                params={
+                    "id": provider_fixture_id,
+                    "timezone": "UTC",
+                },
+            )
+            primary_rows = _predict1_fixture_rows(primary_payload)
+            selected_primary = None
+            for item in primary_rows:
+                normalised = _normalise_api_fixture(item)
+                if (
+                    isinstance(normalised, dict)
+                    and str(normalised.get("provider_fixture_id"))
+                    == provider_fixture_id
+                ):
+                    selected_primary = normalised
+                    break
+            if isinstance(selected_primary, dict):
+                store_result = _predict1_store_normalised_fixture(
+                    selected_primary
+                )
+                primary_refresh = {
+                    "status": (
+                        "refreshed"
+                        if store_result.get("stored")
+                        else "database_error"
+                    ),
+                    "provider_call_made": True,
+                    "provider_results_reported": primary_payload.get("results"),
+                    "rate_limit": primary_payload.get(
+                        "_proxy_rate_limit_audit",
+                        {},
+                    ),
+                }
+            else:
+                primary_refresh = {
+                    "status": "fixture_not_returned",
+                    "provider_call_made": True,
+                    "provider_results_reported": primary_payload.get("results"),
+                }
+        except ApiFootballRequestError as exc:
+            primary_refresh = {
+                "status": "provider_error",
+                "provider_call_made": True,
+                "diagnostics": exc.diagnostics,
+            }
+        except Exception as exc:
+            primary_refresh = {
+                "status": "provider_error",
+                "provider_call_made": True,
+                "error_type": type(exc).__name__,
+            }
+    else:
+        primary_refresh = {
+            "status": "provider_fixture_id_missing",
+            "provider_call_made": False,
+        }
+
+    refreshed = _predict1_fixture_record(fixture_id)
+    if isinstance(refreshed, dict):
+        record = refreshed
+        refreshed_kickoff = _predict1_parse_provider_datetime(
+            record.get("kickoff_utc")
+        )
+        if refreshed_kickoff is not None:
+            kickoff = refreshed_kickoff
+
+    search_name = (
+        f"{record.get('home_team') or ''}_vs_"
+        f"{record.get('away_team') or ''}"
+    )
+    secondary_payload, secondary_error = _predict1_thesportsdb_get(
+        "searchevents.php",
+        {
+            "e": search_name,
+            "d": kickoff.date().isoformat(),
+        },
+    )
+    selected_event = _predict1_select_thesportsdb_event(
+        record,
+        secondary_payload,
+    )
+
+    if secondary_error or not isinstance(selected_event, dict):
+        result = {
+            "status": (
+                "secondary_source_error"
+                if secondary_error
+                else "secondary_source_no_match"
+            ),
+            "verified": False,
+            "blocking_conflict": False,
+            "attempted_at": attempted_at,
+            "fixture_id": fixture_id,
+            "primary_refresh": primary_refresh,
+            "secondary_source": {
+                "provider": "TheSportsDB",
+                "error": secondary_error,
+                "matched_event": None,
+            },
+            "message": (
+                "No independent fixture-specific venue confirmation was "
+                "available. Manual confirmation remains the final fallback."
+            ),
+            "backend_version": PROXY_VERSION,
+        }
+        _predict1_metadata_set(state_key, result)
+        return result
+
+    venue_name = str(
+        selected_event.get("venue_name") or ""
+    ).strip()
+    venue_city = str(
+        selected_event.get("venue_city") or ""
+    ).strip()
+    country = str(
+        selected_event.get("country")
+        or record.get("country")
+        or ""
+    ).strip()
+    venue_detail = None
+    if venue_name and (not venue_city or not country):
+        venue_detail = _predict1_thesportsdb_venue_details(
+            venue_name
+        )
+        if venue_detail.get("status") == "ok":
+            venue_city = str(
+                venue_city
+                or venue_detail.get("venue_city")
+                or ""
+            ).strip()
+            country = str(
+                country
+                or venue_detail.get("country")
+                or ""
+            ).strip()
+
+    provider_venue_name = str(
+        record.get("venue_name") or ""
+    ).strip()
+    provider_venue_city = str(
+        record.get("venue_city") or ""
+    ).strip()
+    venue_similarity = None
+
+    # The secondary source may confirm the exact fixture while omitting its
+    # venue. In that case the refreshed API-Football venue can still proceed
+    # to independent physical-place verification through LocationIQ.
+    if not venue_name and provider_venue_name:
+        venue_name = provider_venue_name
+        venue_city = provider_venue_city or venue_city
+
+    if provider_venue_name and venue_name:
+        venue_similarity = _predict1_text_similarity(
+            provider_venue_name,
+            venue_name,
+        )
+        if venue_similarity < ONLINE_MATCH_VERIFY_VENUE_SIMILARITY:
+            result = {
+                "status": "venue_source_conflict",
+                "verified": False,
+                "blocking_conflict": True,
+                "attempted_at": attempted_at,
+                "fixture_id": fixture_id,
+                "primary_refresh": primary_refresh,
+                "provider_venue": {
+                    "name": provider_venue_name,
+                    "city": provider_venue_city or None,
+                },
+                "secondary_source": {
+                    "provider": "TheSportsDB",
+                    "matched_event": selected_event,
+                    "venue_detail": venue_detail,
+                },
+                "venue_similarity": venue_similarity,
+                "message": (
+                    "Independent sources disagree on the fixture venue. "
+                    "Astrology remains blocked."
+                ),
+                "backend_version": PROXY_VERSION,
+            }
+            _predict1_metadata_set(state_key, result)
+            return result
+        venue_name = provider_venue_name
+        venue_city = provider_venue_city or venue_city
+
+    # A fixture-specific TheSportsDB event can safely validate the name of the
+    # home-team venue. The team venue may then supply its city only when its
+    # name agrees with the event venue.
+    team_venue_support = None
+    if venue_name and not venue_city:
+        team_candidate_result = _predict1_home_team_venue_candidate(
+            fixture_id
+        )
+        team_candidate = (
+            team_candidate_result.get("candidate")
+            if isinstance(team_candidate_result, dict)
+            else None
+        )
+        if isinstance(team_candidate, dict):
+            team_similarity = _predict1_text_similarity(
+                venue_name,
+                team_candidate.get("venue_name"),
+            )
+            team_venue_support = {
+                "status": team_candidate_result.get("status"),
+                "venue_similarity": team_similarity,
+                "candidate_source": team_candidate.get("source"),
+            }
+            if (
+                team_similarity
+                >= ONLINE_MATCH_VERIFY_VENUE_SIMILARITY
+            ):
+                venue_city = str(
+                    team_candidate.get("venue_city") or ""
+                ).strip()
+                country = str(
+                    country
+                    or team_candidate.get("country")
+                    or ""
+                ).strip()
+
+    if not venue_name or not venue_city or not country:
+        result = {
+            "status": "independent_match_found_but_venue_incomplete",
+            "verified": False,
+            "blocking_conflict": False,
+            "attempted_at": attempted_at,
+            "fixture_id": fixture_id,
+            "primary_refresh": primary_refresh,
+            "secondary_source": {
+                "provider": "TheSportsDB",
+                "matched_event": selected_event,
+                "venue_detail": venue_detail,
+            },
+            "team_venue_support": team_venue_support,
+            "message": (
+                "The independent match was found, but an exact stadium city "
+                "could not be established automatically."
+            ),
+            "backend_version": PROXY_VERSION,
+        }
+        _predict1_metadata_set(state_key, result)
+        return result
+
+    identity_name_same = (
+        _predict1_text_similarity(
+            record.get("venue_name"),
+            venue_name,
+        ) >= ONLINE_MATCH_VERIFY_VENUE_SIMILARITY
+    )
+    identity_city_same = (
+        _predict1_text_similarity(
+            record.get("venue_city"),
+            venue_city,
+        ) >= 0.70
+    )
+    location_already_verified = bool(
+        record.get("latitude") is not None
+        and record.get("longitude") is not None
+        and record.get("venue_timezone")
+        and record.get("location_verified_at")
+    )
+
+    audit = {
+        "primary_provider": "API-Football",
+        "secondary_provider": "TheSportsDB",
+        "primary_refresh": primary_refresh,
+        "secondary_event": selected_event,
+        "secondary_venue_detail": venue_detail,
+        "team_venue_support": team_venue_support,
+        "venue_similarity": venue_similarity,
+        "venue_name": venue_name,
+        "venue_city": venue_city,
+        "country": country,
+    }
+    if (
+        identity_name_same
+        and identity_city_same
+        and location_already_verified
+    ):
+        result = {
+            "status": "verified",
+            "verified": True,
+            "blocking_conflict": False,
+            "attempted_at": attempted_at,
+            "fixture_id": fixture_id,
+            "primary_refresh": primary_refresh,
+            "secondary_source": {
+                "provider": "TheSportsDB",
+                "matched_event": selected_event,
+                "venue_detail": venue_detail,
+            },
+            "venue_identity": {
+                "venue_name": venue_name,
+                "venue_city": venue_city,
+                "country": country,
+                "source": "preserved previously verified stadium",
+            },
+            "identity_preserved": True,
+            "message": (
+                "The live fixture cross-check agreed with the previously "
+                "verified stadium and local timezone."
+            ),
+            "backend_version": PROXY_VERSION,
+        }
+        _predict1_metadata_set(state_key, result)
+        return result
+
+    store_result = _predict1_store_online_venue_identity(
+        fixture_id,
+        venue_name,
+        venue_city,
+        country,
+        audit,
+    )
+    result = {
+        "status": (
+            "verified"
+            if store_result.get("stored")
+            else "verification_storage_failed"
+        ),
+        "verified": bool(store_result.get("stored")),
+        "blocking_conflict": False,
+        "attempted_at": attempted_at,
+        "fixture_id": fixture_id,
+        "primary_refresh": primary_refresh,
+        "secondary_source": {
+            "provider": "TheSportsDB",
+            "matched_event": selected_event,
+            "venue_detail": venue_detail,
+        },
+        "venue_identity": {
+            "venue_name": venue_name,
+            "venue_city": venue_city,
+            "country": country,
+            "source": (
+                "API-Football fixture + TheSportsDB event"
+            ),
+        },
+        "storage": {
+            key: value
+            for key, value in store_result.items()
+            if key != "audit"
+        },
+        "message": (
+            "The fixture and venue identity were independently verified "
+            "online. Physical-place verification is the next gate."
+        ),
+        "backend_version": PROXY_VERSION,
+    }
+    _predict1_metadata_set(state_key, result)
+    return result
+
+
 PREDICT1_VENUE_CANDIDATE_PREFIX = "predict1_venue_candidate:"
 PREDICT1_VENUE_CANDIDATE_MAX_AGE_SECONDS = int(
     os.getenv("PREDICT1_VENUE_CANDIDATE_MAX_AGE_SECONDS", "86400")
@@ -25188,6 +26024,25 @@ def _predict1_auto_verify_fixture_location(
             "location_time_ready": False,
         }
 
+    online_verification = _predict1_online_match_verification(
+        fixture_id
+    )
+    if online_verification.get("blocking_conflict"):
+        return {
+            "status": "online_verification_conflict",
+            "committed": False,
+            "location_time_ready": False,
+            "online_verification": online_verification,
+            "message": (
+                "Independent online sources conflict. "
+                "No location or astrology call was made."
+            ),
+        }
+
+    refreshed_online_detail = get_stored_fixture_by_id(fixture_id)
+    if refreshed_online_detail.get("status") == "ok":
+        fixture = refreshed_online_detail["fixture"]
+
     identity_refresh = None
     required_identity = {
         "venue_name": fixture.get("venue_name"),
@@ -25235,6 +26090,7 @@ def _predict1_auto_verify_fixture_location(
             "location_time_ready": False,
             "missing": missing_identity,
             "identity_refresh": identity_refresh,
+            "online_verification": online_verification,
             "venue_candidate_result": venue_candidate_result,
             "venue_candidate": venue_candidate,
             "message": (
@@ -25366,6 +26222,7 @@ def _predict1_auto_verify_fixture_location(
                 else None
             ),
             "identity_refresh": identity_refresh,
+            "online_verification": online_verification,
             "backend_version": PROXY_VERSION,
         }
         _predict1_metadata_set(state_key, result)
@@ -25380,6 +26237,11 @@ def _predict1_auto_verify_fixture_location(
         source = (
             "manual-confirmed:"
             "api-football-home-team-venue+locationiq-city-bounded-v1"
+        )
+    elif existing_location_source.startswith("online-verified:"):
+        source = (
+            "auto_verified:"
+            "api-football+thesportsdb+locationiq-city-bounded-v1"
         )
     else:
         source = (
@@ -25463,16 +26325,17 @@ def _predict1_auto_verify_fixture_location(
             else None
         ),
         "verification_policy": (
-            "private on-demand cross-source exact identity"
+            "private on-demand multi-source exact identity"
         ),
         "identity_refresh": identity_refresh,
+        "online_verification": online_verification,
         "backend_version": PROXY_VERSION,
     }
     _predict1_metadata_set(state_key, result)
     return result
 
 
-def run_private_prediction(fixture_id: int) -> dict[str, Any]:
+def _run_private_prediction_core(fixture_id: int) -> dict[str, Any]:
     try:
         lock_context = _predict1_fixture_lock(fixture_id)
         with lock_context:
@@ -25497,10 +26360,34 @@ def run_private_prediction(fixture_id: int) -> dict[str, Any]:
             )
             blockers: list[str] = []
             location_resolution = None
+            online_verification = None
 
             if kickoff is None or kickoff <= datetime.now(timezone.utc):
                 blockers.append("kickoff_passed_or_invalid")
-            elif not fixture.get("location_time_ready"):
+            else:
+                online_verification = (
+                    _predict1_online_match_verification(fixture_id)
+                )
+                if online_verification.get("blocking_conflict"):
+                    blockers.append(
+                        "online_match_verification_conflict"
+                    )
+                refreshed_detail = get_stored_fixture_by_id(fixture_id)
+                if refreshed_detail.get("status") == "ok":
+                    fixture = refreshed_detail["fixture"]
+                    kickoff = _predict1_parse_provider_datetime(
+                        fixture.get("kickoff_utc")
+                    )
+                if (
+                    kickoff is None
+                    or kickoff <= datetime.now(timezone.utc)
+                ):
+                    blockers.append("kickoff_passed_or_invalid")
+
+            if (
+                not blockers
+                and not fixture.get("location_time_ready")
+            ):
                 location_resolution = (
                     _predict1_auto_verify_fixture_location(
                         fixture_id
@@ -25545,6 +26432,14 @@ def run_private_prediction(fixture_id: int) -> dict[str, Any]:
                     "prediction_ready": False,
                     "blockers": list(dict.fromkeys(blockers)),
                     "location_resolution": location_resolution,
+                    "online_verification": (
+                        online_verification
+                        or (
+                            location_resolution.get("online_verification")
+                            if isinstance(location_resolution, dict)
+                            else None
+                        )
+                    ),
                     "venue_candidate": venue_candidate,
                     "astrology_called": False,
                 }
@@ -25581,6 +26476,14 @@ def run_private_prediction(fixture_id: int) -> dict[str, Any]:
                     "prediction_ready": False,
                     "blockers": list(dict.fromkeys(blockers)),
                     "location_resolution": location_resolution,
+                    "online_verification": (
+                        online_verification
+                        or (
+                            location_resolution.get("online_verification")
+                            if isinstance(location_resolution, dict)
+                            else None
+                        )
+                    ),
                     "market_capture": market_capture,
                     "performance_capture": performance_capture,
                     "market": market,
@@ -25717,6 +26620,7 @@ def run_private_prediction(fixture_id: int) -> dict[str, Any]:
                 "prediction_ready": bool(stored.get("stored")),
                 "astrology_called": True,
                 "event_id": event_id,
+                "online_verification": online_verification,
                 "decision": decision,
                 "prediction": stored.get("prediction"),
                 "storage": {
@@ -25733,6 +26637,91 @@ def run_private_prediction(fixture_id: int) -> dict[str, Any]:
             "message": str(exc),
             "astrology_called": False,
         }
+
+
+
+PREDICT1_WORKFLOW_ERROR_PREFIX = "predict1_workflow_error:"
+
+
+def _predict1_safe_exception_summary(exc: Exception) -> dict[str, Any]:
+    """
+    Return a private, secret-safe diagnostic summary.
+
+    It deliberately records code locations and exception type without dumping
+    request headers, environment variables, database URLs or API keys.
+    """
+    frames = []
+    try:
+        extracted = traceback.extract_tb(exc.__traceback__)
+    except Exception:
+        extracted = []
+    for frame in extracted[-8:]:
+        frames.append({
+            "file": os.path.basename(str(frame.filename)),
+            "line": int(frame.lineno),
+            "function": str(frame.name)[:120],
+        })
+
+    message = str(exc or "").strip()
+    # Avoid exposing long provider/database strings through the UI.
+    if len(message) > 240:
+        message = message[:240] + "…"
+
+    return {
+        "error_type": type(exc).__name__,
+        "safe_message": message or type(exc).__name__,
+        "frames": frames,
+    }
+
+
+def run_private_prediction(fixture_id: int) -> dict[str, Any]:
+    """
+    Protected private prediction entry point.
+
+    PREDICT1C could surface a generic HTTP 500 as only "Request failed" in the
+    browser. This wrapper converts every unexpected workflow exception into a
+    deterministic JSON audit with a diagnostic ID, while keeping astrology
+    state explicit and preserving all existing prediction guards.
+    """
+    diagnostic_id = hashlib.sha256(
+        f"{fixture_id}|{time.time_ns()}|{PROXY_VERSION}".encode("utf-8")
+    ).hexdigest()[:18]
+
+    try:
+        result = _run_private_prediction_core(fixture_id)
+        if isinstance(result, dict):
+            result.setdefault("backend_version", PROXY_VERSION)
+        return result
+    except Exception as exc:
+        diagnostic = _predict1_safe_exception_summary(exc)
+        payload = {
+            "status": "workflow_error",
+            "diagnostic_id": diagnostic_id,
+            "fixture_id": fixture_id,
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "backend_version": PROXY_VERSION,
+            **diagnostic,
+        }
+        _predict1_metadata_set(
+            f"{PREDICT1_WORKFLOW_ERROR_PREFIX}{diagnostic_id}",
+            payload,
+        )
+        return {
+            "status": "workflow_error",
+            "prediction_ready": False,
+            "blockers": ["prediction_workflow_internal_error"],
+            "message": (
+                "The prediction workflow stopped before completion. "
+                "No retry should be made until the diagnostic is reviewed."
+            ),
+            "diagnostic_id": diagnostic_id,
+            "error_type": diagnostic.get("error_type"),
+            "safe_message": diagnostic.get("safe_message"),
+            "diagnostic_frames": diagnostic.get("frames"),
+            "astrology_called": False,
+            "backend_version": PROXY_VERSION,
+        }
+
 
 
 def _predict1_result_outcome(
@@ -27227,7 +28216,7 @@ def private_system_summary() -> dict[str, Any]:
     }
 
 
-PRIVATE_UI_HTML = '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<meta name="color-scheme" content="dark">\n<title>Rejans Mastermind — Private Predictor</title>\n<style>\n:root{--bg:#061017;--panel:#0d1923;--panel2:#11212d;--line:#203542;--text:#eef8f7;--muted:#8fa6b3;--teal:#45e0bf;--teal2:#18a991;--gold:#f4cb77;--red:#ff768b;--blue:#7ab5ff}\n*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 10% -15%,rgba(69,224,191,.2),transparent 34rem),radial-gradient(circle at 95% 0,rgba(122,181,255,.13),transparent 30rem),var(--bg);color:var(--text);font:15px/1.5 Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}\nbutton,input{font:inherit}button{cursor:pointer}.hidden{display:none!important}.muted{color:var(--muted)}.kicker{color:var(--teal);font-size:11px;font-weight:900;letter-spacing:.17em;text-transform:uppercase}\n.login{min-height:100vh;display:grid;place-items:center;padding:24px}.login-card{width:min(430px,100%);padding:34px;border:1px solid rgba(69,224,191,.25);border-radius:28px;background:linear-gradient(155deg,rgba(17,33,45,.97),rgba(7,17,24,.97));box-shadow:0 30px 90px rgba(0,0,0,.45)}\n.logo{width:56px;height:56px;border-radius:18px;display:grid;place-items:center;background:linear-gradient(135deg,var(--teal),#0e8e79);color:#03231d;font-size:24px;font-weight:950}.login h1{font-size:31px;letter-spacing:-.04em;margin:18px 0 7px}.field{display:grid;gap:7px;margin:24px 0 12px}.field input,.search{width:100%;border:1px solid var(--line);border-radius:14px;background:#08131c;color:var(--text);padding:13px 15px;outline:none}.field input:focus,.search:focus{border-color:var(--teal)}\n.primary,.secondary{border-radius:13px;padding:11px 15px;font-weight:850}.primary{border:0;background:linear-gradient(135deg,var(--teal),var(--teal2));color:#03221d}.secondary{border:1px solid var(--line);background:#0a1720;color:var(--text)}.danger{color:#ffb0bc;border-color:rgba(255,118,139,.35)}\n.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;padding:14px 22px;background:rgba(6,16,23,.78);backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,.06)}.brand{display:flex;align-items:center;gap:12px}.brand .logo{width:38px;height:38px;border-radius:12px;font-size:16px}.brand strong{display:block}.brand span{font-size:12px;color:var(--muted)}\n.layout{display:grid;grid-template-columns:220px minmax(0,1fr);min-height:calc(100vh - 67px)}.side{border-right:1px solid rgba(255,255,255,.06);padding:20px 14px}.nav{display:grid;gap:8px;position:sticky;top:88px}.nav button{border:0;background:transparent;color:var(--muted);padding:12px 14px;border-radius:12px;text-align:left;font-weight:800}.nav button.active,.nav button:hover{color:var(--teal);background:rgba(69,224,191,.1)}\n.main{padding:28px;max-width:1500px;width:100%;margin:0 auto}.hero{display:flex;justify-content:space-between;align-items:end;gap:18px;margin-bottom:18px}.hero h1{font-size:34px;letter-spacing:-.045em;margin:2px 0 4px}.filters{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0}.chip{border:1px solid var(--line);background:#0a1720;color:var(--muted);padding:9px 13px;border-radius:999px;font-weight:850}.chip.active{color:var(--teal);border-color:rgba(69,224,191,.45);background:rgba(69,224,191,.1)}\n.toolbar{display:grid;grid-template-columns:minmax(240px,1fr) auto;gap:10px;margin-bottom:16px}.notice{padding:12px 14px;border-radius:14px;border:1px solid rgba(244,203,119,.25);background:rgba(244,203,119,.08);color:#f6dfa9;margin-bottom:15px}\n.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:15px}.card{padding:18px;border:1px solid rgba(255,255,255,.07);border-radius:20px;background:linear-gradient(155deg,rgba(17,33,45,.96),rgba(10,23,32,.96));box-shadow:0 16px 44px rgba(0,0,0,.18)}.card:hover{border-color:rgba(69,224,191,.25)}.league{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px}.teams{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:10px;margin:18px 0}.team{font-size:17px;font-weight:850}.team:last-child{text-align:right}.vs{font-size:11px;color:var(--muted)}\n.kickoff{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px;border-radius:14px;background:#07131b}.kickoff strong{display:block;font-size:16px}.kickoff small{display:block;color:var(--muted)}.badges{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.badge{font-size:11px;font-weight:900;padding:5px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.06);background:#11232f;color:var(--muted)}.badge.good{color:var(--teal);background:rgba(69,224,191,.08);border-color:rgba(69,224,191,.22)}.badge.warn{color:var(--gold);background:rgba(244,203,119,.08);border-color:rgba(244,203,119,.2)}.badge.bad{color:#ff9cab;background:rgba(255,118,139,.08);border-color:rgba(255,118,139,.2)}.meta{font-size:12px;color:var(--muted)}.actions{display:flex;gap:8px;margin-top:14px}.actions button{flex:1}\n.empty{padding:46px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:18px}.skeleton{height:245px;border-radius:20px;background:linear-gradient(90deg,#0c1822,#142733,#0c1822);background-size:200% 100%;animation:shimmer 1.4s infinite}@keyframes shimmer{to{background-position:-200% 0}}\n.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:18px}.stat{padding:18px;border:1px solid rgba(255,255,255,.07);border-radius:18px;background:var(--panel)}.stat b{display:block;font-size:28px;letter-spacing:-.04em}.stat span{font-size:12px;color:var(--muted)}\n.table-wrap{overflow:auto;border:1px solid rgba(255,255,255,.07);border-radius:18px}table{width:100%;border-collapse:collapse;background:rgba(13,25,35,.9)}th,td{padding:13px 14px;border-bottom:1px solid rgba(255,255,255,.06);white-space:nowrap;text-align:left}th{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}\n.modal{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:20px;background:rgba(1,7,11,.8);backdrop-filter:blur(10px)}.modal-card{width:min(900px,100%);max-height:90vh;overflow:auto;padding:24px;border-radius:24px;border:1px solid rgba(69,224,191,.24);background:#0a1720;box-shadow:0 30px 100px rgba(0,0,0,.5)}.modal-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}.modal-head h2{margin:2px 0 0}.close{width:38px;height:38px;border:1px solid var(--line);border-radius:12px;background:#10212c;color:var(--text)}\n.detail{display:grid;gap:8px}.detail-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}details{margin-top:12px;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,.07);background:#0e1d28}summary{font-weight:850;cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;color:#b6c9d3;font-size:12px}.pager{display:flex;justify-content:center;align-items:center;gap:10px;margin:22px 0}.system-actions{display:flex;flex-wrap:wrap;gap:9px;margin-bottom:16px}\n@media(max-width:900px){.layout{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid rgba(255,255,255,.06);overflow:auto;padding:10px}.nav{display:flex;position:static;min-width:max-content}.main{padding:20px}.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:560px){.top{padding:12px}.main{padding:15px}.grid{grid-template-columns:1fr}.toolbar{grid-template-columns:1fr}.hero h1{font-size:28px}}\n</style>\n</head>\n<body>\n<section id="loginView" class="login">\n  <form id="loginForm" class="login-card">\n    <div class="logo">R</div>\n    <h1>Private Predictor</h1>\n    <p class="muted">Verified football, venue-local astrology and controlled learning.</p>\n    <label class="field"><span>Private password</span><input id="password" type="password" autocomplete="current-password" required></label>\n    <button class="primary" style="width:100%" type="submit">Enter dashboard</button>\n    <p id="loginError" style="color:#ff9cab;min-height:22px;margin:12px 0 0"></p>\n  </form>\n</section>\n\n<div id="appView" class="hidden">\n<header class="top"><div class="brand"><div class="logo">R</div><div><strong>Rejans Mastermind</strong><span>Private production console</span></div></div><button id="logout" class="secondary danger">Sign out</button></header>\n<div class="layout">\n<aside class="side"><nav class="nav"><button class="active" data-view="fixtures">⚽ Fixtures</button><button data-view="predictions">◎ Predictions</button><button data-view="learning">◈ Learning</button><button data-view="system">⚙ System</button></nav></aside>\n<main class="main">\n<section id="fixturesView">\n  <div class="hero"><div><div class="kicker">Venue-local intelligence</div><h1>Upcoming matches</h1><p class="muted">Kickoff times use each stadium’s verified local timezone.</p></div></div>\n  <div class="filters"><button class="chip active" data-range="today">Today</button><button class="chip" data-range="tomorrow">Tomorrow</button><button class="chip" data-range="3d">Next 3 days</button><button class="chip" data-range="3m">Next 3 months</button></div>\n  <div class="toolbar"><input id="search" class="search" placeholder="Search team, league, country or venue"><button id="refresh" class="secondary">Refresh</button></div>\n  <div id="fixtureNotice"></div><div id="fixtureGrid" class="grid"></div><div id="pager" class="pager"></div>\n</section>\n<section id="predictionsView" class="hidden"><div class="hero"><div><div class="kicker">Immutable audit trail</div><h1>Predictions</h1><p class="muted">Every issued forecast remains frozen.</p></div></div><div id="predictionContent"></div></section>\n<section id="learningView" class="hidden"><div class="hero"><div><div class="kicker">Controlled improvement</div><h1>Results & learning</h1><p class="muted">Prediction versus outcome, market baseline and holdout-gated updates.</p></div></div><div id="learningContent"></div></section>\n<section id="systemView" class="hidden"><div class="hero"><div><div class="kicker">Private operations</div><h1>System</h1><p class="muted">Guarded sync and diagnostics without terminal commands.</p></div></div><div class="system-actions"><button id="syncToday" class="secondary">Sync today</button><button id="syncFuture" class="secondary">Sync future</button><button id="diagnose" class="secondary">Run one-call diagnostic</button><button id="syncResults" class="secondary">Sync official results</button></div><div id="systemContent"></div></section>\n</main>\n</div>\n</div>\n\n<div id="modal" class="modal hidden"><div class="modal-card"><div class="modal-head"><div><div class="kicker">Prediction workflow</div><h2 id="modalTitle">Fixture</h2></div><button id="closeModal" class="close">×</button></div><div id="modalBody"></div></div></div>\n\n<script>\nconst state={view:"fixtures",range:"today",page:1,pageSize:24,search:""};\nconst $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];\nconst esc=v=>String(v??"").replace(/[&<>"\']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;","\'":"&#39;"}[m]));\nconst api=async(url,opts={})=>{const r=await fetch(url,{credentials:"same-origin",headers:{"Content-Type":"application/json",...(opts.headers||{})},...opts});let d={};try{d=await r.json()}catch{}if(r.status===401){showLogin();throw new Error("Session expired")}if(!r.ok)throw new Error(d.detail?.message||d.message||"Request failed");return d};\nconst fmt=v=>v?new Intl.DateTimeFormat(undefined,{weekday:"short",day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"}).format(new Date(v)):"Time pending";const fmtVenue=v=>{if(!v)return"Venue time pending";const m=String(v).match(/^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2})(?::\\d{2}(?:\\.\\d+)?)?([+-]\\d{2}:\\d{2}|Z)?/);if(!m)return esc(v);const[,y,mo,d,h,mi,off=""]=m;const wd=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.UTC(+y,+mo-1,+d)).getUTCDay()];const month=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][+mo-1];return `${wd}, ${d} ${month} ${y}, ${h}:${mi}${off?` ${off}`:""}`};\nconst pct=v=>typeof v==="number"?(v*100).toFixed(1)+"%":"—";\nfunction showLogin(){$("#loginView").classList.remove("hidden");$("#appView").classList.add("hidden")}\nfunction showApp(){$("#loginView").classList.add("hidden");$("#appView").classList.remove("hidden");loadView(state.view)}\n$("#loginForm").onsubmit=async e=>{e.preventDefault();$("#loginError").textContent="";try{await api("/private/api/login",{method:"POST",body:JSON.stringify({password:$("#password").value})});$("#password").value="";showApp()}catch(err){$("#loginError").textContent=err.message}};\n$("#logout").onclick=async()=>{try{await api("/private/api/logout",{method:"POST"})}finally{showLogin()}};\n$$(".nav button").forEach(b=>b.onclick=()=>{state.view=b.dataset.view;$$(".nav button").forEach(x=>x.classList.toggle("active",x===b));["fixtures","predictions","learning","system"].forEach(v=>$(`#${v}View`).classList.toggle("hidden",v!==state.view));loadView(state.view)});\n$$(".chip").forEach(b=>b.onclick=()=>{state.range=b.dataset.range;state.page=1;$$(".chip").forEach(x=>x.classList.toggle("active",x===b));loadFixtures()});\n$("#refresh").onclick=loadFixtures;$("#search").oninput=e=>{clearTimeout(window.searchTimer);window.searchTimer=setTimeout(()=>{state.search=e.target.value;state.page=1;loadFixtures()},300)};\n$("#closeModal").onclick=()=>$("#modal").classList.add("hidden");$("#modal").onclick=e=>{if(e.target===$("#modal"))$("#modal").classList.add("hidden")};\nconst badge=(t,c="")=>`<span class="badge ${c}">${esc(t)}</span>`;\nfunction card(f){const m=f.market||{},p=f.performance||{},o=m.median_decimal_odds||{},existing=f.existing_prediction;const action=existing?"View prediction":f.location_time_ready?"Predict":f.venue_name?"Verify venue & predict":"Fetch venue & predict";return `<article class="card"><div class="league"><span>${esc(f.competition)}</span><span>${esc(f.country||"")}</span></div><div class="teams"><div class="team">${esc(f.home_team)}</div><div class="vs">VS</div><div class="team">${esc(f.away_team)}</div></div><div class="kickoff"><div><strong>${f.kickoff_venue_local?fmtVenue(f.kickoff_venue_local):"Venue time pending"}</strong><small>${esc(f.venue_timezone||"Timezone unverified")} ${esc(f.venue_utc_offset||"")}</small></div><div class="meta">${esc(f.venue_name||"Venue pending")}</div></div><div class="badges">${badge(f.venue_local_time_verified?"Local time verified":"Local time pending",f.venue_local_time_verified?"good":"bad")}${badge(m.market_ready?`${m.bookmaker_count} books`:"Market pending",m.market_ready?"good":"warn")}${badge(p.performance_ready?"Performance ready":"Performance pending",p.performance_ready?"good":"warn")}${existing?badge(`Frozen: ${existing.predicted_outcome}`,"good"):badge(f.prediction_ready?"Ready":"Preparation required",f.prediction_ready?"good":"warn")}</div><div class="meta">1X2: ${o.home??"—"} / ${o.draw??"—"} / ${o.away??"—"}</div><div class="actions"><button class="${existing?"secondary":"primary"}" onclick="${existing?`viewPrediction(${f.database_fixture_id})`:`checkPrediction(${f.database_fixture_id})`}">${action}</button></div></article>`}\nasync function loadFixtures(){$("#fixtureGrid").innerHTML=Array.from({length:8},()=>\'<div class="skeleton"></div>\').join("");$("#fixtureNotice").innerHTML="";try{const q=new URLSearchParams({range:state.range,page:state.page,page_size:state.pageSize,search:state.search});const d=await api("/private/api/fixtures?"+q);$("#fixtureGrid").innerHTML=d.fixtures.length?d.fixtures.map(card).join(""):\'<div class="empty">No stored fixtures match this filter.</div>\';const n=[];if(d.unverified_venue_time_count)n.push(`${d.unverified_venue_time_count} fixture(s) need venue verification. Press Fetch/Verify venue & predict; the system first refreshes a missing provider stadium, then verifies the exact venue-local timezone before any astrology call.`);if(state.range==="3m"&&d.maximum_available_kickoff_utc)n.push(`Current stored coverage reaches ${fmt(d.maximum_available_kickoff_utc)}.`);$("#fixtureNotice").innerHTML=n.length?`<div class="notice">${n.map(esc).join(" ")}</div>`:"";$("#pager").innerHTML=d.total_pages>1?`<button class="secondary" ${d.page<=1?"disabled":""} onclick="pageBy(-1)">Previous</button><span class="meta">Page ${d.page} of ${d.total_pages}</span><button class="secondary" ${d.page>=d.total_pages?"disabled":""} onclick="pageBy(1)">Next</button>`:""}catch(err){$("#fixtureGrid").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nwindow.pageBy=n=>{state.page=Math.max(1,state.page+n);loadFixtures();scrollTo({top:0,behavior:"smooth"})};\nfunction openModal(title,body){$("#modalTitle").textContent=title;$("#modalBody").innerHTML=body;$("#modal").classList.remove("hidden")}\nfunction renderPredictionWorkflowResult(id,d){if(d.prediction){renderExisting(d.prediction);loadFixtures();return}if(!d.prediction_ready){$("#modalTitle").textContent=d.status==="busy"?"Prediction already running":"Prediction not ready";const audit={location_resolution:d.location_resolution,venue_candidate_confirmation:d.venue_candidate_confirmation,market_capture:d.market_capture,performance_capture:d.performance_capture,market:d.market,performance:d.performance,action_state:d.action_state};const c=d.venue_candidate||d.location_resolution?.venue_candidate;const candidate=c?`<div class="notice" style="margin-top:14px"><strong>Venue confirmation required</strong><div style="margin-top:8px">${esc(c.venue_name)} · ${esc(c.venue_city)}, ${esc(c.country)}</div><div class="meta" style="margin-top:6px">${esc(c.warning||"Confirm only when this fixture is actually scheduled at this stadium.")}</div><button class="primary" style="width:100%;margin-top:14px" data-candidate="${esc(c.candidate_id)}" onclick="confirmVenue(${id},this.dataset.candidate)">Confirm venue & continue</button></div>`:"";$("#modalBody").innerHTML=`<div class="notice">${d.astrology_called?"The chart action was recorded; manual review may be required.":"No astrology call was made."}</div>${candidate}<div class="detail">${(d.blockers||[]).map(x=>`<div class="detail-row"><span>${esc(x.replaceAll("_"," "))}</span>${badge("Blocked","warn")}</div>`).join("")}</div><details><summary>Preparation audit</summary><pre>${esc(JSON.stringify(audit,null,2))}</pre></details>`;return}$("#modalTitle").textContent="Prediction completed";$("#modalBody").innerHTML=`<div class="notice">The prediction was frozen, but the response could not be reloaded. Refresh the ledger.</div>`}\nwindow.checkPrediction=async id=>{openModal("Preparing deep prediction",`<div class="empty">Verifying the stadium and venue-local timezone, capturing pre-match market and performance evidence, then running one fresh Gambler’s Dharma chart. No astrology call is made unless every gate passes.</div>`);try{const d=await api(`/private/api/fixtures/${id}/predict`,{method:"POST"});renderPredictionWorkflowResult(id,d)}catch(err){$("#modalBody").innerHTML=`<div class="notice">${esc(err.message)}</div>`}};\nwindow.confirmVenue=async(id,candidateId)=>{openModal("Confirming venue",`<div class="empty">Confirming the selected stadium, verifying exact coordinates and local timezone, then continuing the guarded prediction workflow.</div>`);try{const d=await api(`/private/api/fixtures/${id}/confirm-venue`,{method:"POST",body:JSON.stringify({candidate_id:candidateId})});renderPredictionWorkflowResult(id,d)}catch(err){$("#modalBody").innerHTML=`<div class="notice">${esc(err.message)}</div>`}};\nwindow.viewPrediction=async id=>{openModal("Frozen prediction",\'<div class="empty">Loading immutable record…</div>\');try{const d=await api(`/private/api/fixtures/${id}/prediction`);renderExisting(d.prediction)}catch(err){$("#modalBody").innerHTML=`<div class="notice">${esc(err.message)}</div>`}};\nfunction renderExisting(p){const d=p.prediction_payload?.decision||p;$("#modalTitle").textContent="Frozen pre-match prediction";$("#modalBody").innerHTML=`<div class="card"><div class="kicker">Final prediction</div><h1>${esc(d.predicted_outcome_label||d.predicted_outcome||p.predicted_outcome)}</h1><div class="detail"><div class="detail-row"><span>Confidence</span><b>${esc(d.confidence||p.confidence||"—")}</b></div><div class="detail-row"><span>Eligibility</span><b>${esc(d.eligibility||p.eligibility||"—")}</b></div><div class="detail-row"><span>Actual result</span><b>${esc(p.actual_result||"Pending")}</b></div></div></div><details><summary>Stored audit payload</summary><pre>${esc(JSON.stringify(p,null,2))}</pre></details>`}\nasync function loadPredictions(){$("#predictionContent").innerHTML=\'<div class="empty">Loading prediction ledger…</div>\';try{const d=await api("/private/api/predictions?page=1&page_size=100");if(!d.predictions.length){$("#predictionContent").innerHTML=\'<div class="empty">No frozen predictions yet.</div>\';return}$("#predictionContent").innerHTML=`<div class="table-wrap"><table><thead><tr><th>Fixture</th><th>Venue-local kickoff</th><th>Prediction</th><th>Actual</th><th>Confidence</th><th>Correct</th></tr></thead><tbody>${d.predictions.map(p=>`<tr><td>${esc(p.home_team)} vs ${esc(p.away_team)}<br><span class="meta">${esc(p.competition)}</span></td><td>${esc(p.kickoff_venue_local?fmtVenue(p.kickoff_venue_local):"Pending")}</td><td>${esc(p.predicted_outcome)}</td><td>${esc(p.actual_result||"Pending")}</td><td>${esc(p.confidence||"—")}</td><td>${p.prediction_correct===true?"✓":p.prediction_correct===false?"✕":"—"}</td></tr>`).join("")}</tbody></table></div>`}catch(err){$("#predictionContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function loadLearning(){$("#learningContent").innerHTML=\'<div class="empty">Loading learning audit…</div>\';try{const d=await api("/private/api/learning"),t=d.totals||{},a=d.accuracy||{},s=d.learning_state||{};$("#learningContent").innerHTML=`<div class="stats"><div class="stat"><b>${t.predictions||0}</b><span>Frozen predictions</span></div><div class="stat"><b>${t.resolved||0}</b><span>Resolved outcomes</span></div><div class="stat"><b>${pct(a.prediction)}</b><span>Prediction accuracy</span></div><div class="stat"><b>${pct(a.market_baseline)}</b><span>Market baseline</span></div></div><div class="card"><h3>Learning gate</h3><div class="detail"><div class="detail-row"><span>Status</span><b>${esc(s.status)}</b></div><div class="detail-row"><span>Minimum resolved sample</span><b>${s.minimum_resolved_matches}</b></div><div class="detail-row"><span>Remaining</span><b>${s.remaining_until_evaluation}</b></div><div class="detail-row"><span>Silent live rule changes</span><b>No</b></div><div class="detail-row"><span>Holdout test</span><b>Required</b></div></div></div>`}catch(err){$("#learningContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function loadSystem(){$("#systemContent").innerHTML=\'<div class="empty">Loading system status…</div>\';try{const d=await api("/private/api/system");$("#systemContent").innerHTML=`<details open><summary>Production status</summary><pre>${esc(JSON.stringify(d,null,2))}</pre></details>`}catch(err){$("#systemContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function admin(path){$("#systemContent").innerHTML=\'<div class="empty">Running guarded operation…</div>\';try{const d=await api(path,{method:"POST"});$("#systemContent").innerHTML=`<details open><summary>Operation result</summary><pre>${esc(JSON.stringify(d,null,2))}</pre></details>`}catch(err){$("#systemContent").innerHTML=`<div class="notice">${esc(err.message)}</div>`}}\n$("#syncToday").onclick=()=>admin("/private/api/admin/sync-today");$("#syncFuture").onclick=()=>admin("/private/api/admin/sync-future");$("#diagnose").onclick=()=>admin("/private/api/admin/diagnose-future?offset_days=2");$("#syncResults").onclick=()=>admin("/private/api/admin/sync-results");\nfunction loadView(v){if(v==="fixtures")loadFixtures();if(v==="predictions")loadPredictions();if(v==="learning")loadLearning();if(v==="system")loadSystem()}\n(async()=>{try{await api("/private/api/session");showApp()}catch{showLogin()}})();\n</script>\n</body>\n</html>'
+PRIVATE_UI_HTML = '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<meta name="color-scheme" content="dark">\n<title>Rejans Mastermind — Private Predictor</title>\n<style>\n:root{--bg:#061017;--panel:#0d1923;--panel2:#11212d;--line:#203542;--text:#eef8f7;--muted:#8fa6b3;--teal:#45e0bf;--teal2:#18a991;--gold:#f4cb77;--red:#ff768b;--blue:#7ab5ff}\n*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 10% -15%,rgba(69,224,191,.2),transparent 34rem),radial-gradient(circle at 95% 0,rgba(122,181,255,.13),transparent 30rem),var(--bg);color:var(--text);font:15px/1.5 Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}\nbutton,input{font:inherit}button{cursor:pointer}.hidden{display:none!important}.muted{color:var(--muted)}.kicker{color:var(--teal);font-size:11px;font-weight:900;letter-spacing:.17em;text-transform:uppercase}\n.login{min-height:100vh;display:grid;place-items:center;padding:24px}.login-card{width:min(430px,100%);padding:34px;border:1px solid rgba(69,224,191,.25);border-radius:28px;background:linear-gradient(155deg,rgba(17,33,45,.97),rgba(7,17,24,.97));box-shadow:0 30px 90px rgba(0,0,0,.45)}\n.logo{width:56px;height:56px;border-radius:18px;display:grid;place-items:center;background:linear-gradient(135deg,var(--teal),#0e8e79);color:#03231d;font-size:24px;font-weight:950}.login h1{font-size:31px;letter-spacing:-.04em;margin:18px 0 7px}.field{display:grid;gap:7px;margin:24px 0 12px}.field input,.search{width:100%;border:1px solid var(--line);border-radius:14px;background:#08131c;color:var(--text);padding:13px 15px;outline:none}.field input:focus,.search:focus{border-color:var(--teal)}\n.primary,.secondary{border-radius:13px;padding:11px 15px;font-weight:850}.primary{border:0;background:linear-gradient(135deg,var(--teal),var(--teal2));color:#03221d}.secondary{border:1px solid var(--line);background:#0a1720;color:var(--text)}.danger{color:#ffb0bc;border-color:rgba(255,118,139,.35)}\n.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;padding:14px 22px;background:rgba(6,16,23,.78);backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,.06)}.brand{display:flex;align-items:center;gap:12px}.brand .logo{width:38px;height:38px;border-radius:12px;font-size:16px}.brand strong{display:block}.brand span{font-size:12px;color:var(--muted)}\n.layout{display:grid;grid-template-columns:220px minmax(0,1fr);min-height:calc(100vh - 67px)}.side{border-right:1px solid rgba(255,255,255,.06);padding:20px 14px}.nav{display:grid;gap:8px;position:sticky;top:88px}.nav button{border:0;background:transparent;color:var(--muted);padding:12px 14px;border-radius:12px;text-align:left;font-weight:800}.nav button.active,.nav button:hover{color:var(--teal);background:rgba(69,224,191,.1)}\n.main{padding:28px;max-width:1500px;width:100%;margin:0 auto}.hero{display:flex;justify-content:space-between;align-items:end;gap:18px;margin-bottom:18px}.hero h1{font-size:34px;letter-spacing:-.045em;margin:2px 0 4px}.filters{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0}.chip{border:1px solid var(--line);background:#0a1720;color:var(--muted);padding:9px 13px;border-radius:999px;font-weight:850}.chip.active{color:var(--teal);border-color:rgba(69,224,191,.45);background:rgba(69,224,191,.1)}\n.toolbar{display:grid;grid-template-columns:minmax(240px,1fr) auto;gap:10px;margin-bottom:16px}.notice{padding:12px 14px;border-radius:14px;border:1px solid rgba(244,203,119,.25);background:rgba(244,203,119,.08);color:#f6dfa9;margin-bottom:15px}\n.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:15px}.card{padding:18px;border:1px solid rgba(255,255,255,.07);border-radius:20px;background:linear-gradient(155deg,rgba(17,33,45,.96),rgba(10,23,32,.96));box-shadow:0 16px 44px rgba(0,0,0,.18)}.card:hover{border-color:rgba(69,224,191,.25)}.league{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px}.teams{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:10px;margin:18px 0}.team{font-size:17px;font-weight:850}.team:last-child{text-align:right}.vs{font-size:11px;color:var(--muted)}\n.kickoff{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px;border-radius:14px;background:#07131b}.kickoff strong{display:block;font-size:16px}.kickoff small{display:block;color:var(--muted)}.badges{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.badge{font-size:11px;font-weight:900;padding:5px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.06);background:#11232f;color:var(--muted)}.badge.good{color:var(--teal);background:rgba(69,224,191,.08);border-color:rgba(69,224,191,.22)}.badge.warn{color:var(--gold);background:rgba(244,203,119,.08);border-color:rgba(244,203,119,.2)}.badge.bad{color:#ff9cab;background:rgba(255,118,139,.08);border-color:rgba(255,118,139,.2)}.meta{font-size:12px;color:var(--muted)}.actions{display:flex;gap:8px;margin-top:14px}.actions button{flex:1}\n.empty{padding:46px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:18px}.skeleton{height:245px;border-radius:20px;background:linear-gradient(90deg,#0c1822,#142733,#0c1822);background-size:200% 100%;animation:shimmer 1.4s infinite}@keyframes shimmer{to{background-position:-200% 0}}\n.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:18px}.stat{padding:18px;border:1px solid rgba(255,255,255,.07);border-radius:18px;background:var(--panel)}.stat b{display:block;font-size:28px;letter-spacing:-.04em}.stat span{font-size:12px;color:var(--muted)}\n.table-wrap{overflow:auto;border:1px solid rgba(255,255,255,.07);border-radius:18px}table{width:100%;border-collapse:collapse;background:rgba(13,25,35,.9)}th,td{padding:13px 14px;border-bottom:1px solid rgba(255,255,255,.06);white-space:nowrap;text-align:left}th{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}\n.modal{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:20px;background:rgba(1,7,11,.8);backdrop-filter:blur(10px)}.modal-card{width:min(900px,100%);max-height:90vh;overflow:auto;padding:24px;border-radius:24px;border:1px solid rgba(69,224,191,.24);background:#0a1720;box-shadow:0 30px 100px rgba(0,0,0,.5)}.modal-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}.modal-head h2{margin:2px 0 0}.close{width:38px;height:38px;border:1px solid var(--line);border-radius:12px;background:#10212c;color:var(--text)}\n.detail{display:grid;gap:8px}.detail-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}details{margin-top:12px;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,.07);background:#0e1d28}summary{font-weight:850;cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;color:#b6c9d3;font-size:12px}.pager{display:flex;justify-content:center;align-items:center;gap:10px;margin:22px 0}.system-actions{display:flex;flex-wrap:wrap;gap:9px;margin-bottom:16px}\n@media(max-width:900px){.layout{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid rgba(255,255,255,.06);overflow:auto;padding:10px}.nav{display:flex;position:static;min-width:max-content}.main{padding:20px}.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:560px){.top{padding:12px}.main{padding:15px}.grid{grid-template-columns:1fr}.toolbar{grid-template-columns:1fr}.hero h1{font-size:28px}}\n</style>\n</head>\n<body>\n<section id="loginView" class="login">\n  <form id="loginForm" class="login-card">\n    <div class="logo">R</div>\n    <h1>Private Predictor</h1>\n    <p class="muted">Verified football, venue-local astrology and controlled learning.</p>\n    <label class="field"><span>Private password</span><input id="password" type="password" autocomplete="current-password" required></label>\n    <button class="primary" style="width:100%" type="submit">Enter dashboard</button>\n    <p id="loginError" style="color:#ff9cab;min-height:22px;margin:12px 0 0"></p>\n  </form>\n</section>\n\n<div id="appView" class="hidden">\n<header class="top"><div class="brand"><div class="logo">R</div><div><strong>Rejans Mastermind</strong><span>Private production console</span></div></div><button id="logout" class="secondary danger">Sign out</button></header>\n<div class="layout">\n<aside class="side"><nav class="nav"><button class="active" data-view="fixtures">⚽ Fixtures</button><button data-view="predictions">◎ Predictions</button><button data-view="learning">◈ Learning</button><button data-view="system">⚙ System</button></nav></aside>\n<main class="main">\n<section id="fixturesView">\n  <div class="hero"><div><div class="kicker">Venue-local intelligence</div><h1>Upcoming matches</h1><p class="muted">Kickoff times use each stadium’s verified local timezone.</p></div></div>\n  <div class="filters"><button class="chip active" data-range="today">Today</button><button class="chip" data-range="tomorrow">Tomorrow</button><button class="chip" data-range="3d">Next 3 days</button><button class="chip" data-range="3m">Next 3 months</button></div>\n  <div class="toolbar"><input id="search" class="search" placeholder="Search team, league, country or venue"><button id="refresh" class="secondary">Refresh</button></div>\n  <div id="fixtureNotice"></div><div id="fixtureGrid" class="grid"></div><div id="pager" class="pager"></div>\n</section>\n<section id="predictionsView" class="hidden"><div class="hero"><div><div class="kicker">Immutable audit trail</div><h1>Predictions</h1><p class="muted">Every issued forecast remains frozen.</p></div></div><div id="predictionContent"></div></section>\n<section id="learningView" class="hidden"><div class="hero"><div><div class="kicker">Controlled improvement</div><h1>Results & learning</h1><p class="muted">Prediction versus outcome, market baseline and holdout-gated updates.</p></div></div><div id="learningContent"></div></section>\n<section id="systemView" class="hidden"><div class="hero"><div><div class="kicker">Private operations</div><h1>System</h1><p class="muted">Guarded sync and diagnostics without terminal commands.</p></div></div><div class="system-actions"><button id="syncToday" class="secondary">Sync today</button><button id="syncFuture" class="secondary">Sync future</button><button id="diagnose" class="secondary">Run one-call diagnostic</button><button id="syncResults" class="secondary">Sync official results</button></div><div id="systemContent"></div></section>\n</main>\n</div>\n</div>\n\n<div id="modal" class="modal hidden"><div class="modal-card"><div class="modal-head"><div><div class="kicker">Prediction workflow</div><h2 id="modalTitle">Fixture</h2></div><button id="closeModal" class="close">×</button></div><div id="modalBody"></div></div></div>\n\n<script>\nconst state={view:"fixtures",range:"today",page:1,pageSize:24,search:""};\nconst $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];\nconst esc=v=>String(v??"").replace(/[&<>"\']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;","\'":"&#39;"}[m]));\nconst api=async(url,opts={})=>{let r;try{r=await fetch(url,{credentials:"same-origin",headers:{"Content-Type":"application/json",...(opts.headers||{})},...opts})}catch(err){throw new Error(`Network request failed: ${err?.message||"connection error"}`)}const raw=await r.text();let d={};if(raw){try{d=JSON.parse(raw)}catch{d={raw_preview:raw.slice(0,240)}}}if(r.status===401){showLogin();throw new Error("Session expired")}if(!r.ok){const detail=typeof d.detail==="string"?d.detail:d.detail?.message||d.detail?.error||d.message||d.error||d.raw_preview;const suffix=d.diagnostic_id?` · Diagnostic ${d.diagnostic_id}`:"";throw new Error(`${detail||`HTTP ${r.status}`} [HTTP ${r.status}]${suffix}`)}return d};\nconst fmt=v=>v?new Intl.DateTimeFormat(undefined,{weekday:"short",day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"}).format(new Date(v)):"Time pending";const fmtVenue=v=>{if(!v)return"Venue time pending";const m=String(v).match(/^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2})(?::\\d{2}(?:\\.\\d+)?)?([+-]\\d{2}:\\d{2}|Z)?/);if(!m)return esc(v);const[,y,mo,d,h,mi,off=""]=m;const wd=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.UTC(+y,+mo-1,+d)).getUTCDay()];const month=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][+mo-1];return `${wd}, ${d} ${month} ${y}, ${h}:${mi}${off?` ${off}`:""}`};\nconst pct=v=>typeof v==="number"?(v*100).toFixed(1)+"%":"—";\nfunction showLogin(){$("#loginView").classList.remove("hidden");$("#appView").classList.add("hidden")}\nfunction showApp(){$("#loginView").classList.add("hidden");$("#appView").classList.remove("hidden");loadView(state.view)}\n$("#loginForm").onsubmit=async e=>{e.preventDefault();$("#loginError").textContent="";try{await api("/private/api/login",{method:"POST",body:JSON.stringify({password:$("#password").value})});$("#password").value="";showApp()}catch(err){$("#loginError").textContent=err.message}};\n$("#logout").onclick=async()=>{try{await api("/private/api/logout",{method:"POST"})}finally{showLogin()}};\n$$(".nav button").forEach(b=>b.onclick=()=>{state.view=b.dataset.view;$$(".nav button").forEach(x=>x.classList.toggle("active",x===b));["fixtures","predictions","learning","system"].forEach(v=>$(`#${v}View`).classList.toggle("hidden",v!==state.view));loadView(state.view)});\n$$(".chip").forEach(b=>b.onclick=()=>{state.range=b.dataset.range;state.page=1;$$(".chip").forEach(x=>x.classList.toggle("active",x===b));loadFixtures()});\n$("#refresh").onclick=loadFixtures;$("#search").oninput=e=>{clearTimeout(window.searchTimer);window.searchTimer=setTimeout(()=>{state.search=e.target.value;state.page=1;loadFixtures()},300)};\n$("#closeModal").onclick=()=>$("#modal").classList.add("hidden");$("#modal").onclick=e=>{if(e.target===$("#modal"))$("#modal").classList.add("hidden")};\nconst badge=(t,c="")=>`<span class="badge ${c}">${esc(t)}</span>`;\nfunction card(f){const m=f.market||{},p=f.performance||{},o=m.median_decimal_odds||{},existing=f.existing_prediction;const action=existing?"View prediction":f.location_time_ready?"Predict":f.venue_name?"Verify venue & predict":"Fetch venue & predict";return `<article class="card"><div class="league"><span>${esc(f.competition)}</span><span>${esc(f.country||"")}</span></div><div class="teams"><div class="team">${esc(f.home_team)}</div><div class="vs">VS</div><div class="team">${esc(f.away_team)}</div></div><div class="kickoff"><div><strong>${f.kickoff_venue_local?fmtVenue(f.kickoff_venue_local):"Venue time pending"}</strong><small>${esc(f.venue_timezone||"Timezone unverified")} ${esc(f.venue_utc_offset||"")}</small></div><div class="meta">${esc(f.venue_name||"Venue pending")}</div></div><div class="badges">${badge(f.venue_local_time_verified?"Local time verified":"Local time pending",f.venue_local_time_verified?"good":"bad")}${badge(m.market_ready?`${m.bookmaker_count} books`:"Market pending",m.market_ready?"good":"warn")}${badge(p.performance_ready?"Performance ready":"Performance pending",p.performance_ready?"good":"warn")}${existing?badge(`Frozen: ${existing.predicted_outcome}`,"good"):badge(f.prediction_ready?"Ready":"Preparation required",f.prediction_ready?"good":"warn")}</div><div class="meta">1X2: ${o.home??"—"} / ${o.draw??"—"} / ${o.away??"—"}</div><div class="actions"><button class="${existing?"secondary":"primary"}" onclick="${existing?`viewPrediction(${f.database_fixture_id})`:`checkPrediction(${f.database_fixture_id})`}">${action}</button></div></article>`}\nasync function loadFixtures(){$("#fixtureGrid").innerHTML=Array.from({length:8},()=>\'<div class="skeleton"></div>\').join("");$("#fixtureNotice").innerHTML="";try{const q=new URLSearchParams({range:state.range,page:state.page,page_size:state.pageSize,search:state.search});const d=await api("/private/api/fixtures?"+q);$("#fixtureGrid").innerHTML=d.fixtures.length?d.fixtures.map(card).join(""):\'<div class="empty">No stored fixtures match this filter.</div>\';const n=[];if(d.unverified_venue_time_count)n.push(`${d.unverified_venue_time_count} fixture(s) need venue verification. Press Fetch/Verify venue & predict; the system first cross-checks the fixture online, then verifies the exact stadium and venue-local timezone before any astrology call.`);if(state.range==="3m"&&d.maximum_available_kickoff_utc)n.push(`Current stored coverage reaches ${fmt(d.maximum_available_kickoff_utc)}.`);$("#fixtureNotice").innerHTML=n.length?`<div class="notice">${n.map(esc).join(" ")}</div>`:"";$("#pager").innerHTML=d.total_pages>1?`<button class="secondary" ${d.page<=1?"disabled":""} onclick="pageBy(-1)">Previous</button><span class="meta">Page ${d.page} of ${d.total_pages}</span><button class="secondary" ${d.page>=d.total_pages?"disabled":""} onclick="pageBy(1)">Next</button>`:""}catch(err){$("#fixtureGrid").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nwindow.pageBy=n=>{state.page=Math.max(1,state.page+n);loadFixtures();scrollTo({top:0,behavior:"smooth"})};\nfunction openModal(title,body){$("#modalTitle").textContent=title;$("#modalBody").innerHTML=body;$("#modal").classList.remove("hidden")}\nfunction renderPredictionWorkflowResult(id,d){if(d.prediction){renderExisting(d.prediction);loadFixtures();return}if(d.status==="workflow_error"){ $("#modalTitle").textContent="Prediction workflow error";const diag={diagnostic_id:d.diagnostic_id,error_type:d.error_type,safe_message:d.safe_message,frames:d.diagnostic_frames,backend_version:d.backend_version};$("#modalBody").innerHTML=`<div class="notice"><strong>The server stopped the workflow safely.</strong><div style="margin-top:8px">No new prediction was issued. Diagnostic ID: <b>${esc(d.diagnostic_id||"unavailable")}</b></div></div><div class="detail"><div class="detail-row"><span>Error type</span><b>${esc(d.error_type||"Unknown")}</b></div><div class="detail-row"><span>Safe detail</span><b>${esc(d.safe_message||"No detail")}</b></div></div><details open><summary>Private diagnostic</summary><pre>${esc(JSON.stringify(diag,null,2))}</pre></details>`;return}if(!d.prediction_ready){$("#modalTitle").textContent=d.status==="busy"?"Prediction already running":"Prediction not ready";const audit={online_verification:d.online_verification||d.location_resolution?.online_verification,location_resolution:d.location_resolution,venue_candidate_confirmation:d.venue_candidate_confirmation,market_capture:d.market_capture,performance_capture:d.performance_capture,market:d.market,performance:d.performance,action_state:d.action_state};const c=d.venue_candidate||d.location_resolution?.venue_candidate;const candidate=c?`<div class="notice" style="margin-top:14px"><strong>Venue confirmation required</strong><div style="margin-top:8px">${esc(c.venue_name)} · ${esc(c.venue_city)}, ${esc(c.country)}</div><div class="meta" style="margin-top:6px">${esc(c.warning||"Confirm only when this fixture is actually scheduled at this stadium.")}</div><button class="primary" style="width:100%;margin-top:14px" data-candidate="${esc(c.candidate_id)}" onclick="confirmVenue(${id},this.dataset.candidate)">Confirm venue & continue</button></div>`:"";$("#modalBody").innerHTML=`<div class="notice">${d.astrology_called?"The chart action was recorded; manual review may be required.":"No astrology call was made."}</div>${candidate}<div class="detail">${(d.blockers||[]).map(x=>`<div class="detail-row"><span>${esc(x.replaceAll("_"," "))}</span>${badge("Blocked","warn")}</div>`).join("")}</div><details><summary>Preparation audit</summary><pre>${esc(JSON.stringify(audit,null,2))}</pre></details>`;return}$("#modalTitle").textContent="Prediction completed";$("#modalBody").innerHTML=`<div class="notice">The prediction was frozen, but the response could not be reloaded. Refresh the ledger.</div>`}\nwindow.checkPrediction=async id=>{openModal("Preparing deep prediction",`<div class="empty">Refreshing the fixture, cross-checking it with an independent online match source, verifying the stadium and venue-local timezone, capturing pre-match market and performance evidence, then running one fresh Gambler’s Dharma chart. No astrology call is made unless every gate passes.</div>`);try{const d=await api(`/private/api/fixtures/${id}/predict`,{method:"POST"});renderPredictionWorkflowResult(id,d)}catch(err){$("#modalBody").innerHTML=`<div class="notice">${esc(err.message)}</div>`}};\nwindow.confirmVenue=async(id,candidateId)=>{openModal("Confirming venue",`<div class="empty">Confirming the selected stadium, verifying exact coordinates and local timezone, then continuing the guarded prediction workflow.</div>`);try{const d=await api(`/private/api/fixtures/${id}/confirm-venue`,{method:"POST",body:JSON.stringify({candidate_id:candidateId})});renderPredictionWorkflowResult(id,d)}catch(err){$("#modalBody").innerHTML=`<div class="notice">${esc(err.message)}</div>`}};\nwindow.viewPrediction=async id=>{openModal("Frozen prediction",\'<div class="empty">Loading immutable record…</div>\');try{const d=await api(`/private/api/fixtures/${id}/prediction`);renderExisting(d.prediction)}catch(err){$("#modalBody").innerHTML=`<div class="notice">${esc(err.message)}</div>`}};\nfunction renderExisting(p){const d=p.prediction_payload?.decision||p;$("#modalTitle").textContent="Frozen pre-match prediction";$("#modalBody").innerHTML=`<div class="card"><div class="kicker">Final prediction</div><h1>${esc(d.predicted_outcome_label||d.predicted_outcome||p.predicted_outcome)}</h1><div class="detail"><div class="detail-row"><span>Confidence</span><b>${esc(d.confidence||p.confidence||"—")}</b></div><div class="detail-row"><span>Eligibility</span><b>${esc(d.eligibility||p.eligibility||"—")}</b></div><div class="detail-row"><span>Actual result</span><b>${esc(p.actual_result||"Pending")}</b></div></div></div><details><summary>Stored audit payload</summary><pre>${esc(JSON.stringify(p,null,2))}</pre></details>`}\nasync function loadPredictions(){$("#predictionContent").innerHTML=\'<div class="empty">Loading prediction ledger…</div>\';try{const d=await api("/private/api/predictions?page=1&page_size=100");if(!d.predictions.length){$("#predictionContent").innerHTML=\'<div class="empty">No frozen predictions yet.</div>\';return}$("#predictionContent").innerHTML=`<div class="table-wrap"><table><thead><tr><th>Fixture</th><th>Venue-local kickoff</th><th>Prediction</th><th>Actual</th><th>Confidence</th><th>Correct</th></tr></thead><tbody>${d.predictions.map(p=>`<tr><td>${esc(p.home_team)} vs ${esc(p.away_team)}<br><span class="meta">${esc(p.competition)}</span></td><td>${esc(p.kickoff_venue_local?fmtVenue(p.kickoff_venue_local):"Pending")}</td><td>${esc(p.predicted_outcome)}</td><td>${esc(p.actual_result||"Pending")}</td><td>${esc(p.confidence||"—")}</td><td>${p.prediction_correct===true?"✓":p.prediction_correct===false?"✕":"—"}</td></tr>`).join("")}</tbody></table></div>`}catch(err){$("#predictionContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function loadLearning(){$("#learningContent").innerHTML=\'<div class="empty">Loading learning audit…</div>\';try{const d=await api("/private/api/learning"),t=d.totals||{},a=d.accuracy||{},s=d.learning_state||{};$("#learningContent").innerHTML=`<div class="stats"><div class="stat"><b>${t.predictions||0}</b><span>Frozen predictions</span></div><div class="stat"><b>${t.resolved||0}</b><span>Resolved outcomes</span></div><div class="stat"><b>${pct(a.prediction)}</b><span>Prediction accuracy</span></div><div class="stat"><b>${pct(a.market_baseline)}</b><span>Market baseline</span></div></div><div class="card"><h3>Learning gate</h3><div class="detail"><div class="detail-row"><span>Status</span><b>${esc(s.status)}</b></div><div class="detail-row"><span>Minimum resolved sample</span><b>${s.minimum_resolved_matches}</b></div><div class="detail-row"><span>Remaining</span><b>${s.remaining_until_evaluation}</b></div><div class="detail-row"><span>Silent live rule changes</span><b>No</b></div><div class="detail-row"><span>Holdout test</span><b>Required</b></div></div></div>`}catch(err){$("#learningContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function loadSystem(){$("#systemContent").innerHTML=\'<div class="empty">Loading system status…</div>\';try{const d=await api("/private/api/system");$("#systemContent").innerHTML=`<details open><summary>Production status</summary><pre>${esc(JSON.stringify(d,null,2))}</pre></details>`}catch(err){$("#systemContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function admin(path){$("#systemContent").innerHTML=\'<div class="empty">Running guarded operation…</div>\';try{const d=await api(path,{method:"POST"});$("#systemContent").innerHTML=`<details open><summary>Operation result</summary><pre>${esc(JSON.stringify(d,null,2))}</pre></details>`}catch(err){$("#systemContent").innerHTML=`<div class="notice">${esc(err.message)}</div>`}}\n$("#syncToday").onclick=()=>admin("/private/api/admin/sync-today");$("#syncFuture").onclick=()=>admin("/private/api/admin/sync-future");$("#diagnose").onclick=()=>admin("/private/api/admin/diagnose-future?offset_days=2");$("#syncResults").onclick=()=>admin("/private/api/admin/sync-results");\nfunction loadView(v){if(v==="fixtures")loadFixtures();if(v==="predictions")loadPredictions();if(v==="learning")loadLearning();if(v==="system")loadSystem()}\n(async()=>{try{await api("/private/api/session");showApp()}catch{showLogin()}})();\n</script>\n</body>\n</html>'
 
 
 @app.get("/private", response_class=HTMLResponse)
@@ -27535,6 +28524,12 @@ def health() -> dict[str, Any]:
             "selected_fixture_provider_venue_refresh": True,
             "manual_home_team_venue_confirmation": True,
             "home_team_venue_never_auto_accepted": True,
+            "structured_workflow_error_diagnostics": True,
+            "generic_request_failed_removed": True,
+            "online_multi_source_fixture_verification": ONLINE_MATCH_VERIFY_ENABLED,
+            "independent_match_source": "TheSportsDB",
+            "manual_confirmation_final_fallback_only": True,
+            "source_conflict_blocks_astrology": True,
             "missing_provider_venue_never_guessed": True,
         },
         "result_learning_checkpoint": {
@@ -27551,7 +28546,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "PREDICT1B selected-fixture venue identity refresh and strict local-time verification",
+        "database_checkpoint": "PREDICT1E automatic multi-source online fixture and venue verification",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -27610,6 +28605,8 @@ def health() -> dict[str, Any]:
             "material_venue_or_city_change_invalidates_location": True,
             "provider_display_timezone_never_trusted_as_venue_timezone": True,
         },
+        "thesportsdb_key_configured": bool(THESPORTSDB_API_KEY),
+        "online_match_verification_enabled": ONLINE_MATCH_VERIFY_ENABLED,
         "locationiq_key_configured": bool(LOCATIONIQ_KEY),
         "timezonefinder_available": timezone_at is not None,
         "location_checkpoint": (
@@ -27681,6 +28678,9 @@ def health() -> dict[str, Any]:
             "on_demand_cross_source_identity_required": True,
             "on_demand_before_kickoff_only": True,
             "selected_fixture_provider_identity_refresh": True,
+            "online_fixture_cross_check_enabled": ONLINE_MATCH_VERIFY_ENABLED,
+            "secondary_fixture_source": "TheSportsDB",
+            "manual_confirmation_final_fallback_only": True,
             "provider_identity_refresh_interval_seconds": (
                 VENUE_IDENTITY_REFRESH_MIN_INTERVAL_SECONDS
             ),
