@@ -53,7 +53,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.22.7-predict1g"
+PROXY_VERSION = "1.22.8-predict1h"
 
 
 # ============================================================
@@ -350,7 +350,7 @@ LOCATION_PREVIEW_QUEUE_SCAN_LIMIT = int(
 # DB6C uses a two-stage strategy:
 # 1. verify/cache the fixture city and country
 # 2. search for the venue only inside a bounded box around that city
-LOCATION_GEOCODE_STRATEGY_VERSION = "city_bounded_v1"
+LOCATION_GEOCODE_STRATEGY_VERSION = "sportsdb_exact_venue_country_v2"
 LOCATION_CITY_VIEWBOX_LAT_DELTA = float(
     os.getenv("LOCATION_CITY_VIEWBOX_LAT_DELTA", "0.45")
 )
@@ -25619,7 +25619,7 @@ def _predict1_online_match_verification_sports_sources(
 # ============================================================
 # PREDICT1G — THESPORTSDB-ONLY ONLINE VERIFICATION
 # ============================================================
-PREDICT1G_SPORTSDB_VERIFY_PREFIX = "predict1g_sportsdb_verify:"
+PREDICT1G_SPORTSDB_VERIFY_PREFIX = "predict1h_sportsdb_verify:"
 PREDICT1G_SPORTSDB_MAX_CALLS_PER_FIXTURE = max(
     4,
     min(
@@ -26119,6 +26119,10 @@ def _predict1g_sportsdb_verify_fixture(
     provider_venue = str(record.get("venue_name") or "").strip()
     provider_city = str(record.get("venue_city") or "").strip()
     provider_country = str(record.get("country") or "").strip()
+    if _normalise_lookup_text(provider_country) in {
+        "world", "international", "global", "unknown", "tbd",
+    }:
+        provider_country = ""
 
     venue_similarity = None
     if provider_venue and sportsdb_venue:
@@ -26151,9 +26155,41 @@ def _predict1g_sportsdb_verify_fixture(
 
     venue_name = provider_venue or sportsdb_venue
     venue_city = provider_city or sportsdb_city
-    country = provider_country or sportsdb_country
 
-    if not venue_name or not venue_city or not country:
+    # API-Football uses competition countries such as "World" for
+    # friendlies. That is not a physical venue country. The exact
+    # TheSportsDB event location must take precedence for geocoding.
+    country = sportsdb_country or provider_country
+    if provider_country and sportsdb_country:
+        provider_aliases = _country_aliases(provider_country)
+        sportsdb_aliases = _country_aliases(sportsdb_country)
+        if (
+            provider_aliases
+            and sportsdb_aliases
+            and not provider_aliases.intersection(sportsdb_aliases)
+        ):
+            result = {
+                "status": "sportsdb_provider_country_conflict",
+                "verified": False,
+                "blocking_conflict": True,
+                "attempted_at": attempted_at,
+                "fixture_id": fixture_id,
+                "provider_country": provider_country,
+                "sportsdb_country": sportsdb_country,
+                "sportsdb": search_audit,
+                "selected_event": selected_event,
+                "venue_detail": venue_detail,
+                "manual_confirmation_required": False,
+                "message": (
+                    "API-Football and TheSportsDB disagree on the physical "
+                    "venue country. Astrology remains blocked."
+                ),
+                "backend_version": PROXY_VERSION,
+            }
+            _predict1_metadata_set(state_key, result)
+            return result
+
+    if not venue_name or not country:
         result = {
             "status": "sportsdb_venue_incomplete",
             "verified": False,
@@ -26180,8 +26216,8 @@ def _predict1g_sportsdb_verify_fixture(
             "manual_confirmation_required": False,
             "message": (
                 "The exact fixture was found, but TheSportsDB and "
-                "API-Football did not publish enough fixture-specific venue "
-                "identity to calculate a safe local chart."
+                "API-Football did not publish an exact venue name and country. "
+                "No stadium was assumed and no chart was calculated."
             ),
             "backend_version": PROXY_VERSION,
         }
@@ -26689,7 +26725,7 @@ def _predict1_confirm_venue_candidate(
 
 
 
-PREDICT1_LOCATION_VERIFY_PREFIX = "predict1_location_verify:"
+PREDICT1_LOCATION_VERIFY_PREFIX = "predict1h_location_verify:"
 
 
 def _predict1_location_verify_state(
@@ -29278,7 +29314,10 @@ def health() -> dict[str, Any]:
             "sportsdb_multi_endpoint_search": True,
             "manual_venue_assumption_removed": True,
             "triple_check_layers": ["API-Football", "TheSportsDB V1 multi-endpoint", "LocationIQ"],
-            "verifier_self_test": PREDICT1G_SELF_TEST_STATUS,
+            "verifier_self_test": PREDICT1H_SELF_TEST_STATUS,
+            "sportsdb_exact_event_city_derivation": True,
+            "locationiq_country_first_fallback": True,
+            "stale_location_cooldown_invalidated": True,
             "missing_provider_venue_never_guessed": True,
         },
         "result_learning_checkpoint": {
@@ -29295,7 +29334,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "PREDICT1G TheSportsDB-only multi-endpoint verification and no manual venue assumption",
+        "database_checkpoint": "PREDICT1H SportsDB exact-event venue plus LocationIQ country-first resolution",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -30296,3 +30335,828 @@ def event_chart_v1(
 ) -> dict[str, Any]:
     verify_proxy_key(x_proxy_key)
     return calculate_event_chart(request)
+
+
+# ============================================================
+# PREDICT1H — SPORTDB EXACT-EVENT VENUE + LOCATIONIQ COUNTRY SEARCH
+# ============================================================
+
+PREDICT1H_LOCATION_STRATEGY = "sportsdb_exact_event_locationiq_country_v2"
+PREDICT1H_MIN_NAME_OVERLAP = max(
+    0.72,
+    min(
+        float(os.getenv("PREDICT1H_MIN_NAME_OVERLAP", "0.75")),
+        1.0,
+    ),
+)
+PREDICT1H_MAX_LOCATIONIQ_CALLS = max(
+    1,
+    min(
+        int(os.getenv("PREDICT1H_MAX_LOCATIONIQ_CALLS", "2")),
+        3,
+    ),
+)
+
+_PREDICT1H_COUNTRY_CODES = {
+    "argentina": "ar",
+    "australia": "au",
+    "austria": "at",
+    "belgium": "be",
+    "brazil": "br",
+    "canada": "ca",
+    "chile": "cl",
+    "china": "cn",
+    "colombia": "co",
+    "croatia": "hr",
+    "czech republic": "cz",
+    "czechia": "cz",
+    "denmark": "dk",
+    "ecuador": "ec",
+    "england": "gb",
+    "finland": "fi",
+    "france": "fr",
+    "germany": "de",
+    "greece": "gr",
+    "hungary": "hu",
+    "india": "in",
+    "indonesia": "id",
+    "ireland": "ie",
+    "italy": "it",
+    "japan": "jp",
+    "mexico": "mx",
+    "netherlands": "nl",
+    "new zealand": "nz",
+    "norway": "no",
+    "peru": "pe",
+    "poland": "pl",
+    "portugal": "pt",
+    "romania": "ro",
+    "scotland": "gb",
+    "south africa": "za",
+    "south korea": "kr",
+    "korea republic": "kr",
+    "spain": "es",
+    "sweden": "se",
+    "switzerland": "ch",
+    "turkey": "tr",
+    "turkiye": "tr",
+    "ukraine": "ua",
+    "united arab emirates": "ae",
+    "united kingdom": "gb",
+    "united states": "us",
+    "usa": "us",
+    "uruguay": "uy",
+    "wales": "gb",
+}
+
+
+def _predict1h_meaningful_city(
+    city: Any,
+    country: Any,
+) -> str | None:
+    city_text = str(city or "").strip()
+    if not city_text:
+        return None
+    city_norm = _normalise_lookup_text(city_text)
+    country_norm = _normalise_lookup_text(country)
+    if not city_norm or city_norm == country_norm:
+        return None
+    if city_norm in {"world", "international", "unknown", "tbd"}:
+        return None
+    return city_text
+
+
+def _predict1h_candidate_names(candidate: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in ("display_name", "name"):
+        value = candidate.get(key)
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+
+    for container_key in ("namedetails", "extratags"):
+        container = candidate.get(container_key)
+        if isinstance(container, dict):
+            for key, value in container.items():
+                key_norm = _normalise_lookup_text(key)
+                if (
+                    isinstance(value, str)
+                    and value.strip()
+                    and any(
+                        token in key_norm
+                        for token in (
+                            "name", "official", "short", "old",
+                            "alt", "english", "brand",
+                        )
+                    )
+                ):
+                    values.append(value.strip())
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalised = _normalise_lookup_text(value)
+        if normalised and normalised not in seen:
+            seen.add(normalised)
+            deduped.append(value)
+    return deduped
+
+
+def _predict1h_name_match(
+    expected_name: str,
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    expected_tokens = _significant_tokens(expected_name)
+    best_overlap = 0.0
+    best_similarity = 0.0
+    best_name = None
+
+    for candidate_name in _predict1h_candidate_names(candidate):
+        candidate_tokens = _significant_tokens(candidate_name)
+        overlap = (
+            len(expected_tokens.intersection(candidate_tokens))
+            / len(expected_tokens)
+            if expected_tokens
+            else 0.0
+        )
+        similarity = _predict1_text_similarity(
+            expected_name,
+            candidate_name,
+        )
+        if (overlap, similarity) > (best_overlap, best_similarity):
+            best_overlap = overlap
+            best_similarity = similarity
+            best_name = candidate_name
+
+    return {
+        "overlap": round(best_overlap, 4),
+        "similarity": round(best_similarity, 4),
+        "matched_name": best_name,
+        "passed": bool(
+            best_overlap >= PREDICT1H_MIN_NAME_OVERLAP
+            or best_similarity >= 0.86
+        ),
+    }
+
+
+def _predict1h_evaluate_location_candidate(
+    *,
+    candidate: Any,
+    venue_name: str,
+    expected_country: str,
+    expected_city: str | None,
+) -> dict[str, Any] | None:
+    if not isinstance(candidate, dict):
+        return None
+
+    safe = _safe_locationiq_candidate(candidate)
+    if not isinstance(safe, dict):
+        return None
+
+    address = _locationiq_address(candidate)
+    candidate_country = str(address.get("country") or "").strip()
+    candidate_country_code = str(
+        address.get("country_code") or ""
+    ).strip().lower()
+    candidate_city = _candidate_city(address)
+
+    expected_aliases = _country_aliases(expected_country)
+    candidate_aliases = (
+        _country_aliases(candidate_country)
+        | _country_aliases(candidate_country_code)
+    )
+    expected_code = _PREDICT1H_COUNTRY_CODES.get(
+        _normalise_lookup_text(expected_country)
+    )
+    country_match = bool(
+        (
+            expected_aliases
+            and candidate_aliases
+            and expected_aliases.intersection(candidate_aliases)
+        )
+        or (
+            expected_code
+            and candidate_country_code == expected_code
+        )
+    )
+
+    name_match = _predict1h_name_match(venue_name, candidate)
+
+    place_type = _normalise_lookup_text(
+        candidate.get("type") or safe.get("place_type")
+    )
+    place_class = _normalise_lookup_text(
+        candidate.get("class") or safe.get("category")
+    )
+    display_norm = _normalise_lookup_text(
+        candidate.get("display_name")
+    )
+    sports_place_match = bool(
+        place_class in {"leisure", "sport"}
+        or place_type in {
+            "stadium", "sports centre", "sports center",
+            "sports_centre", "pitch", "recreation ground",
+            "recreation_ground", "arena",
+        }
+        or "stadium" in display_norm
+        or "sports centre" in display_norm
+        or "sports center" in display_norm
+        or "arena" in display_norm
+    )
+
+    expected_city_norm = _normalise_lookup_text(expected_city)
+    candidate_city_norm = _normalise_lookup_text(candidate_city)
+    city_match = None
+    if expected_city_norm:
+        city_match = bool(
+            expected_city_norm == candidate_city_norm
+            or expected_city_norm in display_norm
+            or candidate_city_norm
+            and candidate_city_norm in expected_city_norm
+        )
+
+    timezone_name = safe.get("derived_timezone")
+    passed = bool(
+        country_match
+        and name_match["passed"]
+        and sports_place_match
+        and isinstance(candidate_city, str)
+        and bool(candidate_city.strip())
+        and isinstance(timezone_name, str)
+        and bool(timezone_name.strip())
+        and (
+            city_match is not False
+            if expected_city_norm
+            else True
+        )
+    )
+
+    score = 0.0
+    score += 30.0 if country_match else 0.0
+    score += 35.0 * max(
+        float(name_match["overlap"]),
+        float(name_match["similarity"]),
+    )
+    score += 20.0 if sports_place_match else 0.0
+    score += 10.0 if timezone_name else 0.0
+    score += 5.0 if candidate_city else 0.0
+    if expected_city_norm and city_match is True:
+        score += 5.0
+
+    return {
+        **safe,
+        "provider_place_id": candidate.get("place_id"),
+        "candidate_country": candidate_country or None,
+        "candidate_country_code": candidate_country_code or None,
+        "candidate_city": candidate_city,
+        "country_match": country_match,
+        "city_match": city_match,
+        "sports_place_match": sports_place_match,
+        "venue_token_overlap": name_match["overlap"],
+        "venue_name_similarity": name_match["similarity"],
+        "matched_candidate_name": name_match["matched_name"],
+        "confidence_score": round(min(score, 100.0), 3),
+        "decision_status": "AUTO_APPROVED" if passed else "REJECTED",
+        "approval_blockers": [
+            blocker
+            for blocker, blocked in (
+                ("country_mismatch", not country_match),
+                ("venue_name_mismatch", not name_match["passed"]),
+                ("not_a_verified_sports_place", not sports_place_match),
+                ("candidate_city_missing", not candidate_city),
+                ("timezone_lookup_failed", not timezone_name),
+                (
+                    "verified_city_conflict",
+                    bool(expected_city_norm and city_match is False),
+                ),
+            )
+            if blocked
+        ],
+    }
+
+
+def _predict1h_locationiq_exact_venue(
+    *,
+    venue_name: str,
+    country: str,
+    city: str | None,
+) -> dict[str, Any]:
+    if not LOCATIONIQ_KEY:
+        return {
+            "status": "provider_not_configured",
+            "verified": False,
+            "message": "LOCATIONIQ_KEY is not configured.",
+        }
+    if timezone_at is None:
+        return {
+            "status": "timezonefinder_unavailable",
+            "verified": False,
+        }
+
+    meaningful_city = _predict1h_meaningful_city(city, country)
+    queries: list[str] = []
+    if meaningful_city:
+        queries.append(
+            f"{venue_name}, {meaningful_city}, {country}"
+        )
+    queries.append(f"{venue_name}, {country}")
+
+    deduped_queries: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        query_norm = _normalise_lookup_text(query)
+        if query_norm and query_norm not in seen:
+            seen.add(query_norm)
+            deduped_queries.append(query)
+
+    expected_code = _PREDICT1H_COUNTRY_CODES.get(
+        _normalise_lookup_text(country)
+    )
+    calls: list[dict[str, Any]] = []
+    evaluated: list[dict[str, Any]] = []
+
+    for query in deduped_queries[:PREDICT1H_MAX_LOCATIONIQ_CALLS]:
+        params: dict[str, Any] = {
+            "key": LOCATIONIQ_KEY,
+            "q": query,
+            "format": "json",
+            "addressdetails": 1,
+            "namedetails": 1,
+            "extratags": 1,
+            "normalizecity": 1,
+            "dedupe": 1,
+            "limit": 10,
+            "accept-language": "en",
+        }
+        if expected_code:
+            params["countrycodes"] = expected_code
+
+        try:
+            response = requests.get(
+                f"{LOCATIONIQ_BASE_URL}/search",
+                params=params,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": (
+                        f"VedAstro-GPT-Proxy/{PROXY_VERSION}"
+                    ),
+                },
+                timeout=LOCATIONIQ_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as exc:
+            calls.append({
+                "query": query,
+                "status": "transport_error",
+                "error_type": type(exc).__name__,
+            })
+            continue
+
+        calls.append({
+            "query": query,
+            "status": "ok" if response.status_code == 200 else "http_error",
+            "http_status": response.status_code,
+        })
+        if response.status_code != 200:
+            continue
+
+        try:
+            payload = response.json()
+        except ValueError:
+            calls[-1]["status"] = "invalid_json"
+            continue
+
+        rows = payload if isinstance(payload, list) else []
+        for candidate in rows:
+            evaluated_candidate = (
+                _predict1h_evaluate_location_candidate(
+                    candidate=candidate,
+                    venue_name=venue_name,
+                    expected_country=country,
+                    expected_city=meaningful_city,
+                )
+            )
+            if isinstance(evaluated_candidate, dict):
+                evaluated_candidate["query"] = query
+                evaluated.append(evaluated_candidate)
+
+        approved = [
+            candidate
+            for candidate in evaluated
+            if candidate.get("decision_status") == "AUTO_APPROVED"
+        ]
+        if approved:
+            break
+
+    approved = [
+        candidate
+        for candidate in evaluated
+        if candidate.get("decision_status") == "AUTO_APPROVED"
+    ]
+    if not approved:
+        best = (
+            max(
+                evaluated,
+                key=lambda item: (
+                    float(item.get("confidence_score") or 0.0),
+                    float(item.get("venue_token_overlap") or 0.0),
+                    float(item.get("venue_name_similarity") or 0.0),
+                ),
+            )
+            if evaluated
+            else None
+        )
+        return {
+            "status": "locationiq_exact_venue_not_verified",
+            "verified": False,
+            "calls": calls,
+            "candidate_count": len(evaluated),
+            "best_candidate": best,
+        }
+
+    best = max(
+        approved,
+        key=lambda item: (
+            float(item.get("confidence_score") or 0.0),
+            float(item.get("venue_token_overlap") or 0.0),
+            float(item.get("venue_name_similarity") or 0.0),
+        ),
+    )
+    return {
+        "status": "verified",
+        "verified": True,
+        "calls": calls,
+        "candidate_count": len(evaluated),
+        "candidate": best,
+    }
+
+
+def _predict1_auto_verify_fixture_location(
+    fixture_id: int,
+) -> dict[str, Any]:
+    """
+    PREDICT1H override.
+
+    TheSportsDB may publish an exact event venue and country while omitting
+    the city. In that case, verify the exact named sports place through a
+    country-filtered LocationIQ lookup and derive the city from the physical
+    venue result. No home-stadium assumption or manual confirmation is used.
+    """
+    if not AUTO_LOCATION_VERIFY_ENABLED:
+        return {
+            "status": "disabled",
+            "committed": False,
+            "location_time_ready": False,
+        }
+
+    detail = get_stored_fixture_by_id(fixture_id)
+    if detail.get("status") != "ok":
+        return {
+            "status": "fixture_not_found",
+            "committed": False,
+            "location_time_ready": False,
+        }
+
+    fixture = detail["fixture"]
+    if fixture.get("location_time_ready"):
+        return {
+            "status": "already_verified",
+            "committed": False,
+            "location_time_ready": True,
+        }
+
+    kickoff = _predict1_parse_provider_datetime(
+        fixture.get("kickoff_utc")
+    )
+    if kickoff is None or kickoff <= datetime.now(timezone.utc):
+        return {
+            "status": "blocked_after_kickoff",
+            "committed": False,
+            "location_time_ready": False,
+        }
+
+    online_verification = _predict1_online_match_verification(
+        fixture_id
+    )
+    if online_verification.get("blocking_conflict"):
+        return {
+            "status": "online_verification_conflict",
+            "committed": False,
+            "location_time_ready": False,
+            "online_verification": online_verification,
+        }
+
+    refreshed = get_stored_fixture_by_id(fixture_id)
+    if refreshed.get("status") == "ok":
+        fixture = refreshed["fixture"]
+
+    venue_identity = online_verification.get("venue_identity")
+    venue_identity = (
+        venue_identity if isinstance(venue_identity, dict) else {}
+    )
+    venue_name = str(
+        venue_identity.get("venue_name")
+        or fixture.get("venue_name")
+        or ""
+    ).strip()
+    country = str(
+        venue_identity.get("country")
+        or fixture.get("country")
+        or ""
+    ).strip()
+    venue_city = _predict1h_meaningful_city(
+        venue_identity.get("venue_city")
+        or fixture.get("venue_city"),
+        country,
+    )
+
+    if (
+        online_verification.get("verified") is not True
+        or not venue_name
+        or not country
+    ):
+        return {
+            "status": "sportsdb_exact_venue_identity_incomplete",
+            "committed": False,
+            "location_time_ready": False,
+            "online_verification": online_verification,
+            "missing": [
+                key for key, value in {
+                    "sportsdb_exact_event_verified": (
+                        online_verification.get("verified") is True
+                    ),
+                    "venue_name": venue_name,
+                    "country": country,
+                }.items() if not value
+            ],
+            "manual_confirmation_required": False,
+        }
+
+    attempted_at = datetime.now(timezone.utc).isoformat()
+    state_key = f"{PREDICT1_LOCATION_VERIFY_PREFIX}{fixture_id}"
+    previous = _predict1_location_verify_state(fixture_id)
+    if (
+        _predict1_location_verify_is_fresh(previous)
+        and previous
+        and previous.get("status") in {
+            "committed", "already_verified",
+        }
+    ):
+        return {**previous, "cached": True}
+
+    resolver = _predict1h_locationiq_exact_venue(
+        venue_name=venue_name,
+        country=country,
+        city=venue_city,
+    )
+    if resolver.get("verified") is not True:
+        result = {
+            "status": resolver.get("status"),
+            "fixture_id": fixture_id,
+            "attempted_at": attempted_at,
+            "committed": False,
+            "location_time_ready": False,
+            "online_verification": online_verification,
+            "locationiq": resolver,
+            "manual_confirmation_required": False,
+            "astrology_called": False,
+            "backend_version": PROXY_VERSION,
+        }
+        _predict1_metadata_set(state_key, result)
+        return result
+
+    candidate = resolver["candidate"]
+    candidate_city = str(
+        candidate.get("candidate_city") or ""
+    ).strip()
+    timezone_name = str(
+        candidate.get("derived_timezone") or ""
+    ).strip()
+    latitude = _predict1_safe_number(candidate.get("latitude"))
+    longitude = _predict1_safe_number(candidate.get("longitude"))
+    confidence = _predict1_safe_number(
+        candidate.get("confidence_score")
+    )
+    overlap = _predict1_safe_number(
+        candidate.get("venue_token_overlap")
+    )
+
+    if (
+        not candidate_city
+        or not timezone_name
+        or latitude is None
+        or longitude is None
+    ):
+        result = {
+            "status": "locationiq_verified_candidate_incomplete",
+            "fixture_id": fixture_id,
+            "attempted_at": attempted_at,
+            "committed": False,
+            "location_time_ready": False,
+            "candidate": candidate,
+            "online_verification": online_verification,
+            "manual_confirmation_required": False,
+            "astrology_called": False,
+            "backend_version": PROXY_VERSION,
+        }
+        _predict1_metadata_set(state_key, result)
+        return result
+
+    source = (
+        "auto_verified:"
+        "api-football+thesportsdb-exact-event+"
+        "locationiq-country-first-v2"
+    )
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE fixtures
+                    SET
+                        venue_name = %s,
+                        venue_city = %s,
+                        competition_country = %s,
+                        latitude = %s,
+                        longitude = %s,
+                        timezone_name = %s,
+                        location_source = %s,
+                        location_confidence = %s,
+                        location_verified_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = %s
+                      AND sport = 'soccer'
+                      AND kickoff_utc > NOW()
+                    """,
+                    (
+                        venue_name,
+                        candidate_city,
+                        country,
+                        latitude,
+                        longitude,
+                        timezone_name,
+                        source,
+                        confidence,
+                        fixture_id,
+                    ),
+                )
+                updated_count = int(cursor.rowcount or 0)
+            connection.commit()
+    except Exception as exc:
+        result = {
+            "status": "database_error",
+            "fixture_id": fixture_id,
+            "attempted_at": attempted_at,
+            "error_type": type(exc).__name__,
+            "committed": False,
+            "location_time_ready": False,
+            "online_verification": online_verification,
+            "manual_confirmation_required": False,
+            "astrology_called": False,
+            "backend_version": PROXY_VERSION,
+        }
+        _predict1_metadata_set(state_key, result)
+        return result
+
+    refreshed = get_stored_fixture_by_id(fixture_id)
+    ready = bool(
+        refreshed.get("status") == "ok"
+        and refreshed.get("fixture", {}).get("location_time_ready")
+    )
+    result = {
+        "status": "committed" if ready else "commit_incomplete",
+        "fixture_id": fixture_id,
+        "attempted_at": attempted_at,
+        "committed": ready,
+        "location_time_ready": ready,
+        "fixtures_updated": updated_count,
+        "location_source": source,
+        "venue_name": venue_name,
+        "venue_city": candidate_city,
+        "country": country,
+        "latitude": latitude,
+        "longitude": longitude,
+        "timezone_name": timezone_name,
+        "confidence_score": confidence,
+        "venue_token_overlap": overlap,
+        "provider_place_id": candidate.get("provider_place_id"),
+        "online_verification": online_verification,
+        "locationiq": {
+            "status": resolver.get("status"),
+            "calls": resolver.get("calls"),
+            "candidate_count": resolver.get("candidate_count"),
+            "matched_candidate_name": candidate.get(
+                "matched_candidate_name"
+            ),
+            "sports_place_match": candidate.get(
+                "sports_place_match"
+            ),
+            "country_match": candidate.get("country_match"),
+        },
+        "manual_confirmation_required": False,
+        "astrology_called": False,
+        "verification_policy": PREDICT1H_LOCATION_STRATEGY,
+        "backend_version": PROXY_VERSION,
+    }
+    _predict1_metadata_set(state_key, result)
+    return result
+
+
+def _predict1h_run_self_tests() -> dict[str, Any]:
+    original_timezone_at = globals().get("timezone_at")
+    try:
+        globals()["timezone_at"] = (
+            lambda *, lng, lat: "Asia/Tokyo"
+        )
+        good = _predict1h_evaluate_location_candidate(
+            candidate={
+                "place_id": "1",
+                "display_name": (
+                    "Edion Peace Wing Hiroshima, Hiroshima, Japan"
+                ),
+                "name": "Edion Peace Wing Hiroshima",
+                "lat": "34.3978",
+                "lon": "132.4553",
+                "type": "stadium",
+                "class": "leisure",
+                "address": {
+                    "city": "Hiroshima",
+                    "country": "Japan",
+                    "country_code": "jp",
+                },
+                "namedetails": {
+                    "name:en": "Edion Peace Wing Hiroshima",
+                },
+            },
+            venue_name="Edion Peace Wing Hiroshima",
+            expected_country="Japan",
+            expected_city=None,
+        )
+        wrong_country = _predict1h_evaluate_location_candidate(
+            candidate={
+                "place_id": "2",
+                "display_name": "Edion Peace Wing Hiroshima, Paris",
+                "name": "Edion Peace Wing Hiroshima",
+                "lat": "48.8566",
+                "lon": "2.3522",
+                "type": "stadium",
+                "class": "leisure",
+                "address": {
+                    "city": "Paris",
+                    "country": "France",
+                    "country_code": "fr",
+                },
+            },
+            venue_name="Edion Peace Wing Hiroshima",
+            expected_country="Japan",
+            expected_city=None,
+        )
+        nonsports = _predict1h_evaluate_location_candidate(
+            candidate={
+                "place_id": "3",
+                "display_name": (
+                    "Edion Peace Wing Hiroshima Hotel, Hiroshima, Japan"
+                ),
+                "name": "Edion Peace Wing Hiroshima Hotel",
+                "lat": "34.3978",
+                "lon": "132.4553",
+                "type": "hotel",
+                "class": "tourism",
+                "address": {
+                    "city": "Hiroshima",
+                    "country": "Japan",
+                    "country_code": "jp",
+                },
+            },
+            venue_name="Edion Peace Wing Hiroshima",
+            expected_country="Japan",
+            expected_city=None,
+        )
+    finally:
+        globals()["timezone_at"] = original_timezone_at
+
+    if not isinstance(good, dict):
+        raise RuntimeError("PREDICT1H good-candidate test failed.")
+    if good.get("decision_status") != "AUTO_APPROVED":
+        raise RuntimeError("PREDICT1H exact venue was not approved.")
+    if (
+        not isinstance(wrong_country, dict)
+        or wrong_country.get("decision_status") != "REJECTED"
+    ):
+        raise RuntimeError("PREDICT1H wrong-country veto failed.")
+    if (
+        not isinstance(nonsports, dict)
+        or nonsports.get("decision_status") != "REJECTED"
+    ):
+        raise RuntimeError("PREDICT1H non-sports-place veto failed.")
+
+    return {
+        "status": "pass",
+        "cases": {
+            "exact_sportsdb_venue_without_city": "pass",
+            "wrong_country_rejected": "pass",
+            "non_sports_place_rejected": "pass",
+            "manual_confirmation": "disabled",
+        },
+    }
+
+
+PREDICT1H_SELF_TEST_STATUS = _predict1h_run_self_tests()
