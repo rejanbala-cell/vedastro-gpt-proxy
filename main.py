@@ -54,7 +54,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.23.3-predict1m"
+PROXY_VERSION = "1.23.4-predict1n"
 
 
 # ============================================================
@@ -29500,6 +29500,8 @@ def health() -> dict[str, Any]:
             "predict1k_self_test": PREDICT1K_SELF_TEST_STATUS,
             "predict1l_self_test": PREDICT1L_SELF_TEST_STATUS,
             "predict1m_self_test": PREDICT1M_SELF_TEST_STATUS,
+            "sportsdb_form_normaliser_fix": True,
+            "predict1n_self_test": PREDICT1N_SELF_TEST_STATUS,
             "missing_provider_venue_never_guessed": True,
         },
         "result_learning_checkpoint": {
@@ -29531,7 +29533,7 @@ def health() -> dict[str, Any]:
         "private_ui_cookie_samesite": PRIVATE_UI_COOKIE_SAMESITE,
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "PREDICT1M private-login diagnostics and cookie verification plus PREDICT1L safeguards",
+        "database_checkpoint": "PREDICT1N SportsDB performance normaliser fix plus PREDICT1M/PREDICT1L safeguards",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -31486,7 +31488,7 @@ def _predict1i_sportsdb_team_form(
     target_kickoff: datetime,
 ) -> dict[str, Any]:
     matches: list[dict[str, Any]] = []
-    normal_team = _predict1g_normalise_text(team_name)
+    normal_team = _predict1_compare_text(team_name)
     for event in events:
         played_at = _predict1i_sportsdb_event_datetime(event)
         if played_at is None or played_at >= target_kickoff:
@@ -31503,10 +31505,10 @@ def _predict1i_sportsdb_team_form(
         is_away = bool(team_id and away_id == team_id)
         if not is_home and not is_away:
             is_home = (
-                _predict1g_normalise_text(home_name) == normal_team
+                _predict1_compare_text(home_name) == normal_team
             )
             is_away = (
-                _predict1g_normalise_text(away_name) == normal_team
+                _predict1_compare_text(away_name) == normal_team
             )
         if is_home:
             goals_for, goals_against = home_score, away_score
@@ -33669,3 +33671,81 @@ def _predict1m_run_self_tests() -> dict[str, Any]:
 
 
 PREDICT1M_SELF_TEST_STATUS = _predict1m_run_self_tests()
+# ============================================================
+# PREDICT1N — SPORTSDB PERFORMANCE NORMALISER REGRESSION TEST
+# ============================================================
+
+def _predict1n_run_self_tests() -> dict[str, Any]:
+    target = datetime(2099, 1, 10, 12, 0, tzinfo=timezone.utc)
+    events = [
+        {
+            "strTimestamp": "2099-01-08T12:00:00+00:00",
+            "idHomeTeam": "",
+            "idAwayTeam": "",
+            "strHomeTeam": "Álpha United FC",
+            "strAwayTeam": "Opponent One",
+            "intHomeScore": "2",
+            "intAwayScore": "0",
+        },
+        {
+            "strTimestamp": "2099-01-05T12:00:00+00:00",
+            "idHomeTeam": "",
+            "idAwayTeam": "",
+            "strHomeTeam": "Opponent Two",
+            "strAwayTeam": "Alpha United",
+            "intHomeScore": "1",
+            "intAwayScore": "1",
+        },
+        {
+            "strTimestamp": "2099-01-02T12:00:00+00:00",
+            "idHomeTeam": "",
+            "idAwayTeam": "",
+            "strHomeTeam": "Alpha United",
+            "strAwayTeam": "Opponent Three",
+            "intHomeScore": "0",
+            "intAwayScore": "1",
+        },
+    ]
+
+    form = _predict1i_sportsdb_team_form(
+        events,
+        team_id=None,
+        team_name="Alpha United",
+        target_kickoff=target,
+    )
+    if form.get("sample_size") != 3:
+        raise RuntimeError(
+            "PREDICT1N SportsDB form sample-size test failed."
+        )
+    if form.get("wins") != 1:
+        raise RuntimeError(
+            "PREDICT1N SportsDB form win-count test failed."
+        )
+    if form.get("draws") != 1:
+        raise RuntimeError(
+            "PREDICT1N SportsDB form draw-count test failed."
+        )
+    if form.get("losses") != 1:
+        raise RuntimeError(
+            "PREDICT1N SportsDB form loss-count test failed."
+        )
+    if form.get("recent_outcomes") != ["W", "D", "L"]:
+        raise RuntimeError(
+            "PREDICT1N SportsDB form ordering test failed."
+        )
+
+    return {
+        "status": "pass",
+        "cases": {
+            "missing_normaliser_symbol_removed": "pass",
+            "accent_and_fc_suffix_normalisation": "pass",
+            "name_based_home_team_match": "pass",
+            "name_based_away_team_match": "pass",
+            "three_match_form_aggregation": "pass",
+            "recent_match_ordering": "pass",
+        },
+        "provider_calls_made": 0,
+    }
+
+
+PREDICT1N_SELF_TEST_STATUS = _predict1n_run_self_tests()
