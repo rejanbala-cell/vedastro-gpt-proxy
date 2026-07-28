@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from enum import Enum
 from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from urllib.parse import urlparse
 
 try:
     import swisseph as swe
@@ -53,7 +54,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.22.9-predict1i"
+PROXY_VERSION = "1.23.1-predict1k"
 
 
 # ============================================================
@@ -174,6 +175,51 @@ ONLINE_MATCH_VERIFY_MAX_KICKOFF_DELTA_MINUTES = max(
             "180",
         )
     ),
+)
+
+
+# PREDICT1J adds Tavily only as a guarded fallback when API-Football and
+# TheSportsDB cannot establish the exact fixture venue. Search results never
+# replace the bookmaker market, and coordinates/timezone remain LocationIQ's
+# responsibility.
+TAVILY_SEARCH_ENABLED = (
+    os.getenv("TAVILY_SEARCH_ENABLED", "true")
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+TAVILY_BASE_URL = os.getenv(
+    "TAVILY_BASE_URL",
+    "https://api.tavily.com",
+).rstrip("/")
+TAVILY_TIMEOUT_SECONDS = max(
+    5,
+    min(int(os.getenv("TAVILY_TIMEOUT_SECONDS", "20")), 45),
+)
+TAVILY_SEARCH_DEPTH = os.getenv(
+    "TAVILY_SEARCH_DEPTH",
+    "basic",
+).strip().lower()
+if TAVILY_SEARCH_DEPTH not in {"basic", "advanced", "fast", "ultra-fast"}:
+    TAVILY_SEARCH_DEPTH = "basic"
+TAVILY_MAX_RESULTS = max(
+    3,
+    min(int(os.getenv("TAVILY_MAX_RESULTS", "8")), 12),
+)
+TAVILY_MIN_DISTINCT_DOMAINS = max(
+    2,
+    min(int(os.getenv("TAVILY_MIN_DISTINCT_DOMAINS", "2")), 4),
+)
+TAVILY_REQUIRE_OFFICIAL_SOURCE = (
+    os.getenv("TAVILY_REQUIRE_OFFICIAL_SOURCE", "true")
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+TAVILY_VERIFY_MIN_INTERVAL_SECONDS = max(
+    900,
+    int(os.getenv("TAVILY_VERIFY_MIN_INTERVAL_SECONDS", "21600")),
 )
 
 # PREDICT1G uses TheSportsDB V1 only for the independent online fixture check.
@@ -22419,9 +22465,6 @@ def _build_market_consensus(
         "bookmaker_count": bookmaker_count,
         "minimum_bookmaker_count": MARKET_MIN_BOOKMAKER_COUNT,
         "market_ready": market_ready,
-        "pre_match_capture_valid": pre_match_capture_valid,
-        "historical_research_only": not pre_match_capture_valid,
-        "temporal_validation": temporal_validation,
         "median_decimal_odds": {
             outcome: round(value, 6)
             for outcome, value in median_odds.items()
@@ -22964,6 +23007,13 @@ def capture_target_market_odds(
                 "pre-match market snapshot."
             ),
         }
+
+    consensus = {
+        **consensus,
+        "pre_match_capture_valid": True,
+        "historical_research_only": False,
+        "temporal_validation": temporal_validation,
+    }
 
     stored = _store_market_snapshot(
         fixture_id=fixture_id,
@@ -23871,6 +23921,13 @@ def capture_market_odds_for_fixture(
             "market_ready": False,
             "temporal_validation": temporal,
         }
+
+    consensus = {
+        **consensus,
+        "pre_match_capture_valid": True,
+        "historical_research_only": False,
+        "temporal_validation": temporal,
+    }
 
     stored = _store_market_snapshot(
         fixture_id=fixture_id,
@@ -28988,7 +29045,7 @@ def private_system_summary() -> dict[str, Any]:
     }
 
 
-PRIVATE_UI_HTML = '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<meta name="color-scheme" content="dark">\n<title>Rejans Mastermind — Private Predictor</title>\n<style>\n:root{--bg:#061017;--panel:#0d1923;--panel2:#11212d;--line:#203542;--text:#eef8f7;--muted:#8fa6b3;--teal:#45e0bf;--teal2:#18a991;--gold:#f4cb77;--red:#ff768b;--blue:#7ab5ff}\n*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 10% -15%,rgba(69,224,191,.2),transparent 34rem),radial-gradient(circle at 95% 0,rgba(122,181,255,.13),transparent 30rem),var(--bg);color:var(--text);font:15px/1.5 Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}\nbutton,input{font:inherit}button{cursor:pointer}.hidden{display:none!important}.muted{color:var(--muted)}.kicker{color:var(--teal);font-size:11px;font-weight:900;letter-spacing:.17em;text-transform:uppercase}\n.login{min-height:100vh;display:grid;place-items:center;padding:24px}.login-card{width:min(430px,100%);padding:34px;border:1px solid rgba(69,224,191,.25);border-radius:28px;background:linear-gradient(155deg,rgba(17,33,45,.97),rgba(7,17,24,.97));box-shadow:0 30px 90px rgba(0,0,0,.45)}\n.logo{width:56px;height:56px;border-radius:18px;display:grid;place-items:center;background:linear-gradient(135deg,var(--teal),#0e8e79);color:#03231d;font-size:24px;font-weight:950}.login h1{font-size:31px;letter-spacing:-.04em;margin:18px 0 7px}.field{display:grid;gap:7px;margin:24px 0 12px}.field input,.search{width:100%;border:1px solid var(--line);border-radius:14px;background:#08131c;color:var(--text);padding:13px 15px;outline:none}.field input:focus,.search:focus{border-color:var(--teal)}\n.primary,.secondary{border-radius:13px;padding:11px 15px;font-weight:850}.primary{border:0;background:linear-gradient(135deg,var(--teal),var(--teal2));color:#03221d}.secondary{border:1px solid var(--line);background:#0a1720;color:var(--text)}.danger{color:#ffb0bc;border-color:rgba(255,118,139,.35)}\n.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;padding:14px 22px;background:rgba(6,16,23,.78);backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,.06)}.brand{display:flex;align-items:center;gap:12px}.brand .logo{width:38px;height:38px;border-radius:12px;font-size:16px}.brand strong{display:block}.brand span{font-size:12px;color:var(--muted)}\n.layout{display:grid;grid-template-columns:220px minmax(0,1fr);min-height:calc(100vh - 67px)}.side{border-right:1px solid rgba(255,255,255,.06);padding:20px 14px}.nav{display:grid;gap:8px;position:sticky;top:88px}.nav button{border:0;background:transparent;color:var(--muted);padding:12px 14px;border-radius:12px;text-align:left;font-weight:800}.nav button.active,.nav button:hover{color:var(--teal);background:rgba(69,224,191,.1)}\n.main{padding:28px;max-width:1500px;width:100%;margin:0 auto}.hero{display:flex;justify-content:space-between;align-items:end;gap:18px;margin-bottom:18px}.hero h1{font-size:34px;letter-spacing:-.045em;margin:2px 0 4px}.filters{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0}.chip{border:1px solid var(--line);background:#0a1720;color:var(--muted);padding:9px 13px;border-radius:999px;font-weight:850}.chip.active{color:var(--teal);border-color:rgba(69,224,191,.45);background:rgba(69,224,191,.1)}\n.toolbar{display:grid;grid-template-columns:minmax(240px,1fr) auto;gap:10px;margin-bottom:16px}.notice{padding:12px 14px;border-radius:14px;border:1px solid rgba(244,203,119,.25);background:rgba(244,203,119,.08);color:#f6dfa9;margin-bottom:15px}\n.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:15px}.card{padding:18px;border:1px solid rgba(255,255,255,.07);border-radius:20px;background:linear-gradient(155deg,rgba(17,33,45,.96),rgba(10,23,32,.96));box-shadow:0 16px 44px rgba(0,0,0,.18)}.card:hover{border-color:rgba(69,224,191,.25)}.league{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px}.teams{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:10px;margin:18px 0}.team{font-size:17px;font-weight:850}.team:last-child{text-align:right}.vs{font-size:11px;color:var(--muted)}\n.kickoff{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px;border-radius:14px;background:#07131b}.kickoff strong{display:block;font-size:16px}.kickoff small{display:block;color:var(--muted)}.badges{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.badge{font-size:11px;font-weight:900;padding:5px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.06);background:#11232f;color:var(--muted)}.badge.good{color:var(--teal);background:rgba(69,224,191,.08);border-color:rgba(69,224,191,.22)}.badge.warn{color:var(--gold);background:rgba(244,203,119,.08);border-color:rgba(244,203,119,.2)}.badge.bad{color:#ff9cab;background:rgba(255,118,139,.08);border-color:rgba(255,118,139,.2)}.meta{font-size:12px;color:var(--muted)}.actions{display:flex;gap:8px;margin-top:14px}.actions button{flex:1}\n.empty{padding:46px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:18px}.skeleton{height:245px;border-radius:20px;background:linear-gradient(90deg,#0c1822,#142733,#0c1822);background-size:200% 100%;animation:shimmer 1.4s infinite}@keyframes shimmer{to{background-position:-200% 0}}\n.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:18px}.stat{padding:18px;border:1px solid rgba(255,255,255,.07);border-radius:18px;background:var(--panel)}.stat b{display:block;font-size:28px;letter-spacing:-.04em}.stat span{font-size:12px;color:var(--muted)}\n.table-wrap{overflow:auto;border:1px solid rgba(255,255,255,.07);border-radius:18px}table{width:100%;border-collapse:collapse;background:rgba(13,25,35,.9)}th,td{padding:13px 14px;border-bottom:1px solid rgba(255,255,255,.06);white-space:nowrap;text-align:left}th{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}\n.modal{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:20px;background:rgba(1,7,11,.8);backdrop-filter:blur(10px)}.modal-card{width:min(900px,100%);max-height:90vh;overflow:auto;padding:24px;border-radius:24px;border:1px solid rgba(69,224,191,.24);background:#0a1720;box-shadow:0 30px 100px rgba(0,0,0,.5)}.modal-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}.modal-head h2{margin:2px 0 0}.close{width:38px;height:38px;border:1px solid var(--line);border-radius:12px;background:#10212c;color:var(--text)}\n.detail{display:grid;gap:8px}.detail-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}details{margin-top:12px;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,.07);background:#0e1d28}summary{font-weight:850;cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;color:#b6c9d3;font-size:12px}.pager{display:flex;justify-content:center;align-items:center;gap:10px;margin:22px 0}.system-actions{display:flex;flex-wrap:wrap;gap:9px;margin-bottom:16px}\n@media(max-width:900px){.layout{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid rgba(255,255,255,.06);overflow:auto;padding:10px}.nav{display:flex;position:static;min-width:max-content}.main{padding:20px}.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:560px){.top{padding:12px}.main{padding:15px}.grid{grid-template-columns:1fr}.toolbar{grid-template-columns:1fr}.hero h1{font-size:28px}}\n</style>\n</head>\n<body>\n<section id="loginView" class="login">\n  <form id="loginForm" class="login-card">\n    <div class="logo">R</div>\n    <h1>Private Predictor</h1>\n    <p class="muted">Verified football, venue-local astrology and controlled learning.</p>\n    <label class="field"><span>Private password</span><input id="password" type="password" autocomplete="current-password" required></label>\n    <button class="primary" style="width:100%" type="submit">Enter dashboard</button>\n    <p id="loginError" style="color:#ff9cab;min-height:22px;margin:12px 0 0"></p>\n  </form>\n</section>\n\n<div id="appView" class="hidden">\n<header class="top"><div class="brand"><div class="logo">R</div><div><strong>Rejans Mastermind</strong><span>Private production console</span></div></div><button id="logout" class="secondary danger">Sign out</button></header>\n<div class="layout">\n<aside class="side"><nav class="nav"><button class="active" data-view="fixtures">⚽ Fixtures</button><button data-view="predictions">◎ Predictions</button><button data-view="learning">◈ Learning</button><button data-view="system">⚙ System</button></nav></aside>\n<main class="main">\n<section id="fixturesView">\n  <div class="hero"><div><div class="kicker">Venue-local intelligence</div><h1>Upcoming matches</h1><p class="muted">Kickoff times use each stadium’s verified local timezone.</p></div></div>\n  <div class="filters"><button class="chip active" data-range="today">Today</button><button class="chip" data-range="tomorrow">Tomorrow</button><button class="chip" data-range="3d">Next 3 days</button><button class="chip" data-range="3m">Next 3 months</button></div>\n  <div class="toolbar"><input id="search" class="search" placeholder="Search team, league, country or venue"><button id="refresh" class="secondary">Refresh</button></div>\n  <div id="fixtureNotice"></div><div id="fixtureGrid" class="grid"></div><div id="pager" class="pager"></div>\n</section>\n<section id="predictionsView" class="hidden"><div class="hero"><div><div class="kicker">Immutable audit trail</div><h1>Predictions</h1><p class="muted">Every issued forecast remains frozen.</p></div></div><div id="predictionContent"></div></section>\n<section id="learningView" class="hidden"><div class="hero"><div><div class="kicker">Controlled improvement</div><h1>Results & learning</h1><p class="muted">Prediction versus outcome, market baseline and holdout-gated updates.</p></div></div><div id="learningContent"></div></section>\n<section id="systemView" class="hidden"><div class="hero"><div><div class="kicker">Private operations</div><h1>System</h1><p class="muted">Guarded sync and diagnostics without terminal commands.</p></div></div><div class="system-actions"><button id="syncToday" class="secondary">Sync today</button><button id="syncFuture" class="secondary">Sync future</button><button id="diagnose" class="secondary">Run one-call diagnostic</button><button id="syncResults" class="secondary">Sync official results</button></div><div id="systemContent"></div></section>\n</main>\n</div>\n</div>\n\n<div id="modal" class="modal hidden"><div class="modal-card"><div class="modal-head"><div><div class="kicker">Prediction workflow</div><h2 id="modalTitle">Fixture</h2></div><button id="closeModal" class="close">×</button></div><div id="modalBody"></div></div></div>\n\n<script>\nconst state={view:"fixtures",range:"today",page:1,pageSize:24,search:""};\nconst $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];\nconst esc=v=>String(v??"").replace(/[&<>"\']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;","\'":"&#39;"}[m]));\nconst api=async(url,opts={})=>{let r;try{r=await fetch(url,{credentials:"same-origin",headers:{"Content-Type":"application/json",...(opts.headers||{})},...opts})}catch(err){throw new Error(`Network request failed: ${err?.message||"connection error"}`)}const raw=await r.text();let d={};if(raw){try{d=JSON.parse(raw)}catch{d={raw_preview:raw.slice(0,240)}}}if(r.status===401){showLogin();throw new Error("Session expired")}if(!r.ok){const detail=typeof d.detail==="string"?d.detail:d.detail?.message||d.detail?.error||d.message||d.error||d.raw_preview;const suffix=d.diagnostic_id?` · Diagnostic ${d.diagnostic_id}`:"";throw new Error(`${detail||`HTTP ${r.status}`} [HTTP ${r.status}]${suffix}`)}return d};\nconst fmt=v=>v?new Intl.DateTimeFormat(undefined,{weekday:"short",day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"}).format(new Date(v)):"Time pending";const fmtVenue=v=>{if(!v)return"Venue time pending";const m=String(v).match(/^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2})(?::\\d{2}(?:\\.\\d+)?)?([+-]\\d{2}:\\d{2}|Z)?/);if(!m)return esc(v);const[,y,mo,d,h,mi,off=""]=m;const wd=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.UTC(+y,+mo-1,+d)).getUTCDay()];const month=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][+mo-1];return `${wd}, ${d} ${month} ${y}, ${h}:${mi}${off?` ${off}`:""}`};\nconst pct=v=>typeof v==="number"?(v*100).toFixed(1)+"%":"—";\nfunction showLogin(){$("#loginView").classList.remove("hidden");$("#appView").classList.add("hidden")}\nfunction showApp(){$("#loginView").classList.add("hidden");$("#appView").classList.remove("hidden");loadView(state.view)}\n$("#loginForm").onsubmit=async e=>{e.preventDefault();$("#loginError").textContent="";try{await api("/private/api/login",{method:"POST",body:JSON.stringify({password:$("#password").value})});$("#password").value="";showApp()}catch(err){$("#loginError").textContent=err.message}};\n$("#logout").onclick=async()=>{try{await api("/private/api/logout",{method:"POST"})}finally{showLogin()}};\n$$(".nav button").forEach(b=>b.onclick=()=>{state.view=b.dataset.view;$$(".nav button").forEach(x=>x.classList.toggle("active",x===b));["fixtures","predictions","learning","system"].forEach(v=>$(`#${v}View`).classList.toggle("hidden",v!==state.view));loadView(state.view)});\n$$(".chip").forEach(b=>b.onclick=()=>{state.range=b.dataset.range;state.page=1;$$(".chip").forEach(x=>x.classList.toggle("active",x===b));loadFixtures()});\n$("#refresh").onclick=loadFixtures;$("#search").oninput=e=>{clearTimeout(window.searchTimer);window.searchTimer=setTimeout(()=>{state.search=e.target.value;state.page=1;loadFixtures()},300)};\n$("#closeModal").onclick=()=>$("#modal").classList.add("hidden");$("#modal").onclick=e=>{if(e.target===$("#modal"))$("#modal").classList.add("hidden")};\nconst badge=(t,c="")=>`<span class="badge ${c}">${esc(t)}</span>`;\nfunction card(f){const m=f.market||{},p=f.performance||{},o=m.median_decimal_odds||{},existing=f.existing_prediction;const action=existing?"View prediction":f.location_time_ready?"Predict":"Verify with SportsDB & predict";return `<article class="card"><div class="league"><span>${esc(f.competition)}</span><span>${esc(f.country||"")}</span></div><div class="teams"><div class="team">${esc(f.home_team)}</div><div class="vs">VS</div><div class="team">${esc(f.away_team)}</div></div><div class="kickoff"><div><strong>${f.kickoff_venue_local?fmtVenue(f.kickoff_venue_local):"Venue time pending"}</strong><small>${esc(f.venue_timezone||"Timezone unverified")} ${esc(f.venue_utc_offset||"")}</small></div><div class="meta">${esc(f.venue_name||"Venue pending")}</div></div><div class="badges">${badge(f.venue_local_time_verified?"Local time verified":"Local time pending",f.venue_local_time_verified?"good":"bad")}${badge(m.market_ready?`${m.bookmaker_count} books`:"Market pending",m.market_ready?"good":"warn")}${badge(p.performance_ready?"Performance ready":"Performance pending",p.performance_ready?"good":"warn")}${existing?badge(`Frozen: ${existing.predicted_outcome}`,"good"):badge(f.prediction_ready?"Ready":"Preparation required",f.prediction_ready?"good":"warn")}</div><div class="meta">1X2: ${o.home??"—"} / ${o.draw??"—"} / ${o.away??"—"}</div><div class="actions"><button class="${existing?"secondary":"primary"}" onclick="${existing?`viewPrediction(${f.database_fixture_id})`:`checkPrediction(${f.database_fixture_id})`}">${action}</button></div></article>`}\nasync function loadFixtures(){$("#fixtureGrid").innerHTML=Array.from({length:8},()=>\'<div class="skeleton"></div>\').join("");$("#fixtureNotice").innerHTML="";try{const q=new URLSearchParams({range:state.range,page:state.page,page_size:state.pageSize,search:state.search});const d=await api("/private/api/fixtures?"+q);$("#fixtureGrid").innerHTML=d.fixtures.length?d.fixtures.map(card).join(""):\'<div class="empty">No stored fixtures match this filter.</div>\';const n=[];if(d.unverified_venue_time_count)n.push(`${d.unverified_venue_time_count} fixture(s) need venue verification. Press Verify with SportsDB & predict. The system refreshes API-Football, checks multiple TheSportsDB V1 endpoints, then verifies the stadium and local timezone through LocationIQ before any astrology call.`);if(state.range==="3m"&&d.maximum_available_kickoff_utc)n.push(`Current stored coverage reaches ${fmt(d.maximum_available_kickoff_utc)}.`);$("#fixtureNotice").innerHTML=n.length?`<div class="notice">${n.map(esc).join(" ")}</div>`:"";$("#pager").innerHTML=d.total_pages>1?`<button class="secondary" ${d.page<=1?"disabled":""} onclick="pageBy(-1)">Previous</button><span class="meta">Page ${d.page} of ${d.total_pages}</span><button class="secondary" ${d.page>=d.total_pages?"disabled":""} onclick="pageBy(1)">Next</button>`:""}catch(err){$("#fixtureGrid").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nwindow.pageBy=n=>{state.page=Math.max(1,state.page+n);loadFixtures();scrollTo({top:0,behavior:"smooth"})};\nfunction openModal(title,body){$("#modalTitle").textContent=title;$("#modalBody").innerHTML=body;$("#modal").classList.remove("hidden")}\nfunction renderPredictionWorkflowResult(id,d){if(d.prediction){renderExisting(d.prediction);loadFixtures();return}if(d.status==="workflow_error"){ $("#modalTitle").textContent="Prediction workflow error";const diag={diagnostic_id:d.diagnostic_id,error_type:d.error_type,safe_message:d.safe_message,frames:d.diagnostic_frames,backend_version:d.backend_version};$("#modalBody").innerHTML=`<div class="notice"><strong>The server stopped the workflow safely.</strong><div style="margin-top:8px">No new prediction was issued. Diagnostic ID: <b>${esc(d.diagnostic_id||"unavailable")}</b></div></div><div class="detail"><div class="detail-row"><span>Error type</span><b>${esc(d.error_type||"Unknown")}</b></div><div class="detail-row"><span>Safe detail</span><b>${esc(d.safe_message||"No detail")}</b></div></div><details open><summary>Private diagnostic</summary><pre>${esc(JSON.stringify(diag,null,2))}</pre></details>`;return}if(!d.prediction_ready){$("#modalTitle").textContent=d.status==="busy"?"Prediction already running":"Prediction not ready";const audit={online_verification:d.online_verification||d.location_resolution?.online_verification,location_resolution:d.location_resolution,venue_candidate_confirmation:d.venue_candidate_confirmation,market_capture:d.market_capture,performance_capture:d.performance_capture,market:d.market,performance:d.performance,action_state:d.action_state};const ov=d.online_verification||d.location_resolution?.online_verification||{};const web=ov.web_verification||{};const src=(ov.sources||ov.sportsdb?.sources||web.sources||[]).filter(s=>String(s.url||"").startsWith("https://")).slice(0,8);const sourceHtml=src.length?`<div class="card" style="margin-top:14px"><div class="kicker">Online verification sources</div>${src.map(s=>`<div class="detail-row"><a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.title||s.domain||s.url)}</a><span class="meta">${esc(s.source_type||"source")}</span></div>`).join("")}</div>`:"";$("#modalBody").innerHTML=`<div class="notice">${d.astrology_called?"The chart action was recorded; manual review may be required.":"No astrology call was made."}</div>${sourceHtml}<div class="detail">${(d.blockers||[]).map(x=>`<div class="detail-row"><span>${esc(x.replaceAll("_"," "))}</span>${badge("Blocked","warn")}</div>`).join("")}</div><details><summary>Preparation audit</summary><pre>${esc(JSON.stringify(audit,null,2))}</pre></details>`;return}$("#modalTitle").textContent="Prediction completed";$("#modalBody").innerHTML=`<div class="notice">The prediction was frozen, but the response could not be reloaded. Refresh the ledger.</div>`}\nwindow.checkPrediction=async id=>{openModal("Preparing verified prediction",`<div class="empty">Refreshing API-Football, checking TheSportsDB V1, verifying the stadium and venue-local timezone through LocationIQ, then capturing market and performance evidence. A deep chart runs only with a verified consensus favourite. When bookmaker odds are unavailable, a decisive performance-only result may be frozen without astrology.</div>`);try{const d=await api(`/private/api/fixtures/${id}/predict`,{method:"POST"});renderPredictionWorkflowResult(id,d)}catch(err){$("#modalBody").innerHTML=`<div class="notice">${esc(err.message)}</div>`}};\nwindow.viewPrediction=async id=>{openModal("Frozen prediction",\'<div class="empty">Loading immutable record…</div>\');try{const d=await api(`/private/api/fixtures/${id}/prediction`);renderExisting(d.prediction)}catch(err){$("#modalBody").innerHTML=`<div class="notice">${esc(err.message)}</div>`}};\nfunction renderExisting(p){const d=p.prediction_payload?.decision||p;$("#modalTitle").textContent="Frozen pre-match prediction";$("#modalBody").innerHTML=`<div class="card"><div class="kicker">Final prediction</div><h1>${esc(d.predicted_outcome_label||d.predicted_outcome||p.predicted_outcome)}</h1><div class="detail"><div class="detail-row"><span>Confidence</span><b>${esc(d.confidence||p.confidence||"—")}</b></div><div class="detail-row"><span>Eligibility</span><b>${esc(d.eligibility||p.eligibility||"—")}</b></div><div class="detail-row"><span>Actual result</span><b>${esc(p.actual_result||"Pending")}</b></div></div></div><details><summary>Stored audit payload</summary><pre>${esc(JSON.stringify(p,null,2))}</pre></details>`}\nasync function loadPredictions(){$("#predictionContent").innerHTML=\'<div class="empty">Loading prediction ledger…</div>\';try{const d=await api("/private/api/predictions?page=1&page_size=100");if(!d.predictions.length){$("#predictionContent").innerHTML=\'<div class="empty">No frozen predictions yet.</div>\';return}$("#predictionContent").innerHTML=`<div class="table-wrap"><table><thead><tr><th>Fixture</th><th>Venue-local kickoff</th><th>Prediction</th><th>Actual</th><th>Confidence</th><th>Correct</th></tr></thead><tbody>${d.predictions.map(p=>`<tr><td>${esc(p.home_team)} vs ${esc(p.away_team)}<br><span class="meta">${esc(p.competition)}</span></td><td>${esc(p.kickoff_venue_local?fmtVenue(p.kickoff_venue_local):"Pending")}</td><td>${esc(p.predicted_outcome)}</td><td>${esc(p.actual_result||"Pending")}</td><td>${esc(p.confidence||"—")}</td><td>${p.prediction_correct===true?"✓":p.prediction_correct===false?"✕":"—"}</td></tr>`).join("")}</tbody></table></div>`}catch(err){$("#predictionContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function loadLearning(){$("#learningContent").innerHTML=\'<div class="empty">Loading learning audit…</div>\';try{const d=await api("/private/api/learning"),t=d.totals||{},a=d.accuracy||{},s=d.learning_state||{};$("#learningContent").innerHTML=`<div class="stats"><div class="stat"><b>${t.predictions||0}</b><span>Frozen predictions</span></div><div class="stat"><b>${t.resolved||0}</b><span>Resolved outcomes</span></div><div class="stat"><b>${pct(a.prediction)}</b><span>Prediction accuracy</span></div><div class="stat"><b>${pct(a.market_baseline)}</b><span>Market baseline</span></div></div><div class="card"><h3>Learning gate</h3><div class="detail"><div class="detail-row"><span>Status</span><b>${esc(s.status)}</b></div><div class="detail-row"><span>Minimum resolved sample</span><b>${s.minimum_resolved_matches}</b></div><div class="detail-row"><span>Remaining</span><b>${s.remaining_until_evaluation}</b></div><div class="detail-row"><span>Silent live rule changes</span><b>No</b></div><div class="detail-row"><span>Holdout test</span><b>Required</b></div></div></div>`}catch(err){$("#learningContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function loadSystem(){$("#systemContent").innerHTML=\'<div class="empty">Loading system status…</div>\';try{const d=await api("/private/api/system");$("#systemContent").innerHTML=`<details open><summary>Production status</summary><pre>${esc(JSON.stringify(d,null,2))}</pre></details>`}catch(err){$("#systemContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function admin(path){$("#systemContent").innerHTML=\'<div class="empty">Running guarded operation…</div>\';try{const d=await api(path,{method:"POST"});$("#systemContent").innerHTML=`<details open><summary>Operation result</summary><pre>${esc(JSON.stringify(d,null,2))}</pre></details>`}catch(err){$("#systemContent").innerHTML=`<div class="notice">${esc(err.message)}</div>`}}\n$("#syncToday").onclick=()=>admin("/private/api/admin/sync-today");$("#syncFuture").onclick=()=>admin("/private/api/admin/sync-future");$("#diagnose").onclick=()=>admin("/private/api/admin/diagnose-future?offset_days=2");$("#syncResults").onclick=()=>admin("/private/api/admin/sync-results");\nfunction loadView(v){if(v==="fixtures")loadFixtures();if(v==="predictions")loadPredictions();if(v==="learning")loadLearning();if(v==="system")loadSystem()}\n(async()=>{try{await api("/private/api/session");showApp()}catch{showLogin()}})();\n</script>\n</body>\n</html>'
+PRIVATE_UI_HTML = '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<meta name="color-scheme" content="dark">\n<title>Rejans Mastermind — Private Predictor</title>\n<style>\n:root{--bg:#061017;--panel:#0d1923;--panel2:#11212d;--line:#203542;--text:#eef8f7;--muted:#8fa6b3;--teal:#45e0bf;--teal2:#18a991;--gold:#f4cb77;--red:#ff768b;--blue:#7ab5ff}\n*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 10% -15%,rgba(69,224,191,.2),transparent 34rem),radial-gradient(circle at 95% 0,rgba(122,181,255,.13),transparent 30rem),var(--bg);color:var(--text);font:15px/1.5 Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}\nbutton,input{font:inherit}button{cursor:pointer}.hidden{display:none!important}.muted{color:var(--muted)}.kicker{color:var(--teal);font-size:11px;font-weight:900;letter-spacing:.17em;text-transform:uppercase}\n.login{min-height:100vh;display:grid;place-items:center;padding:24px}.login-card{width:min(430px,100%);padding:34px;border:1px solid rgba(69,224,191,.25);border-radius:28px;background:linear-gradient(155deg,rgba(17,33,45,.97),rgba(7,17,24,.97));box-shadow:0 30px 90px rgba(0,0,0,.45)}\n.logo{width:56px;height:56px;border-radius:18px;display:grid;place-items:center;background:linear-gradient(135deg,var(--teal),#0e8e79);color:#03231d;font-size:24px;font-weight:950}.login h1{font-size:31px;letter-spacing:-.04em;margin:18px 0 7px}.field{display:grid;gap:7px;margin:24px 0 12px}.field input,.search{width:100%;border:1px solid var(--line);border-radius:14px;background:#08131c;color:var(--text);padding:13px 15px;outline:none}.field input:focus,.search:focus{border-color:var(--teal)}\n.primary,.secondary{border-radius:13px;padding:11px 15px;font-weight:850}.primary{border:0;background:linear-gradient(135deg,var(--teal),var(--teal2));color:#03221d}.secondary{border:1px solid var(--line);background:#0a1720;color:var(--text)}.danger{color:#ffb0bc;border-color:rgba(255,118,139,.35)}\n.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;padding:14px 22px;background:rgba(6,16,23,.78);backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,.06)}.brand{display:flex;align-items:center;gap:12px}.brand .logo{width:38px;height:38px;border-radius:12px;font-size:16px}.brand strong{display:block}.brand span{font-size:12px;color:var(--muted)}\n.layout{display:grid;grid-template-columns:220px minmax(0,1fr);min-height:calc(100vh - 67px)}.side{border-right:1px solid rgba(255,255,255,.06);padding:20px 14px}.nav{display:grid;gap:8px;position:sticky;top:88px}.nav button{border:0;background:transparent;color:var(--muted);padding:12px 14px;border-radius:12px;text-align:left;font-weight:800}.nav button.active,.nav button:hover{color:var(--teal);background:rgba(69,224,191,.1)}\n.main{padding:28px;max-width:1500px;width:100%;margin:0 auto}.hero{display:flex;justify-content:space-between;align-items:end;gap:18px;margin-bottom:18px}.hero h1{font-size:34px;letter-spacing:-.045em;margin:2px 0 4px}.filters{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0}.chip{border:1px solid var(--line);background:#0a1720;color:var(--muted);padding:9px 13px;border-radius:999px;font-weight:850}.chip.active{color:var(--teal);border-color:rgba(69,224,191,.45);background:rgba(69,224,191,.1)}\n.toolbar{display:grid;grid-template-columns:minmax(240px,1fr) auto;gap:10px;margin-bottom:16px}.notice{padding:12px 14px;border-radius:14px;border:1px solid rgba(244,203,119,.25);background:rgba(244,203,119,.08);color:#f6dfa9;margin-bottom:15px}\n.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:15px}.card{padding:18px;border:1px solid rgba(255,255,255,.07);border-radius:20px;background:linear-gradient(155deg,rgba(17,33,45,.96),rgba(10,23,32,.96));box-shadow:0 16px 44px rgba(0,0,0,.18)}.card:hover{border-color:rgba(69,224,191,.25)}.league{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px}.teams{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:10px;margin:18px 0}.team{font-size:17px;font-weight:850}.team:last-child{text-align:right}.vs{font-size:11px;color:var(--muted)}\n.kickoff{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px;border-radius:14px;background:#07131b}.kickoff strong{display:block;font-size:16px}.kickoff small{display:block;color:var(--muted)}.badges{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.badge{font-size:11px;font-weight:900;padding:5px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.06);background:#11232f;color:var(--muted)}.badge.good{color:var(--teal);background:rgba(69,224,191,.08);border-color:rgba(69,224,191,.22)}.badge.warn{color:var(--gold);background:rgba(244,203,119,.08);border-color:rgba(244,203,119,.2)}.badge.bad{color:#ff9cab;background:rgba(255,118,139,.08);border-color:rgba(255,118,139,.2)}.meta{font-size:12px;color:var(--muted)}.actions{display:flex;gap:8px;margin-top:14px}.actions button{flex:1}\n.empty{padding:46px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:18px}.skeleton{height:245px;border-radius:20px;background:linear-gradient(90deg,#0c1822,#142733,#0c1822);background-size:200% 100%;animation:shimmer 1.4s infinite}@keyframes shimmer{to{background-position:-200% 0}}\n.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:18px}.stat{padding:18px;border:1px solid rgba(255,255,255,.07);border-radius:18px;background:var(--panel)}.stat b{display:block;font-size:28px;letter-spacing:-.04em}.stat span{font-size:12px;color:var(--muted)}\n.table-wrap{overflow:auto;border:1px solid rgba(255,255,255,.07);border-radius:18px}table{width:100%;border-collapse:collapse;background:rgba(13,25,35,.9)}th,td{padding:13px 14px;border-bottom:1px solid rgba(255,255,255,.06);white-space:nowrap;text-align:left}th{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}\n.modal{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:20px;background:rgba(1,7,11,.8);backdrop-filter:blur(10px)}.modal-card{width:min(900px,100%);max-height:90vh;overflow:auto;padding:24px;border-radius:24px;border:1px solid rgba(69,224,191,.24);background:#0a1720;box-shadow:0 30px 100px rgba(0,0,0,.5)}.modal-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}.modal-head h2{margin:2px 0 0}.close{width:38px;height:38px;border:1px solid var(--line);border-radius:12px;background:#10212c;color:var(--text)}\n.detail{display:grid;gap:8px}.detail-row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}details{margin-top:12px;padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,.07);background:#0e1d28}summary{font-weight:850;cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;color:#b6c9d3;font-size:12px}.pager{display:flex;justify-content:center;align-items:center;gap:10px;margin:22px 0}.system-actions{display:flex;flex-wrap:wrap;gap:9px;margin-bottom:16px}\n@media(max-width:900px){.layout{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid rgba(255,255,255,.06);overflow:auto;padding:10px}.nav{display:flex;position:static;min-width:max-content}.main{padding:20px}.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:560px){.top{padding:12px}.main{padding:15px}.grid{grid-template-columns:1fr}.toolbar{grid-template-columns:1fr}.hero h1{font-size:28px}}\n</style>\n</head>\n<body>\n<section id="loginView" class="login">\n  <form id="loginForm" class="login-card">\n    <div class="logo">R</div>\n    <h1>Private Predictor</h1>\n    <p class="muted">Verified football, venue-local astrology and controlled learning.</p>\n    <label class="field"><span>Private password</span><input id="password" type="password" autocomplete="current-password" required></label>\n    <button class="primary" style="width:100%" type="submit">Enter dashboard</button>\n    <p id="loginError" style="color:#ff9cab;min-height:22px;margin:12px 0 0"></p>\n  </form>\n</section>\n\n<div id="appView" class="hidden">\n<header class="top"><div class="brand"><div class="logo">R</div><div><strong>Rejans Mastermind</strong><span>Private production console</span></div></div><button id="logout" class="secondary danger">Sign out</button></header>\n<div class="layout">\n<aside class="side"><nav class="nav"><button class="active" data-view="fixtures">⚽ Fixtures</button><button data-view="predictions">◎ Predictions</button><button data-view="learning">◈ Learning</button><button data-view="system">⚙ System</button></nav></aside>\n<main class="main">\n<section id="fixturesView">\n  <div class="hero"><div><div class="kicker">Venue-local intelligence</div><h1>Upcoming matches</h1><p class="muted">Kickoff times use each stadium’s verified local timezone.</p></div></div>\n  <div class="filters"><button class="chip active" data-range="today">Today</button><button class="chip" data-range="tomorrow">Tomorrow</button><button class="chip" data-range="3d">Next 3 days</button><button class="chip" data-range="3m">Next 3 months</button></div>\n  <div class="toolbar"><input id="search" class="search" placeholder="Search team, league, country or venue"><button id="refresh" class="secondary">Refresh</button></div>\n  <div id="fixtureNotice"></div><div id="fixtureGrid" class="grid"></div><div id="pager" class="pager"></div>\n</section>\n<section id="predictionsView" class="hidden"><div class="hero"><div><div class="kicker">Immutable audit trail</div><h1>Predictions</h1><p class="muted">Every issued forecast remains frozen.</p></div></div><div id="predictionContent"></div></section>\n<section id="learningView" class="hidden"><div class="hero"><div><div class="kicker">Controlled improvement</div><h1>Results & learning</h1><p class="muted">Prediction versus outcome, market baseline and holdout-gated updates.</p></div></div><div id="learningContent"></div></section>\n<section id="systemView" class="hidden"><div class="hero"><div><div class="kicker">Private operations</div><h1>System</h1><p class="muted">Guarded sync and diagnostics without terminal commands.</p></div></div><div class="system-actions"><button id="syncToday" class="secondary">Sync today</button><button id="syncFuture" class="secondary">Sync future</button><button id="diagnose" class="secondary">Run one-call diagnostic</button><button id="syncResults" class="secondary">Sync official results</button></div><div id="systemContent"></div></section>\n</main>\n</div>\n</div>\n\n<div id="modal" class="modal hidden"><div class="modal-card"><div class="modal-head"><div><div class="kicker">Prediction workflow</div><h2 id="modalTitle">Fixture</h2></div><button id="closeModal" class="close">×</button></div><div id="modalBody"></div></div></div>\n\n<script>\nconst state={view:"fixtures",range:"today",page:1,pageSize:24,search:""};\nconst $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];\nconst esc=v=>String(v??"").replace(/[&<>"\']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;","\'":"&#39;"}[m]));\nconst api=async(url,opts={})=>{let r;try{r=await fetch(url,{credentials:"same-origin",headers:{"Content-Type":"application/json",...(opts.headers||{})},...opts})}catch(err){throw new Error(`Network request failed: ${err?.message||"connection error"}`)}const raw=await r.text();let d={};if(raw){try{d=JSON.parse(raw)}catch{d={raw_preview:raw.slice(0,240)}}}if(r.status===401){showLogin();throw new Error("Session expired")}if(!r.ok){const detail=typeof d.detail==="string"?d.detail:d.detail?.message||d.detail?.error||d.message||d.error||d.raw_preview;const suffix=d.diagnostic_id?` · Diagnostic ${d.diagnostic_id}`:"";throw new Error(`${detail||`HTTP ${r.status}`} [HTTP ${r.status}]${suffix}`)}return d};\nconst fmt=v=>v?new Intl.DateTimeFormat(undefined,{weekday:"short",day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"}).format(new Date(v)):"Time pending";const fmtVenue=v=>{if(!v)return"Venue time pending";const m=String(v).match(/^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2})(?::\\d{2}(?:\\.\\d+)?)?([+-]\\d{2}:\\d{2}|Z)?/);if(!m)return esc(v);const[,y,mo,d,h,mi,off=""]=m;const wd=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.UTC(+y,+mo-1,+d)).getUTCDay()];const month=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][+mo-1];return `${wd}, ${d} ${month} ${y}, ${h}:${mi}${off?` ${off}`:""}`};\nconst pct=v=>typeof v==="number"?(v*100).toFixed(1)+"%":"—";\nfunction showLogin(){$("#loginView").classList.remove("hidden");$("#appView").classList.add("hidden")}\nfunction showApp(){$("#loginView").classList.add("hidden");$("#appView").classList.remove("hidden");loadView(state.view)}\n$("#loginForm").onsubmit=async e=>{e.preventDefault();$("#loginError").textContent="";try{await api("/private/api/login",{method:"POST",body:JSON.stringify({password:$("#password").value})});$("#password").value="";showApp()}catch(err){$("#loginError").textContent=err.message}};\n$("#logout").onclick=async()=>{try{await api("/private/api/logout",{method:"POST"})}finally{showLogin()}};\n$$(".nav button").forEach(b=>b.onclick=()=>{state.view=b.dataset.view;$$(".nav button").forEach(x=>x.classList.toggle("active",x===b));["fixtures","predictions","learning","system"].forEach(v=>$(`#${v}View`).classList.toggle("hidden",v!==state.view));loadView(state.view)});\n$$(".chip").forEach(b=>b.onclick=()=>{state.range=b.dataset.range;state.page=1;$$(".chip").forEach(x=>x.classList.toggle("active",x===b));loadFixtures()});\n$("#refresh").onclick=loadFixtures;$("#search").oninput=e=>{clearTimeout(window.searchTimer);window.searchTimer=setTimeout(()=>{state.search=e.target.value;state.page=1;loadFixtures()},300)};\n$("#closeModal").onclick=()=>$("#modal").classList.add("hidden");$("#modal").onclick=e=>{if(e.target===$("#modal"))$("#modal").classList.add("hidden")};\nconst badge=(t,c="")=>`<span class="badge ${c}">${esc(t)}</span>`;\nfunction card(f){const m=f.market||{},p=f.performance||{},o=m.median_decimal_odds||{},existing=f.existing_prediction;const action=existing?"View prediction":f.location_time_ready?"Predict":"Verify online & predict";return `<article class="card"><div class="league"><span>${esc(f.competition)}</span><span>${esc(f.country||"")}</span></div><div class="teams"><div class="team">${esc(f.home_team)}</div><div class="vs">VS</div><div class="team">${esc(f.away_team)}</div></div><div class="kickoff"><div><strong>${f.kickoff_venue_local?fmtVenue(f.kickoff_venue_local):"Venue time pending"}</strong><small>${esc(f.venue_timezone||"Timezone unverified")} ${esc(f.venue_utc_offset||"")}</small></div><div class="meta">${esc(f.venue_name||"Venue pending")}</div></div><div class="badges">${badge(f.venue_local_time_verified?"Local time verified":"Local time pending",f.venue_local_time_verified?"good":"bad")}${badge(m.market_ready?`${m.bookmaker_count} books`:"Market pending",m.market_ready?"good":"warn")}${badge(p.performance_ready?"Performance ready":"Performance pending",p.performance_ready?"good":"warn")}${existing?badge(`Frozen: ${existing.predicted_outcome}`,"good"):badge(f.prediction_ready?"Ready":"Preparation required",f.prediction_ready?"good":"warn")}</div><div class="meta">1X2: ${o.home??"—"} / ${o.draw??"—"} / ${o.away??"—"}</div><div class="actions"><button class="${existing?"secondary":"primary"}" onclick="${existing?`viewPrediction(${f.database_fixture_id})`:`checkPrediction(${f.database_fixture_id})`}">${action}</button></div></article>`}\nasync function loadFixtures(){$("#fixtureGrid").innerHTML=Array.from({length:8},()=>\'<div class="skeleton"></div>\').join("");$("#fixtureNotice").innerHTML="";try{const q=new URLSearchParams({range:state.range,page:state.page,page_size:state.pageSize,search:state.search});const d=await api("/private/api/fixtures?"+q);$("#fixtureGrid").innerHTML=d.fixtures.length?d.fixtures.map(card).join(""):\'<div class="empty">No stored fixtures match this filter.</div>\';const n=[];if(d.unverified_venue_time_count)n.push(`${d.unverified_venue_time_count} fixture(s) need venue verification. Press Verify with SportsDB & predict. The system refreshes API-Football, checks multiple TheSportsDB V1 endpoints, then verifies the stadium and local timezone through LocationIQ before any astrology call.`);if(state.range==="3m"&&d.maximum_available_kickoff_utc)n.push(`Current stored coverage reaches ${fmt(d.maximum_available_kickoff_utc)}.`);$("#fixtureNotice").innerHTML=n.length?`<div class="notice">${n.map(esc).join(" ")}</div>`:"";$("#pager").innerHTML=d.total_pages>1?`<button class="secondary" ${d.page<=1?"disabled":""} onclick="pageBy(-1)">Previous</button><span class="meta">Page ${d.page} of ${d.total_pages}</span><button class="secondary" ${d.page>=d.total_pages?"disabled":""} onclick="pageBy(1)">Next</button>`:""}catch(err){$("#fixtureGrid").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nwindow.pageBy=n=>{state.page=Math.max(1,state.page+n);loadFixtures();scrollTo({top:0,behavior:"smooth"})};\nfunction openModal(title,body){$("#modalTitle").textContent=title;$("#modalBody").innerHTML=body;$("#modal").classList.remove("hidden")}\nfunction renderPredictionWorkflowResult(id,d){if(d.prediction){renderExisting(d.prediction);loadFixtures();return}if(d.status==="workflow_error"){ $("#modalTitle").textContent="Prediction workflow error";const diag={diagnostic_id:d.diagnostic_id,error_type:d.error_type,safe_message:d.safe_message,frames:d.diagnostic_frames,backend_version:d.backend_version};$("#modalBody").innerHTML=`<div class="notice"><strong>The server stopped the workflow safely.</strong><div style="margin-top:8px">No new prediction was issued. Diagnostic ID: <b>${esc(d.diagnostic_id||"unavailable")}</b></div></div><div class="detail"><div class="detail-row"><span>Error type</span><b>${esc(d.error_type||"Unknown")}</b></div><div class="detail-row"><span>Safe detail</span><b>${esc(d.safe_message||"No detail")}</b></div></div><details open><summary>Private diagnostic</summary><pre>${esc(JSON.stringify(diag,null,2))}</pre></details>`;return}if(!d.prediction_ready){$("#modalTitle").textContent=d.status==="busy"?"Prediction already running":"Prediction not ready";const audit={online_verification:d.online_verification||d.location_resolution?.online_verification,location_resolution:d.location_resolution,venue_candidate_confirmation:d.venue_candidate_confirmation,market_capture:d.market_capture,performance_capture:d.performance_capture,market:d.market,performance:d.performance,action_state:d.action_state};const ov=d.online_verification||d.location_resolution?.online_verification||{};const web=ov.web_verification||{};const src=(ov.sources||ov.sportsdb?.sources||web.sources||[]).filter(s=>String(s.url||"").startsWith("https://")).slice(0,8);const sourceHtml=src.length?`<div class="card" style="margin-top:14px"><div class="kicker">Online verification sources</div>${src.map(s=>`<div class="detail-row"><a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.title||s.domain||s.url)}</a><span class="meta">${esc(s.source_type||"source")}</span></div>`).join("")}</div>`:"";$("#modalBody").innerHTML=`<div class="notice">${d.astrology_called?"The chart action was recorded; manual review may be required.":"No astrology call was made."}</div>${sourceHtml}<div class="detail">${(d.blockers||[]).map(x=>`<div class="detail-row"><span>${esc(x.replaceAll("_"," "))}</span>${badge("Blocked","warn")}</div>`).join("")}</div><details><summary>Preparation audit</summary><pre>${esc(JSON.stringify(audit,null,2))}</pre></details>`;return}$("#modalTitle").textContent="Prediction completed";$("#modalBody").innerHTML=`<div class="notice">The prediction was frozen, but the response could not be reloaded. Refresh the ledger.</div>`}\nwindow.checkPrediction=async id=>{openModal("Preparing verified prediction",`<div class="empty">Refreshing API-Football, checking TheSportsDB V1, verifying the stadium and venue-local timezone through LocationIQ, then capturing market and performance evidence. A deep chart runs only with a verified consensus favourite. When bookmaker odds are unavailable, a decisive performance-only result may be frozen without astrology.</div>`);try{const d=await api(`/private/api/fixtures/${id}/predict`,{method:"POST"});renderPredictionWorkflowResult(id,d)}catch(err){$("#modalBody").innerHTML=`<div class="notice">${esc(err.message)}</div>`}};\nwindow.viewPrediction=async id=>{openModal("Frozen prediction",\'<div class="empty">Loading immutable record…</div>\');try{const d=await api(`/private/api/fixtures/${id}/prediction`);renderExisting(d.prediction)}catch(err){$("#modalBody").innerHTML=`<div class="notice">${esc(err.message)}</div>`}};\nfunction renderExisting(p){const d=p.prediction_payload?.decision||p;$("#modalTitle").textContent="Frozen pre-match prediction";$("#modalBody").innerHTML=`<div class="card"><div class="kicker">Final prediction</div><h1>${esc(d.predicted_outcome_label||d.predicted_outcome||p.predicted_outcome)}</h1><div class="detail"><div class="detail-row"><span>Confidence</span><b>${esc(d.confidence||p.confidence||"—")}</b></div><div class="detail-row"><span>Eligibility</span><b>${esc(d.eligibility||p.eligibility||"—")}</b></div><div class="detail-row"><span>Actual result</span><b>${esc(p.actual_result||"Pending")}</b></div></div></div><details><summary>Stored audit payload</summary><pre>${esc(JSON.stringify(p,null,2))}</pre></details>`}\nasync function loadPredictions(){$("#predictionContent").innerHTML=\'<div class="empty">Loading prediction ledger…</div>\';try{const d=await api("/private/api/predictions?page=1&page_size=100");if(!d.predictions.length){$("#predictionContent").innerHTML=\'<div class="empty">No frozen predictions yet.</div>\';return}$("#predictionContent").innerHTML=`<div class="table-wrap"><table><thead><tr><th>Fixture</th><th>Venue-local kickoff</th><th>Prediction</th><th>Actual</th><th>Confidence</th><th>Correct</th></tr></thead><tbody>${d.predictions.map(p=>`<tr><td>${esc(p.home_team)} vs ${esc(p.away_team)}<br><span class="meta">${esc(p.competition)}</span></td><td>${esc(p.kickoff_venue_local?fmtVenue(p.kickoff_venue_local):"Pending")}</td><td>${esc(p.predicted_outcome)}</td><td>${esc(p.actual_result||"Pending")}</td><td>${esc(p.confidence||"—")}</td><td>${p.prediction_correct===true?"✓":p.prediction_correct===false?"✕":"—"}</td></tr>`).join("")}</tbody></table></div>`}catch(err){$("#predictionContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function loadLearning(){$("#learningContent").innerHTML=\'<div class="empty">Loading learning audit…</div>\';try{const d=await api("/private/api/learning"),t=d.totals||{},a=d.accuracy||{},s=d.learning_state||{};$("#learningContent").innerHTML=`<div class="stats"><div class="stat"><b>${t.predictions||0}</b><span>Frozen predictions</span></div><div class="stat"><b>${t.resolved||0}</b><span>Resolved outcomes</span></div><div class="stat"><b>${pct(a.prediction)}</b><span>Prediction accuracy</span></div><div class="stat"><b>${pct(a.market_baseline)}</b><span>Market baseline</span></div></div><div class="card"><h3>Learning gate</h3><div class="detail"><div class="detail-row"><span>Status</span><b>${esc(s.status)}</b></div><div class="detail-row"><span>Minimum resolved sample</span><b>${s.minimum_resolved_matches}</b></div><div class="detail-row"><span>Remaining</span><b>${s.remaining_until_evaluation}</b></div><div class="detail-row"><span>Silent live rule changes</span><b>No</b></div><div class="detail-row"><span>Holdout test</span><b>Required</b></div></div></div>`}catch(err){$("#learningContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function loadSystem(){$("#systemContent").innerHTML=\'<div class="empty">Loading system status…</div>\';try{const d=await api("/private/api/system");$("#systemContent").innerHTML=`<details open><summary>Production status</summary><pre>${esc(JSON.stringify(d,null,2))}</pre></details>`}catch(err){$("#systemContent").innerHTML=`<div class="empty">${esc(err.message)}</div>`}}\nasync function admin(path){$("#systemContent").innerHTML=\'<div class="empty">Running guarded operation…</div>\';try{const d=await api(path,{method:"POST"});$("#systemContent").innerHTML=`<details open><summary>Operation result</summary><pre>${esc(JSON.stringify(d,null,2))}</pre></details>`}catch(err){$("#systemContent").innerHTML=`<div class="notice">${esc(err.message)}</div>`}}\n$("#syncToday").onclick=()=>admin("/private/api/admin/sync-today");$("#syncFuture").onclick=()=>admin("/private/api/admin/sync-future");$("#diagnose").onclick=()=>admin("/private/api/admin/diagnose-future?offset_days=2");$("#syncResults").onclick=()=>admin("/private/api/admin/sync-results");\nfunction loadView(v){if(v==="fixtures")loadFixtures();if(v==="predictions")loadPredictions();if(v==="learning")loadLearning();if(v==="system")loadSystem()}\n(async()=>{try{await api("/private/api/session");showApp()}catch{showLogin()}})();\n</script>\n</body>\n</html>'
 
 
 @app.get("/private", response_class=HTMLResponse)
@@ -29306,14 +29363,24 @@ def health() -> dict[str, Any]:
             "structured_workflow_error_diagnostics": True,
             "generic_request_failed_removed": True,
             "online_multi_source_fixture_verification": ONLINE_MATCH_VERIFY_ENABLED,
-            "independent_match_sources": ["API-Football", "TheSportsDB V1"],
+            "independent_match_sources": [
+                "API-Football", "TheSportsDB V1", "Tavily fallback"
+            ],
             "manual_confirmation_final_fallback_only": False,
             "source_conflict_blocks_astrology": True,
             "hosted_chatgpt_style_web_search": False,
-            "sportsdb_only_online_verification": True,
+            "tavily_search_fallback": TAVILY_SEARCH_ENABLED,
+            "tavily_used_only_when_structured_sources_unresolved": True,
+            "tavily_never_used_as_bookmaker_market": True,
+            "sportsdb_only_online_verification": False,
             "sportsdb_multi_endpoint_search": True,
             "manual_venue_assumption_removed": True,
-            "triple_check_layers": ["API-Football", "TheSportsDB V1 multi-endpoint", "LocationIQ"],
+            "triple_check_layers": [
+                "API-Football",
+                "TheSportsDB V1 multi-endpoint",
+                "Tavily fallback when unresolved",
+                "LocationIQ physical-place verification",
+            ],
             "verifier_self_test": PREDICT1H_SELF_TEST_STATUS,
             "sportsdb_exact_event_city_derivation": True,
             "locationiq_country_first_fallback": True,
@@ -29323,6 +29390,9 @@ def health() -> dict[str, Any]:
             "performance_only_when_market_unavailable": True,
             "market_assignment_never_invented": True,
             "predict1i_self_test": PREDICT1I_SELF_TEST_STATUS,
+            "predict1j_self_test": PREDICT1J_SELF_TEST_STATUS,
+            "market_consensus_temporal_scope_fix": True,
+            "predict1k_self_test": PREDICT1K_SELF_TEST_STATUS,
             "missing_provider_venue_never_guessed": True,
         },
         "result_learning_checkpoint": {
@@ -29339,7 +29409,7 @@ def health() -> dict[str, Any]:
         "proxy_key_configured": bool(PROXY_API_KEY),
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "PREDICT1I free-plan performance capture without Last plus performance-only fallback",
+        "database_checkpoint": "PREDICT1K market consensus temporal-scope fix plus Tavily and free-plan performance handling",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -29398,6 +29468,11 @@ def health() -> dict[str, Any]:
             "material_venue_or_city_change_invalidates_location": True,
             "provider_display_timezone_never_trusted_as_venue_timezone": True,
         },
+        "tavily_api_key_configured": bool(TAVILY_API_KEY),
+        "tavily_search_enabled": TAVILY_SEARCH_ENABLED,
+        "tavily_search_depth": TAVILY_SEARCH_DEPTH,
+        "tavily_min_distinct_domains": TAVILY_MIN_DISTINCT_DOMAINS,
+        "tavily_require_official_source": TAVILY_REQUIRE_OFFICIAL_SOURCE,
         "thesportsdb_key_configured": bool(THESPORTSDB_API_KEY),
         "thesportsdb_api_version": "v1",
         "thesportsdb_free_key_supported": True,
@@ -32247,3 +32322,604 @@ def _predict1i_run_self_tests() -> dict[str, Any]:
 
 
 PREDICT1I_SELF_TEST_STATUS = _predict1i_run_self_tests()
+# ============================================================
+# PREDICT1J — TAVILY WEB-SEARCH FALLBACK
+# ============================================================
+
+PREDICT1J_TAVILY_VERIFY_PREFIX = "predict1j_tavily_verify:"
+
+
+def _predict1j_domain(url: Any) -> str:
+    try:
+        hostname = (urlparse(str(url or "")).hostname or "").lower()
+    except Exception:
+        return ""
+    return hostname[4:] if hostname.startswith("www.") else hostname
+
+
+def _predict1j_tokens(value: Any) -> list[str]:
+    stop = {
+        "fc", "cf", "sc", "club", "football", "soccer", "team",
+        "the", "and", "vs", "v", "women", "woman", "men", "u20",
+        "u21", "u23", "ii", "reserves",
+    }
+    normalised = _predict1_compare_text(value)
+    return [
+        token for token in normalised.split()
+        if len(token) >= 3 and token not in stop
+    ]
+
+
+def _predict1j_phrase_coverage(phrase: Any, blob: Any) -> float:
+    tokens = _predict1j_tokens(phrase)
+    if not tokens:
+        return 0.0
+    blob_tokens = set(_predict1j_tokens(blob))
+    return sum(token in blob_tokens for token in tokens) / len(tokens)
+
+
+def _predict1j_fixture_supported(
+    record: dict[str, Any],
+    blob: str,
+) -> bool:
+    home = _predict1j_phrase_coverage(record.get("home_team"), blob)
+    away = _predict1j_phrase_coverage(record.get("away_team"), blob)
+    return home >= 0.60 and away >= 0.60
+
+
+def _predict1j_official_like(
+    record: dict[str, Any],
+    result: dict[str, Any],
+) -> bool:
+    domain = _predict1j_domain(result.get("url"))
+    title = str(result.get("title") or "")
+    content = str(result.get("content") or "")
+    blob = f"{domain} {title} {content}".lower()
+    if "official" in blob:
+        return True
+
+    domain_tokens = set(_predict1j_tokens(domain.replace(".", " ")))
+    entity_tokens = set(
+        _predict1j_tokens(record.get("home_team"))
+        + _predict1j_tokens(record.get("away_team"))
+        + _predict1j_tokens(record.get("competition"))
+    )
+    if domain_tokens and entity_tokens:
+        overlap = len(domain_tokens.intersection(entity_tokens))
+        if overlap >= 1:
+            return True
+
+    recognised = (
+        "fifa.com", "uefa.com", "the-afc.com", "concacaf.com",
+        "conmebol.com", "cafonline.com", "jleague.co",
+        "thefa.com", "efl.com", "mlssoccer.com",
+    )
+    return any(domain == item or domain.endswith("." + item) for item in recognised)
+
+
+def _predict1j_candidate_phrases(blob: str) -> list[str]:
+    patterns = [
+        re.compile(
+            r"\b([A-Z][A-Za-z0-9'’.\-]*(?:\s+(?:[A-Z0-9][A-Za-z0-9'’.\-]*|"
+            r"of|the|de|del|da|do|dos|das|la|le)){0,9}\s+"
+            r"(?:Stadium|Arena|Ground|Park|Centre|Center|Complex|Field|Dome))\b"
+        ),
+        re.compile(
+            r"(?:venue|stadium|played at|takes place at|scheduled at)\s*"
+            r"(?:is|:|-|—|at)?\s*"
+            r"([A-Z][A-Za-z0-9'’.\-]*(?:\s+[A-Z0-9][A-Za-z0-9'’.\-]*){1,7})"
+        ),
+    ]
+    output: list[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for match in pattern.finditer(blob):
+            candidate = " ".join(match.group(1).split()).strip(" ,.;:-")
+            key = _predict1_compare_text(candidate)
+            if len(candidate) < 5 or not key or key in seen:
+                continue
+            if len(candidate) > 100:
+                continue
+            seen.add(key)
+            output.append(candidate)
+    return output[:20]
+
+
+def _predict1j_tavily_call(query: str) -> dict[str, Any]:
+    if not TAVILY_SEARCH_ENABLED:
+        return {
+            "status": "disabled",
+            "results": [],
+        }
+    if not TAVILY_API_KEY:
+        return {
+            "status": "key_not_configured",
+            "results": [],
+        }
+
+    payload = {
+        "query": query,
+        "search_depth": TAVILY_SEARCH_DEPTH,
+        "topic": "general",
+        "include_answer": "basic",
+        "include_raw_content": False,
+        "include_images": False,
+        "max_results": TAVILY_MAX_RESULTS,
+    }
+    try:
+        response = requests.post(
+            f"{TAVILY_BASE_URL}/search",
+            headers={
+                "Authorization": f"Bearer {TAVILY_API_KEY}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": f"VedAstro-GPT-Proxy/{PROXY_VERSION}",
+            },
+            json=payload,
+            timeout=TAVILY_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        return {
+            "status": "transport_error",
+            "error_type": type(exc).__name__,
+            "results": [],
+        }
+
+    if response.status_code != 200:
+        return {
+            "status": "http_error",
+            "http_status": response.status_code,
+            "results": [],
+        }
+    try:
+        data = response.json()
+    except ValueError:
+        return {
+            "status": "invalid_json",
+            "results": [],
+        }
+
+    rows = data.get("results")
+    rows = rows if isinstance(rows, list) else []
+    safe_rows: list[dict[str, Any]] = []
+    for row in rows[:TAVILY_MAX_RESULTS]:
+        if not isinstance(row, dict):
+            continue
+        safe_rows.append({
+            "title": str(row.get("title") or "")[:300],
+            "url": str(row.get("url") or "")[:1200],
+            "content": str(row.get("content") or "")[:4000],
+            "score": _predict1_safe_number(row.get("score")),
+        })
+    return {
+        "status": "ok",
+        "query": query,
+        "answer": str(data.get("answer") or "")[:4000],
+        "results": safe_rows,
+        "response_time": data.get("response_time"),
+        "request_id": data.get("request_id"),
+    }
+
+
+def _predict1j_tavily_state(fixture_id: int) -> dict[str, Any] | None:
+    raw = _predict1_metadata_get(
+        f"{PREDICT1J_TAVILY_VERIFY_PREFIX}{fixture_id}"
+    )
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except Exception:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _predict1j_tavily_state_fresh(state: dict[str, Any] | None) -> bool:
+    if not isinstance(state, dict):
+        return False
+    attempted = _predict1_parse_provider_datetime(state.get("attempted_at"))
+    if attempted is None:
+        return False
+    age = (datetime.now(timezone.utc) - attempted).total_seconds()
+    return 0 <= age < TAVILY_VERIFY_MIN_INTERVAL_SECONDS
+
+
+def _predict1j_tavily_verify_fixture(
+    fixture_id: int,
+    structured_result: dict[str, Any],
+) -> dict[str, Any]:
+    attempted_at = datetime.now(timezone.utc).isoformat()
+    state_key = f"{PREDICT1J_TAVILY_VERIFY_PREFIX}{fixture_id}"
+
+    previous = _predict1j_tavily_state(fixture_id)
+    if _predict1j_tavily_state_fresh(previous):
+        return {**previous, "cached": True}
+
+    record = _predict1_fixture_record(fixture_id)
+    if not isinstance(record, dict):
+        return {
+            "status": "fixture_not_found",
+            "verified": False,
+            "blocking_conflict": True,
+            "manual_confirmation_required": False,
+        }
+
+    kickoff = _predict1_parse_provider_datetime(record.get("kickoff_utc"))
+    if kickoff is None or kickoff <= datetime.now(timezone.utc):
+        return {
+            "status": "blocked_after_kickoff",
+            "verified": False,
+            "blocking_conflict": True,
+            "manual_confirmation_required": False,
+        }
+
+    query = (
+        f'"{record.get("home_team")}" vs "{record.get("away_team")}" '
+        f'{kickoff.date().isoformat()} '
+        f'"{record.get("competition") or ""}" '
+        "exact match venue stadium city country kickoff official"
+    )
+    search = _predict1j_tavily_call(query)
+    if search.get("status") != "ok":
+        result = {
+            "status": f"tavily_{search.get('status')}",
+            "verified": False,
+            "blocking_conflict": False,
+            "attempted_at": attempted_at,
+            "fixture_id": fixture_id,
+            "structured_sources": structured_result,
+            "tavily": search,
+            "manual_confirmation_required": False,
+            "astrology_called": False,
+            "backend_version": PROXY_VERSION,
+        }
+        _predict1_metadata_set(state_key, result)
+        return result
+
+    sportsdb_event = structured_result.get("selected_event")
+    sportsdb_event = (
+        sportsdb_event if isinstance(sportsdb_event, dict) else {}
+    )
+    venue_detail = structured_result.get("venue_detail")
+    venue_detail = (
+        venue_detail if isinstance(venue_detail, dict) else {}
+    )
+
+    known_candidates = [
+        record.get("venue_name"),
+        sportsdb_event.get("venue_name"),
+        venue_detail.get("venue_name"),
+    ]
+    answer = str(search.get("answer") or "")
+    result_rows = search.get("results")
+    result_rows = result_rows if isinstance(result_rows, list) else []
+
+    for row in result_rows:
+        blob = (
+            f"{row.get('title') or ''}\n"
+            f"{row.get('content') or ''}"
+        )
+        known_candidates.extend(_predict1j_candidate_phrases(blob))
+    known_candidates.extend(_predict1j_candidate_phrases(answer))
+
+    candidates: list[str] = []
+    seen_candidates: set[str] = set()
+    for candidate in known_candidates:
+        candidate = " ".join(str(candidate or "").split()).strip()
+        key = _predict1_compare_text(candidate)
+        if candidate and key and key not in seen_candidates:
+            seen_candidates.add(key)
+            candidates.append(candidate)
+
+    evidence_by_candidate: list[dict[str, Any]] = []
+    for candidate in candidates:
+        supporting: list[dict[str, Any]] = []
+        domains: set[str] = set()
+        official_domains: set[str] = set()
+        for row in result_rows:
+            blob = (
+                f"{row.get('title') or ''}\n"
+                f"{row.get('content') or ''}"
+            )
+            if not _predict1j_fixture_supported(record, blob):
+                continue
+            if _predict1j_phrase_coverage(candidate, blob) < 0.72:
+                continue
+            domain = _predict1j_domain(row.get("url"))
+            if not domain:
+                continue
+            domains.add(domain)
+            if _predict1j_official_like(record, row):
+                official_domains.add(domain)
+            supporting.append({
+                "title": row.get("title"),
+                "url": row.get("url"),
+                "domain": domain,
+                "official_like": domain in official_domains,
+                "score": row.get("score"),
+            })
+        evidence_by_candidate.append({
+            "venue_name": candidate,
+            "distinct_domains": sorted(domains),
+            "official_domains": sorted(official_domains),
+            "sources": supporting,
+        })
+
+    eligible = [
+        item for item in evidence_by_candidate
+        if len(item["distinct_domains"]) >= TAVILY_MIN_DISTINCT_DOMAINS
+        and (
+            not TAVILY_REQUIRE_OFFICIAL_SOURCE
+            or len(item["official_domains"]) >= 1
+        )
+    ]
+    eligible.sort(
+        key=lambda item: (
+            len(item["official_domains"]),
+            len(item["distinct_domains"]),
+            len(item["sources"]),
+        ),
+        reverse=True,
+    )
+
+    if not eligible:
+        result = {
+            "status": "tavily_consensus_unresolved",
+            "verified": False,
+            "blocking_conflict": False,
+            "attempted_at": attempted_at,
+            "fixture_id": fixture_id,
+            "structured_sources": structured_result,
+            "tavily": search,
+            "candidate_audit": evidence_by_candidate,
+            "minimum_distinct_domains": TAVILY_MIN_DISTINCT_DOMAINS,
+            "official_source_required": TAVILY_REQUIRE_OFFICIAL_SOURCE,
+            "manual_confirmation_required": False,
+            "astrology_called": False,
+            "message": (
+                "The wider web did not provide enough independent "
+                "fixture-specific venue agreement. No stadium was assumed."
+            ),
+            "backend_version": PROXY_VERSION,
+        }
+        _predict1_metadata_set(state_key, result)
+        return result
+
+    winner = eligible[0]
+    venue_name = winner["venue_name"]
+
+    country = str(
+        sportsdb_event.get("country")
+        or venue_detail.get("country")
+        or record.get("country")
+        or ""
+    ).strip()
+    if _normalise_lookup_text(country) in {
+        "world", "international", "global", "unknown", "tbd",
+    }:
+        country = ""
+
+    city = str(
+        sportsdb_event.get("venue_city")
+        or venue_detail.get("venue_city")
+        or record.get("venue_city")
+        or ""
+    ).strip()
+
+    if not country:
+        result = {
+            "status": "tavily_venue_found_country_unresolved",
+            "verified": False,
+            "blocking_conflict": False,
+            "attempted_at": attempted_at,
+            "fixture_id": fixture_id,
+            "structured_sources": structured_result,
+            "tavily": search,
+            "selected_candidate": winner,
+            "manual_confirmation_required": False,
+            "astrology_called": False,
+            "message": (
+                "The web agreed on a stadium, but the physical country "
+                "could not be verified safely."
+            ),
+            "backend_version": PROXY_VERSION,
+        }
+        _predict1_metadata_set(state_key, result)
+        return result
+
+    stored = _predict1_store_online_venue_identity(
+        fixture_id,
+        venue_name,
+        city,
+        country,
+        {
+            "primary_provider": "API-Football",
+            "secondary_provider": "TheSportsDB V1",
+            "fallback_provider": "Tavily Search API",
+            "query": query,
+            "selected_candidate": winner,
+            "all_candidate_evidence": evidence_by_candidate,
+        },
+    )
+    result = {
+        "status": (
+            "verified" if stored.get("stored")
+            else "verification_storage_failed"
+        ),
+        "verified": bool(stored.get("stored")),
+        "blocking_conflict": False,
+        "attempted_at": attempted_at,
+        "fixture_id": fixture_id,
+        "structured_sources": structured_result,
+        "tavily": {
+            "status": search.get("status"),
+            "query": search.get("query"),
+            "request_id": search.get("request_id"),
+            "response_time": search.get("response_time"),
+        },
+        "sources": winner["sources"],
+        "venue_identity": {
+            "venue_name": venue_name,
+            "venue_city": city or None,
+            "country": country,
+            "source": (
+                "API-Football + TheSportsDB attempt + "
+                "Tavily multi-domain consensus"
+            ),
+        },
+        "storage": {
+            key: value for key, value in stored.items()
+            if key != "audit"
+        },
+        "verification_layers": [
+            "API-Football fixture refresh",
+            "TheSportsDB V1 verification attempt",
+            "Tavily multi-domain venue consensus",
+            "LocationIQ physical-place verification next",
+        ],
+        "manual_confirmation_required": False,
+        "message": (
+            "The fixture venue was corroborated through Tavily search "
+            "results. LocationIQ remains the coordinate/timezone gate."
+        ),
+        "backend_version": PROXY_VERSION,
+    }
+    _predict1_metadata_set(state_key, result)
+    return result
+
+
+_PREDICT1J_SPORTSDB_VERIFY = _predict1g_sportsdb_verify_fixture
+
+
+def _predict1_online_match_verification(
+    fixture_id: int,
+) -> dict[str, Any]:
+    """
+    Production verification order:
+    API-Football -> TheSportsDB -> Tavily only when unresolved -> LocationIQ.
+    """
+    structured = _PREDICT1J_SPORTSDB_VERIFY(fixture_id)
+    if not isinstance(structured, dict):
+        return structured
+    if structured.get("verified") is True:
+        return structured
+    if structured.get("blocking_conflict") is True:
+        return structured
+    if not TAVILY_SEARCH_ENABLED or not TAVILY_API_KEY:
+        return {
+            **structured,
+            "tavily_fallback": {
+                "status": (
+                    "disabled"
+                    if not TAVILY_SEARCH_ENABLED
+                    else "key_not_configured"
+                ),
+            },
+        }
+    return _predict1j_tavily_verify_fixture(fixture_id, structured)
+
+
+def _predict1j_run_self_tests() -> dict[str, Any]:
+    record = {
+        "home_team": "Alpha United",
+        "away_team": "Beta City",
+        "competition": "Example Cup",
+    }
+    official = {
+        "title": "Alpha United official match information",
+        "url": "https://alphaunited.example/matches/beta-city",
+        "content": (
+            "Alpha United vs Beta City will be played at Example Stadium."
+        ),
+    }
+    media = {
+        "title": "Alpha United vs Beta City venue confirmed",
+        "url": "https://sportsnews.example/example-cup",
+        "content": (
+            "Alpha United face Beta City at Example Stadium."
+        ),
+    }
+    if not _predict1j_fixture_supported(
+        record,
+        f"{official['title']} {official['content']}",
+    ):
+        raise RuntimeError("PREDICT1J fixture-support test failed.")
+    if not _predict1j_official_like(record, official):
+        raise RuntimeError("PREDICT1J official-source test failed.")
+    candidates = _predict1j_candidate_phrases(
+        official["content"] + " " + media["content"]
+    )
+    if not any(
+        _predict1_compare_text(value)
+        == _predict1_compare_text("Example Stadium")
+        for value in candidates
+    ):
+        raise RuntimeError("PREDICT1J venue extraction test failed.")
+    if _predict1j_domain(official["url"]) == _predict1j_domain(media["url"]):
+        raise RuntimeError("PREDICT1J distinct-domain test failed.")
+    return {
+        "status": "pass",
+        "cases": {
+            "fixture_team_match": "pass",
+            "official_source_detection": "pass",
+            "venue_candidate_extraction": "pass",
+            "distinct_domain_consensus": "pass",
+            "manual_confirmation": "disabled",
+            "tavily_market_use": "disabled",
+        },
+        "provider_calls_made": 0,
+    }
+
+
+PREDICT1J_SELF_TEST_STATUS = _predict1j_run_self_tests()
+
+
+# ============================================================
+# PREDICT1K — MARKET CONSENSUS REGRESSION TEST
+# ============================================================
+
+def _predict1k_run_self_tests() -> dict[str, Any]:
+    quotes = [
+        {
+            "odds": {"home": 1.80, "draw": 3.40, "away": 4.60},
+            "no_margin": {"home": 0.52, "draw": 0.27, "away": 0.21},
+        },
+        {
+            "odds": {"home": 1.85, "draw": 3.50, "away": 4.50},
+            "no_margin": {"home": 0.51, "draw": 0.28, "away": 0.21},
+        },
+        {
+            "odds": {"home": 1.82, "draw": 3.45, "away": 4.55},
+            "no_margin": {"home": 0.515, "draw": 0.275, "away": 0.21},
+        },
+    ]
+    consensus = _build_market_consensus(
+        quotes=quotes,
+        home_team="Home Test",
+        away_team="Away Test",
+    )
+    if not isinstance(consensus, dict):
+        raise RuntimeError("PREDICT1K consensus test returned no result.")
+    if consensus.get("team_favourite") != "HOME":
+        raise RuntimeError("PREDICT1K favourite test failed.")
+    if "pre_match_capture_valid" in consensus:
+        raise RuntimeError(
+            "PREDICT1K temporal fields leaked into the pure consensus builder."
+        )
+    if "temporal_validation" in consensus:
+        raise RuntimeError(
+            "PREDICT1K temporal validation leaked into the consensus builder."
+        )
+    return {
+        "status": "pass",
+        "cases": {
+            "market_consensus_builds_without_name_error": "pass",
+            "temporal_fields_scoped_after_capture_validation": "pass",
+            "three_bookmaker_consensus": "pass",
+            "favourite_selection": "pass",
+        },
+        "provider_calls_made": 0,
+    }
+
+
+PREDICT1K_SELF_TEST_STATUS = _predict1k_run_self_tests()
