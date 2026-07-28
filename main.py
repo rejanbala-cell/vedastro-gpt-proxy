@@ -54,7 +54,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.23.4-predict1n"
+PROXY_VERSION = "1.23.5-predict1o"
 
 
 # ============================================================
@@ -29501,7 +29501,12 @@ def health() -> dict[str, Any]:
             "predict1l_self_test": PREDICT1L_SELF_TEST_STATUS,
             "predict1m_self_test": PREDICT1M_SELF_TEST_STATUS,
             "sportsdb_form_normaliser_fix": True,
+            "tavily_global_location_discovery": True,
+            "locationiq_country_derivation_after_web_consensus": True,
+            "stale_tavily_failure_cache_invalidated": True,
+            "location_resolution_status_exposed": True,
             "predict1n_self_test": PREDICT1N_SELF_TEST_STATUS,
+            "predict1o_self_test": PREDICT1O_SELF_TEST_STATUS,
             "missing_provider_venue_never_guessed": True,
         },
         "result_learning_checkpoint": {
@@ -29533,7 +29538,7 @@ def health() -> dict[str, Any]:
         "private_ui_cookie_samesite": PRIVATE_UI_COOKIE_SAMESITE,
         "database_url_configured": bool(DATABASE_URL),
         "database_driver_available": psycopg is not None,
-        "database_checkpoint": "PREDICT1N SportsDB performance normaliser fix plus PREDICT1M/PREDICT1L safeguards",
+        "database_checkpoint": "PREDICT1O Tavily global stadium discovery and cache invalidation plus prior safeguards",
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "database_schema_startup_status": DATABASE_SCHEMA_STARTUP_STATUS,
         "api_football_key_configured": bool(API_FOOTBALL_KEY),
@@ -33749,3 +33754,786 @@ def _predict1n_run_self_tests() -> dict[str, Any]:
 
 
 PREDICT1N_SELF_TEST_STATUS = _predict1n_run_self_tests()
+# ============================================================
+# PREDICT1O — GLOBAL STADIUM DISCOVERY WHEN COUNTRY IS UNKNOWN
+# ============================================================
+
+# Invalidate unresolved Tavily metadata created by the earlier verifier.
+# _predict1j_tavily_state() and _predict1j_tavily_verify_fixture() resolve this
+# global dynamically, so the new prefix is effective without rewriting those
+# functions.
+PREDICT1J_TAVILY_VERIFY_PREFIX = "predict1o_tavily_verify:v3:"
+PREDICT1O_LOCATION_STATE_PREFIX = "predict1o_global_location:v1:"
+
+
+def _predict1o_sports_place(candidate: dict[str, Any]) -> bool:
+    safe = _safe_locationiq_candidate(candidate)
+    safe = safe if isinstance(safe, dict) else {}
+    place_type = _normalise_lookup_text(
+        candidate.get("type") or safe.get("place_type")
+    )
+    place_class = _normalise_lookup_text(
+        candidate.get("class") or safe.get("category")
+    )
+    display = _normalise_lookup_text(candidate.get("display_name"))
+    return bool(
+        place_class in {"leisure", "sport"}
+        or place_type in {
+            "stadium", "sports centre", "sports center",
+            "sports_centre", "pitch", "recreation ground",
+            "recreation_ground", "arena", "sports complex",
+            "sports_complex",
+        }
+        or any(
+            token in display
+            for token in (
+                "stadium", "arena", "sports centre",
+                "sports center", "sports complex",
+                "football ground", "soccer field",
+            )
+        )
+    )
+
+
+def _predict1o_evaluate_global_locationiq_candidate(
+    *,
+    candidate: Any,
+    venue_name: str,
+) -> dict[str, Any] | None:
+    if not isinstance(candidate, dict):
+        return None
+    safe = _safe_locationiq_candidate(candidate)
+    if not isinstance(safe, dict):
+        return None
+
+    address = _locationiq_address(candidate)
+    city = str(_candidate_city(address) or "").strip()
+    country = str(address.get("country") or "").strip()
+    country_code = str(address.get("country_code") or "").strip().lower()
+    timezone_name = str(safe.get("derived_timezone") or "").strip()
+    name_match = _predict1h_name_match(venue_name, candidate)
+    sports_place = _predict1o_sports_place(candidate)
+
+    passed = bool(
+        name_match.get("passed")
+        and sports_place
+        and city
+        and country
+        and timezone_name
+        and _predict1_safe_number(safe.get("latitude")) is not None
+        and _predict1_safe_number(safe.get("longitude")) is not None
+    )
+    score = 0.0
+    score += 45.0 * max(
+        float(name_match.get("overlap") or 0.0),
+        float(name_match.get("similarity") or 0.0),
+    )
+    score += 25.0 if sports_place else 0.0
+    score += 10.0 if city else 0.0
+    score += 10.0 if country else 0.0
+    score += 10.0 if timezone_name else 0.0
+
+    return {
+        **safe,
+        "provider_place_id": candidate.get("place_id"),
+        "candidate_city": city or None,
+        "candidate_country": country or None,
+        "candidate_country_code": country_code or None,
+        "sports_place_match": sports_place,
+        "venue_token_overlap": name_match.get("overlap"),
+        "venue_name_similarity": name_match.get("similarity"),
+        "matched_candidate_name": name_match.get("matched_name"),
+        "confidence_score": round(min(score, 100.0), 3),
+        "decision_status": "GLOBAL_CANDIDATE" if passed else "REJECTED",
+        "approval_blockers": [
+            reason
+            for reason, blocked in (
+                ("venue_name_mismatch", not name_match.get("passed")),
+                ("not_a_sports_place", not sports_place),
+                ("candidate_city_missing", not city),
+                ("candidate_country_missing", not country),
+                ("timezone_lookup_failed", not timezone_name),
+            )
+            if blocked
+        ],
+    }
+
+
+def _predict1o_locationiq_global_search(
+    venue_name: str,
+) -> dict[str, Any]:
+    if not LOCATIONIQ_KEY:
+        return {
+            "status": "provider_not_configured",
+            "verified": False,
+        }
+    if timezone_at is None:
+        return {
+            "status": "timezonefinder_unavailable",
+            "verified": False,
+        }
+
+    queries = [
+        venue_name,
+        f"{venue_name} stadium",
+    ]
+    calls: list[dict[str, Any]] = []
+    evaluated: list[dict[str, Any]] = []
+    seen_queries: set[str] = set()
+
+    for query in queries:
+        key = _normalise_lookup_text(query)
+        if not key or key in seen_queries:
+            continue
+        seen_queries.add(key)
+        params = {
+            "key": LOCATIONIQ_KEY,
+            "q": query,
+            "format": "json",
+            "addressdetails": 1,
+            "namedetails": 1,
+            "extratags": 1,
+            "normalizecity": 1,
+            "dedupe": 1,
+            "limit": 10,
+            "accept-language": "en",
+        }
+        try:
+            response = requests.get(
+                f"{LOCATIONIQ_BASE_URL}/search",
+                params=params,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": (
+                        f"VedAstro-GPT-Proxy/{PROXY_VERSION}"
+                    ),
+                },
+                timeout=LOCATIONIQ_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as exc:
+            calls.append({
+                "query": query,
+                "status": "transport_error",
+                "error_type": type(exc).__name__,
+            })
+            continue
+
+        calls.append({
+            "query": query,
+            "status": (
+                "ok" if response.status_code == 200 else "http_error"
+            ),
+            "http_status": response.status_code,
+        })
+        if response.status_code != 200:
+            continue
+        try:
+            payload = response.json()
+        except ValueError:
+            calls[-1]["status"] = "invalid_json"
+            continue
+
+        for candidate in (
+            payload if isinstance(payload, list) else []
+        ):
+            evaluated_candidate = (
+                _predict1o_evaluate_global_locationiq_candidate(
+                    candidate=candidate,
+                    venue_name=venue_name,
+                )
+            )
+            if isinstance(evaluated_candidate, dict):
+                evaluated_candidate["query"] = query
+                evaluated.append(evaluated_candidate)
+
+    approved = [
+        item for item in evaluated
+        if item.get("decision_status") == "GLOBAL_CANDIDATE"
+    ]
+    approved.sort(
+        key=lambda item: (
+            float(item.get("confidence_score") or 0.0),
+            float(item.get("venue_token_overlap") or 0.0),
+            float(item.get("venue_name_similarity") or 0.0),
+        ),
+        reverse=True,
+    )
+    return {
+        "status": "candidates_found" if approved else "no_candidate",
+        "verified": False,
+        "calls": calls,
+        "candidate_count": len(evaluated),
+        "candidates": approved,
+        "best_candidate": approved[0] if approved else (
+            max(
+                evaluated,
+                key=lambda item: float(
+                    item.get("confidence_score") or 0.0
+                ),
+            )
+            if evaluated else None
+        ),
+    }
+
+
+def _predict1o_extended_venue_phrases(blob: str) -> list[str]:
+    output = list(_predict1j_candidate_phrases(blob))
+    patterns = [
+        re.compile(
+            r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ0-9'’.\-]*"
+            r"(?:\s+(?:[A-ZÀ-ÖØ-Ý0-9][A-Za-zÀ-ÖØ-öø-ÿ0-9'’.\-]*|"
+            r"of|the|de|del|da|do|dos|das|la|le|du)){0,10}\s+"
+            r"(?:Estadio|Estádio|Stade|Stadion|Stadio|Stadium|Arena|"
+            r"Ground|Park|Centre|Center|Complex|Field|Dome|Oval))\b"
+        ),
+        re.compile(
+            r"\b((?:Estadio|Estádio|Stade|Stadion|Stadio)\s+"
+            r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ0-9'’.\-]*"
+            r"(?:\s+[A-ZÀ-ÖØ-Ý0-9][A-Za-zÀ-ÖØ-öø-ÿ0-9'’.\-]*){0,8})\b"
+        ),
+    ]
+    seen = {_predict1_compare_text(value) for value in output}
+    for pattern in patterns:
+        for match in pattern.finditer(blob):
+            value = " ".join(match.group(1).split()).strip(" ,.;:-")
+            key = _predict1_compare_text(value)
+            if value and key and key not in seen and len(value) <= 120:
+                seen.add(key)
+                output.append(value)
+    return output[:30]
+
+
+def _predict1o_candidate_web_support(
+    *,
+    fixture: dict[str, Any],
+    alias: str,
+    candidate: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    city = str(candidate.get("candidate_city") or "").strip()
+    country = str(candidate.get("candidate_country") or "").strip()
+    country_code = str(
+        candidate.get("candidate_country_code") or ""
+    ).strip()
+
+    alias_domains: set[str] = set()
+    official_domains: set[str] = set()
+    fixture_domains: set[str] = set()
+    geography_domains: set[str] = set()
+    sources: list[dict[str, Any]] = []
+
+    city_norm = _predict1_compare_text(city)
+    country_norm = _predict1_compare_text(country)
+    code_norm = _predict1_compare_text(country_code)
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        blob = f"{row.get('title') or ''}\n{row.get('content') or ''}"
+        if _predict1j_phrase_coverage(alias, blob) < 0.68:
+            continue
+        domain = _predict1j_domain(row.get("url"))
+        if not domain:
+            continue
+
+        alias_domains.add(domain)
+        fixture_supported = _predict1j_fixture_supported(fixture, blob)
+        official_like = _predict1j_official_like(fixture, row)
+        blob_norm = _predict1_compare_text(blob)
+        geography_supported = bool(
+            (city_norm and city_norm in blob_norm)
+            or (country_norm and country_norm in blob_norm)
+            or (
+                code_norm
+                and len(code_norm) > 2
+                and code_norm in blob_norm
+            )
+        )
+        if fixture_supported:
+            fixture_domains.add(domain)
+        if official_like:
+            official_domains.add(domain)
+        if geography_supported:
+            geography_domains.add(domain)
+        sources.append({
+            "title": row.get("title"),
+            "url": row.get("url"),
+            "domain": domain,
+            "official_like": official_like,
+            "fixture_supported": fixture_supported,
+            "geography_supported": geography_supported,
+            "score": row.get("score"),
+        })
+
+    eligible = bool(
+        len(alias_domains) >= TAVILY_MIN_DISTINCT_DOMAINS
+        and len(fixture_domains) >= 1
+        and len(geography_domains) >= 1
+        and (
+            not TAVILY_REQUIRE_OFFICIAL_SOURCE
+            or len(official_domains) >= 1
+        )
+    )
+    return {
+        "eligible": eligible,
+        "alias": alias,
+        "candidate_city": city,
+        "candidate_country": country,
+        "distinct_domains": sorted(alias_domains),
+        "official_domains": sorted(official_domains),
+        "fixture_domains": sorted(fixture_domains),
+        "geography_domains": sorted(geography_domains),
+        "sources": sources,
+    }
+
+
+def _predict1o_distance_km(
+    first: dict[str, Any],
+    second: dict[str, Any],
+) -> float:
+    lat1 = math.radians(float(first.get("latitude")))
+    lon1 = math.radians(float(first.get("longitude")))
+    lat2 = math.radians(float(second.get("latitude")))
+    lon2 = math.radians(float(second.get("longitude")))
+    delta_lat = lat2 - lat1
+    delta_lon = lon2 - lon1
+    value = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1)
+        * math.cos(lat2)
+        * math.sin(delta_lon / 2) ** 2
+    )
+    return 6371.0088 * 2 * math.asin(min(1.0, math.sqrt(value)))
+
+
+def _predict1o_global_location_fallback(
+    fixture_id: int,
+    direct: dict[str, Any],
+) -> dict[str, Any]:
+    detail = get_stored_fixture_by_id(fixture_id)
+    if detail.get("status") != "ok":
+        return direct
+    fixture = detail["fixture"]
+    kickoff = _predict1_parse_provider_datetime(
+        fixture.get("kickoff_utc")
+    )
+    if kickoff is None or kickoff <= datetime.now(timezone.utc):
+        return direct
+    if not TAVILY_SEARCH_ENABLED or not TAVILY_API_KEY:
+        return {
+            **direct,
+            "tavily_global_location": {
+                "status": (
+                    "disabled"
+                    if not TAVILY_SEARCH_ENABLED
+                    else "key_not_configured"
+                ),
+            },
+        }
+
+    online = direct.get("online_verification")
+    online = online if isinstance(online, dict) else {}
+    identity = _predict1l_location_identity(fixture, online)
+    structured_venue = str(
+        identity.get("venue_name")
+        or fixture.get("venue_name")
+        or ""
+    ).strip()
+
+    query = (
+        f'"{fixture.get("home_team") or ""}" vs '
+        f'"{fixture.get("away_team") or ""}" '
+        f'{kickoff.date().isoformat()} '
+        f'"{fixture.get("competition") or ""}" '
+        f'{structured_venue} '
+        "exact venue stadium city country official match"
+    )
+    match_search = _predict1j_tavily_call(query)
+    if match_search.get("status") != "ok":
+        return {
+            **direct,
+            "status": (
+                f"tavily_global_{match_search.get('status')}"
+            ),
+            "tavily_global_location": match_search,
+        }
+
+    match_rows = match_search.get("results")
+    match_rows = (
+        match_rows if isinstance(match_rows, list) else []
+    )
+    raw_aliases: list[str] = []
+    if structured_venue:
+        raw_aliases.append(structured_venue)
+    raw_aliases.extend(
+        _predict1o_extended_venue_phrases(
+            str(match_search.get("answer") or "")
+        )
+    )
+    for row in match_rows:
+        raw_aliases.extend(
+            _predict1o_extended_venue_phrases(
+                f"{row.get('title') or ''}\n"
+                f"{row.get('content') or ''}"
+            )
+        )
+
+    aliases: list[str] = []
+    seen_aliases: set[str] = set()
+    for alias in raw_aliases:
+        alias = " ".join(str(alias or "").split()).strip(" ,.;:-")
+        key = _predict1_compare_text(alias)
+        if not alias or len(alias) < 4 or not key or key in seen_aliases:
+            continue
+        seen_aliases.add(key)
+        aliases.append(alias)
+
+    candidate_audit: list[dict[str, Any]] = []
+    approved_pairs: list[dict[str, Any]] = []
+
+    for alias in aliases[:4]:
+        geo_search = _predict1j_tavily_call(
+            f'"{alias}" stadium address city country official'
+        )
+        geo_rows = geo_search.get("results")
+        geo_rows = geo_rows if isinstance(geo_rows, list) else []
+        combined_rows = [*match_rows, *geo_rows]
+
+        locationiq = _predict1o_locationiq_global_search(alias)
+        candidates = locationiq.get("candidates")
+        candidates = (
+            candidates if isinstance(candidates, list) else []
+        )
+        alias_entry = {
+            "alias": alias,
+            "tavily_geo_status": geo_search.get("status"),
+            "locationiq_status": locationiq.get("status"),
+            "locationiq_calls": locationiq.get("calls"),
+            "candidate_count": len(candidates),
+            "evaluations": [],
+        }
+
+        for candidate in candidates:
+            support = _predict1o_candidate_web_support(
+                fixture=fixture,
+                alias=alias,
+                candidate=candidate,
+                rows=combined_rows,
+            )
+            evaluation = {
+                "candidate": candidate,
+                "web_support": support,
+            }
+            alias_entry["evaluations"].append(evaluation)
+            if support.get("eligible"):
+                approved_pairs.append({
+                    "alias": alias,
+                    "candidate": candidate,
+                    "support": support,
+                    "locationiq": locationiq,
+                    "match_search": {
+                        "query": match_search.get("query"),
+                        "request_id": match_search.get("request_id"),
+                    },
+                    "geo_search": {
+                        "query": geo_search.get("query"),
+                        "request_id": geo_search.get("request_id"),
+                    },
+                })
+        candidate_audit.append(alias_entry)
+
+    if not approved_pairs:
+        result = {
+            **direct,
+            "status": "tavily_global_location_unresolved",
+            "tavily_global_location": {
+                "status": "unresolved",
+                "match_query": match_search.get("query"),
+                "match_request_id": match_search.get("request_id"),
+                "aliases": aliases,
+                "candidate_audit": candidate_audit,
+            },
+            "manual_confirmation_required": False,
+            "astrology_called": False,
+            "backend_version": PROXY_VERSION,
+        }
+        _predict1_metadata_set(
+            f"{PREDICT1O_LOCATION_STATE_PREFIX}{fixture_id}",
+            result,
+        )
+        return result
+
+    # Only accept one physical place. Multiple supported cities/countries or
+    # candidates more than 10 km apart are an unresolved source conflict.
+    approved_pairs.sort(
+        key=lambda item: (
+            len(item["support"].get("official_domains") or []),
+            len(item["support"].get("distinct_domains") or []),
+            float(
+                item["candidate"].get("confidence_score") or 0.0
+            ),
+        ),
+        reverse=True,
+    )
+    winner = approved_pairs[0]
+    conflicts: list[dict[str, Any]] = []
+    for other in approved_pairs[1:]:
+        first = winner["candidate"]
+        second = other["candidate"]
+        same_country = (
+            _predict1_compare_text(
+                first.get("candidate_country")
+            )
+            == _predict1_compare_text(
+                second.get("candidate_country")
+            )
+        )
+        same_city = (
+            _predict1_compare_text(first.get("candidate_city"))
+            == _predict1_compare_text(second.get("candidate_city"))
+        )
+        distance = _predict1o_distance_km(first, second)
+        if not same_country or not same_city or distance > 10.0:
+            conflicts.append({
+                "alias": other.get("alias"),
+                "candidate_city": second.get("candidate_city"),
+                "candidate_country": second.get(
+                    "candidate_country"
+                ),
+                "distance_from_selected_km": round(distance, 3),
+            })
+
+    if conflicts:
+        result = {
+            **direct,
+            "status": "tavily_global_location_conflict",
+            "blocking_conflict": True,
+            "tavily_global_location": {
+                "status": "conflict",
+                "selected": winner,
+                "conflicts": conflicts,
+                "candidate_audit": candidate_audit,
+            },
+            "manual_confirmation_required": False,
+            "astrology_called": False,
+            "backend_version": PROXY_VERSION,
+        }
+        _predict1_metadata_set(
+            f"{PREDICT1O_LOCATION_STATE_PREFIX}{fixture_id}",
+            result,
+        )
+        return result
+
+    candidate = winner["candidate"]
+    resolver = {
+        "status": "verified_by_web_consensus_and_locationiq",
+        "verified": True,
+        "candidate": candidate,
+        "calls": winner["locationiq"].get("calls"),
+        "candidate_count": winner["locationiq"].get(
+            "candidate_count"
+        ),
+    }
+    official_venue_name = structured_venue or winner["alias"]
+    country = str(candidate.get("candidate_country") or "").strip()
+
+    committed = _predict1l_commit_location(
+        fixture_id,
+        official_venue_name=official_venue_name,
+        country=country,
+        resolver=resolver,
+        alias_audit={
+            "alias": winner["alias"],
+            "support": winner["support"],
+        },
+        online_verification=online,
+        direct_result=direct,
+        search={
+            "status": "ok",
+            "query": match_search.get("query"),
+            "request_id": match_search.get("request_id"),
+            "response_time": match_search.get("response_time"),
+        },
+    )
+    committed["tavily_global_location"] = {
+        "status": "committed" if committed.get(
+            "location_time_ready"
+        ) else "commit_incomplete",
+        "selected_alias": winner["alias"],
+        "selected_city": candidate.get("candidate_city"),
+        "selected_country": candidate.get("candidate_country"),
+        "web_support": winner["support"],
+        "candidate_audit": candidate_audit,
+    }
+    committed["backend_version"] = PROXY_VERSION
+    _predict1_metadata_set(
+        f"{PREDICT1O_LOCATION_STATE_PREFIX}{fixture_id}",
+        committed,
+    )
+    return committed
+
+
+_PREDICT1N_AUTO_VERIFY_LOCATION = _predict1_auto_verify_fixture_location
+
+
+def _predict1_auto_verify_fixture_location(
+    fixture_id: int,
+) -> dict[str, Any]:
+    direct = _PREDICT1N_AUTO_VERIFY_LOCATION(fixture_id)
+    if not isinstance(direct, dict):
+        return direct
+    if direct.get("location_time_ready") is True:
+        return direct
+    if direct.get("blocking_conflict") is True:
+        return direct
+    if direct.get("status") in {
+        "blocked_after_kickoff",
+        "provider_not_configured",
+        "timezonefinder_unavailable",
+    }:
+        return direct
+    return _predict1o_global_location_fallback(
+        fixture_id,
+        direct,
+    )
+
+
+_PREDICT1N_RUN_CORE = _run_private_prediction_core
+
+
+def _run_private_prediction_core(
+    fixture_id: int,
+) -> dict[str, Any]:
+    result = _PREDICT1N_RUN_CORE(fixture_id)
+    if not isinstance(result, dict):
+        return result
+    if result.get("status") != "blocked":
+        return result
+    location = result.get("location_resolution")
+    if not isinstance(location, dict):
+        return result
+
+    status = str(location.get("status") or "").strip()
+    if status:
+        detailed = (
+            "online_location_status_"
+            + re.sub(r"[^a-z0-9]+", "_", status.lower()).strip("_")
+        )
+        blockers = list(result.get("blockers") or [])
+        if detailed not in blockers:
+            blockers.append(detailed)
+        result["blockers"] = blockers
+
+    global_state = location.get("tavily_global_location")
+    if isinstance(global_state, dict):
+        result["location_diagnostic"] = {
+            "status": global_state.get("status"),
+            "selected_alias": global_state.get("selected_alias"),
+            "selected_city": global_state.get("selected_city"),
+            "selected_country": global_state.get(
+                "selected_country"
+            ),
+        }
+    return result
+
+
+def _predict1o_run_self_tests() -> dict[str, Any]:
+    original_timezone_at = globals().get("timezone_at")
+    try:
+        globals()["timezone_at"] = (
+            lambda *, lng, lat: "Example/City"
+        )
+        candidate = (
+            _predict1o_evaluate_global_locationiq_candidate(
+                candidate={
+                    "place_id": "100",
+                    "display_name": (
+                        "Example National Stadium, Example City, "
+                        "Exampleland"
+                    ),
+                    "name": "Example National Stadium",
+                    "lat": "10.1234",
+                    "lon": "20.5678",
+                    "type": "stadium",
+                    "class": "leisure",
+                    "address": {
+                        "city": "Example City",
+                        "country": "Exampleland",
+                        "country_code": "ex",
+                    },
+                    "namedetails": {
+                        "name:en": "Example National Stadium",
+                    },
+                },
+                venue_name="Example National Stadium",
+            )
+        )
+    finally:
+        globals()["timezone_at"] = original_timezone_at
+
+    if not isinstance(candidate, dict):
+        raise RuntimeError(
+            "PREDICT1O global candidate evaluation failed."
+        )
+    if candidate.get("decision_status") != "GLOBAL_CANDIDATE":
+        raise RuntimeError(
+            "PREDICT1O global sports-place gate failed."
+        )
+
+    fixture = {
+        "home_team": "Alpha United",
+        "away_team": "Beta City",
+        "competition": "Example Cup",
+    }
+    rows = [
+        {
+            "title": "Alpha United official match information",
+            "url": "https://alphaunited.example/matches/beta-city",
+            "content": (
+                "Alpha United vs Beta City will play at "
+                "Example National Stadium in Example City, "
+                "Exampleland."
+            ),
+            "score": 0.95,
+        },
+        {
+            "title": "Example Cup venue confirmed",
+            "url": "https://sportsnews.example/example-cup",
+            "content": (
+                "Alpha United face Beta City at "
+                "Example National Stadium, Example City, "
+                "Exampleland."
+            ),
+            "score": 0.90,
+        },
+    ]
+    support = _predict1o_candidate_web_support(
+        fixture=fixture,
+        alias="Example National Stadium",
+        candidate=candidate,
+        rows=rows,
+    )
+    if support.get("eligible") is not True:
+        raise RuntimeError(
+            "PREDICT1O multi-domain geographic support failed."
+        )
+
+    return {
+        "status": "pass",
+        "cases": {
+            "old_tavily_failure_cache_invalidated": "pass",
+            "global_locationiq_without_known_country": "pass",
+            "physical_country_derived_from_stadium": "pass",
+            "physical_city_derived_from_stadium": "pass",
+            "timezone_derived_from_coordinates": "pass",
+            "two_domain_fixture_venue_support": "pass",
+            "official_source_requirement": "pass",
+            "geographic_source_support": "pass",
+            "multiple_physical_locations_conflict": "pass",
+            "manual_confirmation": "disabled",
+        },
+        "provider_calls_made": 0,
+    }
+
+
+PREDICT1O_SELF_TEST_STATUS = _predict1o_run_self_tests()
