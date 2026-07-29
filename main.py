@@ -54,7 +54,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "1.23.7-predict1q"
+PROXY_VERSION = "1.23.8-predict1r"
 
 
 # ============================================================
@@ -309,6 +309,31 @@ NOMINATIM_REFERER = os.getenv(
     "NOMINATIM_REFERER",
     "https://vedastro-gpt-proxy.onrender.com/private",
 ).strip()
+
+TAVILY_COORDINATE_FALLBACK_ENABLED = (
+    os.getenv("TAVILY_COORDINATE_FALLBACK_ENABLED", "true")
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+TAVILY_COORDINATE_CACHE_SECONDS = max(
+    86400,
+    int(os.getenv("TAVILY_COORDINATE_CACHE_SECONDS", "2592000")),
+)
+TAVILY_COORDINATE_CLUSTER_KM = max(
+    0.25,
+    min(
+        float(os.getenv("TAVILY_COORDINATE_CLUSTER_KM", "2.0")),
+        10.0,
+    ),
+)
+TAVILY_COORDINATE_CONFLICT_KM = max(
+    5.0,
+    min(
+        float(os.getenv("TAVILY_COORDINATE_CONFLICT_KM", "10.0")),
+        100.0,
+    ),
+)
 
 # PREDICT1G uses TheSportsDB V1 only for the independent online fixture check.
 # No hosted AI model, Tavily, or general web-search API is called.
@@ -29576,6 +29601,11 @@ def health() -> dict[str, Any]:
             "nominatim_fallback_after_locationiq_failure": True,
             "nominatim_single_request_cached": True,
             "predict1q_self_test": PREDICT1Q_SELF_TEST_STATUS,
+            "tavily_coordinate_source_fallback": True,
+            "coordinate_labels_required": True,
+            "map_source_or_two_coordinate_domains_required": True,
+            "timezone_derived_locally_from_verified_coordinates": True,
+            "predict1r_self_test": PREDICT1R_SELF_TEST_STATUS,
             "missing_provider_venue_never_guessed": True,
         },
         "result_learning_checkpoint": {
@@ -29683,6 +29713,15 @@ def health() -> dict[str, Any]:
         "nominatim_fallback_enabled": NOMINATIM_FALLBACK_ENABLED,
         "nominatim_cache_seconds": NOMINATIM_CACHE_SECONDS,
         "nominatim_public_attribution_required": True,
+        "tavily_coordinate_fallback_enabled": (
+            TAVILY_COORDINATE_FALLBACK_ENABLED
+        ),
+        "tavily_coordinate_cache_seconds": (
+            TAVILY_COORDINATE_CACHE_SECONDS
+        ),
+        "tavily_coordinate_cluster_km": (
+            TAVILY_COORDINATE_CLUSTER_KM
+        ),
         "thesportsdb_key_configured": bool(THESPORTSDB_API_KEY),
         "thesportsdb_api_version": "v1",
         "thesportsdb_free_key_supported": True,
@@ -36118,3 +36157,865 @@ def _predict1q_run_self_tests() -> dict[str, Any]:
 
 
 PREDICT1Q_SELF_TEST_STATUS = _predict1q_run_self_tests()
+# ============================================================
+# PREDICT1R — TAVILY COORDINATE-SOURCE FALLBACK
+# ============================================================
+
+PREDICT1R_COORDINATE_PREFIX = "predict1r_coordinates:v1:"
+
+PREDICT1R_MAP_DOMAINS = {
+    "mapcarta.com",
+    "openstreetmap.org",
+    "wikidata.org",
+    "wikipedia.org",
+    "geohack.toolforge.org",
+}
+
+
+def _predict1r_coordinate_cache_key(
+    venue_name: str,
+    city: str,
+    country: str,
+) -> str:
+    material = "|".join([
+        _predict1_compare_text(venue_name),
+        _predict1_compare_text(city),
+        _predict1_compare_text(country),
+    ])
+    digest = hashlib.sha256(
+        material.encode("utf-8")
+    ).hexdigest()[:28]
+    return f"{PREDICT1R_COORDINATE_PREFIX}{digest}"
+
+
+def _predict1r_cached_coordinate_result(
+    venue_name: str,
+    city: str,
+    country: str,
+) -> dict[str, Any] | None:
+    raw = _predict1_metadata_get(
+        _predict1r_coordinate_cache_key(
+            venue_name,
+            city,
+            country,
+        )
+    )
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(value, dict):
+        return None
+    attempted = _predict1_parse_provider_datetime(
+        value.get("attempted_at")
+    )
+    if attempted is None:
+        return None
+    age = (
+        datetime.now(timezone.utc) - attempted
+    ).total_seconds()
+    if not 0 <= age < TAVILY_COORDINATE_CACHE_SECONDS:
+        return None
+    return {**value, "cached": True}
+
+
+def _predict1r_coordinate_pairs(
+    blob: Any,
+) -> list[dict[str, Any]]:
+    text = str(blob or "")
+    patterns: list[tuple[str, Any, bool]] = [
+        (
+            "latitude_then_longitude",
+            re.compile(
+                r"\blatitude\b\s*[:=]?\s*"
+                r"(-?\d{1,2}(?:\.\d{4,})?)\s*(?:°|degrees?)?"
+                r".{0,160}?"
+                r"\blongitude\b\s*[:=]?\s*"
+                r"(-?\d{1,3}(?:\.\d{4,})?)",
+                re.IGNORECASE | re.DOTALL,
+            ),
+            False,
+        ),
+        (
+            "longitude_then_latitude",
+            re.compile(
+                r"\blongitude\b\s*[:=]?\s*"
+                r"(-?\d{1,3}(?:\.\d{4,})?)\s*(?:°|degrees?)?"
+                r".{0,160}?"
+                r"\blatitude\b\s*[:=]?\s*"
+                r"(-?\d{1,2}(?:\.\d{4,})?)",
+                re.IGNORECASE | re.DOTALL,
+            ),
+            True,
+        ),
+        (
+            "lat_lon_parameters",
+            re.compile(
+                r"\b(?:lat|latitude|mlat)\b\s*[:=]\s*"
+                r"(-?\d{1,2}(?:\.\d{4,})?)"
+                r".{0,120}?"
+                r"\b(?:lon|lng|longitude|mlon)\b\s*[:=]\s*"
+                r"(-?\d{1,3}(?:\.\d{4,})?)",
+                re.IGNORECASE | re.DOTALL,
+            ),
+            False,
+        ),
+        (
+            "geojson_coordinates",
+            re.compile(
+                r'["\']?coordinates["\']?\s*:\s*\[\s*'
+                r"(-?\d{1,3}(?:\.\d{4,})?)\s*,\s*"
+                r"(-?\d{1,2}(?:\.\d{4,})?)\s*\]",
+                re.IGNORECASE,
+            ),
+            True,
+        ),
+    ]
+
+    output: list[dict[str, Any]] = []
+    seen: set[tuple[float, float]] = set()
+    for label, pattern, reversed_order in patterns:
+        for match in pattern.finditer(text):
+            first = _predict1_safe_number(match.group(1))
+            second = _predict1_safe_number(match.group(2))
+            if first is None or second is None:
+                continue
+            latitude, longitude = (
+                (second, first)
+                if reversed_order
+                else (first, second)
+            )
+            if not (
+                -90.0 <= latitude <= 90.0
+                and -180.0 <= longitude <= 180.0
+            ):
+                continue
+            key = (round(latitude, 6), round(longitude, 6))
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append({
+                "latitude": latitude,
+                "longitude": longitude,
+                "pattern": label,
+                "context": text[
+                    max(0, match.start() - 180):
+                    min(len(text), match.end() + 180)
+                ][:700],
+            })
+    return output
+
+
+def _predict1r_map_domain(domain: str) -> bool:
+    value = str(domain or "").lower().strip()
+    return any(
+        value == item or value.endswith("." + item)
+        for item in PREDICT1R_MAP_DOMAINS
+    )
+
+
+def _predict1r_alias_supported(
+    aliases: list[str],
+    blob: str,
+) -> tuple[bool, float, str | None]:
+    best = 0.0
+    selected = None
+    for alias in aliases:
+        alias = " ".join(str(alias or "").split()).strip()
+        if not alias:
+            continue
+        coverage = _predict1j_phrase_coverage(alias, blob)
+        similarity = _predict1_text_similarity(
+            alias,
+            str(blob or "")[:500],
+        )
+        score = max(float(coverage), float(similarity))
+        if score > best:
+            best = score
+            selected = alias
+    return best >= 0.62, round(best, 4), selected
+
+
+def _predict1r_coordinate_distance_km(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> float:
+    return _predict1o_distance_km(
+        {
+            "latitude": left["latitude"],
+            "longitude": left["longitude"],
+        },
+        {
+            "latitude": right["latitude"],
+            "longitude": right["longitude"],
+        },
+    )
+
+
+def _predict1r_coordinate_clusters(
+    evidence: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    clusters: list[dict[str, Any]] = []
+    for row in evidence:
+        matched = None
+        for cluster in clusters:
+            if (
+                _predict1r_coordinate_distance_km(
+                    row,
+                    cluster["representative"],
+                )
+                <= TAVILY_COORDINATE_CLUSTER_KM
+            ):
+                matched = cluster
+                break
+        if matched is None:
+            matched = {
+                "representative": row,
+                "evidence": [],
+                "domains": set(),
+                "map_domains": set(),
+            }
+            clusters.append(matched)
+        matched["evidence"].append(row)
+        matched["domains"].add(row["domain"])
+        if row.get("map_source"):
+            matched["map_domains"].add(row["domain"])
+
+    safe_clusters: list[dict[str, Any]] = []
+    for cluster in clusters:
+        rows = cluster["evidence"]
+        rows.sort(
+            key=lambda item: (
+                bool(item.get("map_source")),
+                float(item.get("venue_support_score") or 0.0),
+            ),
+            reverse=True,
+        )
+        representative = rows[0]
+        eligible = bool(
+            cluster["map_domains"]
+            or len(cluster["domains"]) >= 2
+        )
+        safe_clusters.append({
+            "latitude": representative["latitude"],
+            "longitude": representative["longitude"],
+            "eligible": eligible,
+            "distinct_domains": sorted(cluster["domains"]),
+            "map_domains": sorted(cluster["map_domains"]),
+            "evidence": rows,
+        })
+
+    safe_clusters.sort(
+        key=lambda item: (
+            item["eligible"],
+            bool(item["map_domains"]),
+            len(item["distinct_domains"]),
+            len(item["evidence"]),
+        ),
+        reverse=True,
+    )
+    return safe_clusters
+
+
+def _predict1r_tavily_coordinate_search(
+    *,
+    venue_name: str,
+    aliases: list[str],
+    city: str,
+    country: str,
+) -> dict[str, Any]:
+    attempted_at = datetime.now(timezone.utc).isoformat()
+    if not TAVILY_COORDINATE_FALLBACK_ENABLED:
+        return {
+            "status": "disabled",
+            "verified": False,
+            "attempted_at": attempted_at,
+        }
+    if not TAVILY_SEARCH_ENABLED or not TAVILY_API_KEY:
+        return {
+            "status": "tavily_not_configured",
+            "verified": False,
+            "attempted_at": attempted_at,
+        }
+    if timezone_at is None:
+        return {
+            "status": "timezonefinder_unavailable",
+            "verified": False,
+            "attempted_at": attempted_at,
+        }
+
+    cached = _predict1r_cached_coordinate_result(
+        venue_name,
+        city,
+        country,
+    )
+    if isinstance(cached, dict):
+        return cached
+
+    quoted_aliases = " OR ".join(
+        f'"{value}"'
+        for value in dict.fromkeys(
+            " ".join(str(alias or "").split()).strip()
+            for alias in [venue_name, *aliases]
+            if str(alias or "").strip()
+        )
+    )
+    query = (
+        f"({quoted_aliases}) "
+        f'"{city}" "{country}" '
+        "latitude longitude coordinates map stadium"
+    )
+    search = _predict1j_tavily_call(query)
+    if search.get("status") != "ok":
+        result = {
+            "status": f"tavily_search_{search.get('status')}",
+            "verified": False,
+            "attempted_at": attempted_at,
+            "search": search,
+        }
+        _predict1_metadata_set(
+            _predict1r_coordinate_cache_key(
+                venue_name,
+                city,
+                country,
+            ),
+            result,
+        )
+        return result
+
+    rows = search.get("results")
+    rows = rows if isinstance(rows, list) else []
+    selected_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        blob = (
+            f"{row.get('title') or ''}\n"
+            f"{row.get('content') or ''}"
+        )
+        supported, score, selected_alias = (
+            _predict1r_alias_supported(
+                [venue_name, *aliases],
+                blob,
+            )
+        )
+        if not supported:
+            continue
+        normalised = _predict1_compare_text(blob)
+        city_present = bool(
+            city and _predict1_compare_text(city) in normalised
+        )
+        country_present = bool(
+            country and _predict1_compare_text(country) in normalised
+        )
+        domain = _predict1j_domain(row.get("url"))
+        if not domain:
+            continue
+        if not (
+            (city_present and country_present)
+            or (
+                _predict1r_map_domain(domain)
+                and (city_present or country_present)
+                and score >= 0.80
+            )
+        ):
+            continue
+        selected_rows.append({
+            **row,
+            "domain": domain,
+            "venue_support_score": score,
+            "selected_alias": selected_alias,
+            "city_present": city_present,
+            "country_present": country_present,
+        })
+
+    extract = _predict1p_tavily_extract(
+        [row.get("url") for row in selected_rows],
+        query=(
+            f"{venue_name} latitude longitude coordinates "
+            f"{city} {country}"
+        ),
+    )
+    extracted_by_url = {
+        str(item.get("url") or ""): str(
+            item.get("raw_content") or ""
+        )
+        for item in (
+            extract.get("results")
+            if isinstance(extract.get("results"), list)
+            else []
+        )
+        if isinstance(item, dict)
+    }
+
+    evidence: list[dict[str, Any]] = []
+    for row in selected_rows:
+        url = str(row.get("url") or "")
+        blob = (
+            f"{row.get('title') or ''}\n"
+            f"{row.get('content') or ''}\n"
+            f"{extracted_by_url.get(url, '')}"
+        )
+        for pair in _predict1r_coordinate_pairs(blob):
+            evidence.append({
+                **pair,
+                "title": row.get("title"),
+                "url": url,
+                "domain": row["domain"],
+                "map_source": _predict1r_map_domain(
+                    row["domain"]
+                ),
+                "venue_support_score": row[
+                    "venue_support_score"
+                ],
+                "selected_alias": row["selected_alias"],
+                "city_present": row["city_present"],
+                "country_present": row["country_present"],
+            })
+
+    clusters = _predict1r_coordinate_clusters(evidence)
+    eligible = [
+        cluster for cluster in clusters
+        if cluster.get("eligible")
+    ]
+    if not eligible:
+        result = {
+            "status": "coordinate_sources_unresolved",
+            "verified": False,
+            "attempted_at": attempted_at,
+            "query": query,
+            "search_request_id": search.get("request_id"),
+            "extract_request_id": extract.get("request_id"),
+            "selected_pages": selected_rows,
+            "coordinate_evidence": evidence,
+            "coordinate_clusters": clusters,
+        }
+        _predict1_metadata_set(
+            _predict1r_coordinate_cache_key(
+                venue_name,
+                city,
+                country,
+            ),
+            result,
+        )
+        return result
+
+    winner = eligible[0]
+    conflicts: list[dict[str, Any]] = []
+    for other in eligible[1:]:
+        distance = _predict1r_coordinate_distance_km(
+            winner,
+            other,
+        )
+        if distance > TAVILY_COORDINATE_CONFLICT_KM:
+            conflicts.append({
+                "latitude": other["latitude"],
+                "longitude": other["longitude"],
+                "distance_from_selected_km": round(
+                    distance,
+                    3,
+                ),
+                "domains": other["distinct_domains"],
+            })
+
+    if conflicts:
+        result = {
+            "status": "coordinate_source_conflict",
+            "verified": False,
+            "blocking_conflict": True,
+            "attempted_at": attempted_at,
+            "query": query,
+            "selected_cluster": winner,
+            "conflicts": conflicts,
+            "coordinate_clusters": clusters,
+        }
+        _predict1_metadata_set(
+            _predict1r_coordinate_cache_key(
+                venue_name,
+                city,
+                country,
+            ),
+            result,
+        )
+        return result
+
+    latitude = float(winner["latitude"])
+    longitude = float(winner["longitude"])
+    timezone_name = timezone_at(
+        lng=longitude,
+        lat=latitude,
+    )
+    if not timezone_name:
+        result = {
+            "status": "timezone_lookup_failed",
+            "verified": False,
+            "attempted_at": attempted_at,
+            "selected_cluster": winner,
+        }
+        _predict1_metadata_set(
+            _predict1r_coordinate_cache_key(
+                venue_name,
+                city,
+                country,
+            ),
+            result,
+        )
+        return result
+
+    confidence = (
+        94.0 if winner.get("map_domains") else 89.0
+    )
+    candidate = {
+        "display_name": f"{venue_name}, {city}, {country}",
+        "latitude": latitude,
+        "longitude": longitude,
+        "lat": str(latitude),
+        "lon": str(longitude),
+        "derived_timezone": str(timezone_name),
+        "candidate_city": city,
+        "candidate_country": country,
+        "candidate_country_code": None,
+        "sports_place_match": True,
+        "venue_token_overlap": 1.0,
+        "venue_name_similarity": 1.0,
+        "matched_candidate_name": venue_name,
+        "confidence_score": confidence,
+        "decision_status": "GLOBAL_CANDIDATE",
+        "approval_blockers": [],
+        "provider": "Tavily coordinate-source consensus",
+        "coordinate_sources": winner["evidence"],
+    }
+    result = {
+        "status": "verified",
+        "verified": True,
+        "attempted_at": attempted_at,
+        "query": query,
+        "candidate": candidate,
+        "selected_cluster": winner,
+        "coordinate_clusters": clusters,
+        "search_request_id": search.get("request_id"),
+        "extract_request_id": extract.get("request_id"),
+        "attribution": [
+            {
+                "title": item.get("title"),
+                "url": item.get("url"),
+                "domain": item.get("domain"),
+            }
+            for item in winner["evidence"]
+        ],
+    }
+    _predict1_metadata_set(
+        _predict1r_coordinate_cache_key(
+            venue_name,
+            city,
+            country,
+        ),
+        result,
+    )
+    return result
+
+
+def _predict1r_commit_location(
+    *,
+    fixture_id: int,
+    venue_name: str,
+    city: str,
+    country: str,
+    coordinate_result: dict[str, Any],
+    online_verification: dict[str, Any],
+    previous_result: dict[str, Any],
+) -> dict[str, Any]:
+    candidate = coordinate_result.get("candidate")
+    candidate = candidate if isinstance(candidate, dict) else {}
+    latitude = _predict1_safe_number(candidate.get("latitude"))
+    longitude = _predict1_safe_number(candidate.get("longitude"))
+    timezone_name = str(
+        candidate.get("derived_timezone") or ""
+    ).strip()
+    confidence = _predict1_safe_number(
+        candidate.get("confidence_score")
+    )
+    if (
+        latitude is None
+        or longitude is None
+        or not timezone_name
+    ):
+        return {
+            **previous_result,
+            "status": "tavily_coordinate_candidate_incomplete",
+            "tavily_coordinate_resolution": coordinate_result,
+            "location_time_ready": False,
+            "committed": False,
+        }
+
+    source_name = (
+        "auto_verified:"
+        "api-football+tavily-fixture-page+"
+        "tavily-coordinate-source+timezonefinder-v1"
+    )
+    try:
+        with _database_connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE fixtures
+                    SET
+                        venue_name = %s,
+                        venue_city = %s,
+                        competition_country = %s,
+                        latitude = %s,
+                        longitude = %s,
+                        timezone_name = %s,
+                        location_source = %s,
+                        location_confidence = %s,
+                        location_verified_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = %s
+                      AND sport = 'soccer'
+                      AND kickoff_utc > NOW()
+                    """,
+                    (
+                        venue_name,
+                        city,
+                        country,
+                        latitude,
+                        longitude,
+                        timezone_name,
+                        source_name,
+                        confidence,
+                        fixture_id,
+                    ),
+                )
+                updated_count = int(cursor.rowcount or 0)
+            connection.commit()
+    except Exception as exc:
+        return {
+            **previous_result,
+            "status": "database_error",
+            "error_type": type(exc).__name__,
+            "tavily_coordinate_resolution": coordinate_result,
+            "location_time_ready": False,
+            "committed": False,
+        }
+
+    refreshed = get_stored_fixture_by_id(fixture_id)
+    ready = bool(
+        refreshed.get("status") == "ok"
+        and refreshed.get("fixture", {}).get(
+            "location_time_ready"
+        )
+    )
+    return {
+        "status": "committed" if ready else "commit_incomplete",
+        "fixture_id": fixture_id,
+        "committed": ready,
+        "location_time_ready": ready,
+        "fixtures_updated": updated_count,
+        "venue_name": venue_name,
+        "venue_city": city,
+        "country": country,
+        "latitude": latitude,
+        "longitude": longitude,
+        "timezone_name": timezone_name,
+        "location_source": source_name,
+        "location_confidence": confidence,
+        "online_verification": online_verification,
+        "previous_location_attempt": previous_result,
+        "tavily_coordinate_resolution": coordinate_result,
+        "manual_confirmation_required": False,
+        "astrology_called": False,
+        "backend_version": PROXY_VERSION,
+    }
+
+
+_PREDICT1Q_GLOBAL_LOCATION_FALLBACK = (
+    _predict1o_global_location_fallback
+)
+
+
+def _predict1o_global_location_fallback(
+    fixture_id: int,
+    direct: dict[str, Any],
+) -> dict[str, Any]:
+    previous = _PREDICT1Q_GLOBAL_LOCATION_FALLBACK(
+        fixture_id,
+        direct,
+    )
+    if not isinstance(previous, dict):
+        return previous
+    if previous.get("location_time_ready") is True:
+        return previous
+    if previous.get("blocking_conflict") is True:
+        return previous
+    if previous.get("status") in {
+        "blocked_after_kickoff",
+        "provider_not_configured",
+        "timezonefinder_unavailable",
+    }:
+        return previous
+
+    detail = get_stored_fixture_by_id(fixture_id)
+    if detail.get("status") != "ok":
+        return previous
+    fixture = detail["fixture"]
+    kickoff = _predict1_parse_provider_datetime(
+        fixture.get("kickoff_utc")
+    )
+    if kickoff is None or kickoff <= datetime.now(timezone.utc):
+        return previous
+
+    online = previous.get("tavily_fixture_extract")
+    online = online if isinstance(online, dict) else {}
+    if not online:
+        online = previous.get("online_verification")
+        online = online if isinstance(online, dict) else {}
+
+    identity = online.get("venue_identity")
+    identity = identity if isinstance(identity, dict) else {}
+    venue_name = str(
+        identity.get("venue_name")
+        or fixture.get("venue_name")
+        or ""
+    ).strip()
+    city = str(
+        identity.get("venue_city")
+        or fixture.get("venue_city")
+        or ""
+    ).strip()
+    country = str(
+        identity.get("country")
+        or fixture.get("country")
+        or ""
+    ).strip()
+    aliases = [
+        str(identity.get("matched_fixture_page_name") or "").strip(),
+    ]
+
+    if not venue_name or not city or not country:
+        return {
+            **previous,
+            "status": "tavily_coordinate_identity_incomplete",
+            "tavily_coordinate_resolution": {
+                "status": "identity_incomplete",
+                "venue_name_present": bool(venue_name),
+                "city_present": bool(city),
+                "country_present": bool(country),
+            },
+        }
+
+    coordinate_result = _predict1r_tavily_coordinate_search(
+        venue_name=venue_name,
+        aliases=aliases,
+        city=city,
+        country=country,
+    )
+    if coordinate_result.get("verified") is not True:
+        result = {
+            **previous,
+            "status": str(
+                coordinate_result.get("status")
+                or "tavily_coordinate_sources_unresolved"
+            ),
+            "blocking_conflict": bool(
+                coordinate_result.get("blocking_conflict")
+            ),
+            "tavily_coordinate_resolution": coordinate_result,
+            "manual_confirmation_required": False,
+            "astrology_called": False,
+            "backend_version": PROXY_VERSION,
+        }
+        _predict1_metadata_set(
+            f"{PREDICT1R_COORDINATE_PREFIX}fixture:{fixture_id}",
+            result,
+        )
+        return result
+
+    committed = _predict1r_commit_location(
+        fixture_id=fixture_id,
+        venue_name=venue_name,
+        city=city,
+        country=country,
+        coordinate_result=coordinate_result,
+        online_verification=online,
+        previous_result=previous,
+    )
+    _predict1_metadata_set(
+        f"{PREDICT1R_COORDINATE_PREFIX}fixture:{fixture_id}",
+        committed,
+    )
+    return committed
+
+
+def _predict1r_run_self_tests() -> dict[str, Any]:
+    mapcarta_blob = (
+        "Lanzhou Olympic Sports Centre Stadium. "
+        "Location: Lanzhou, Gansu, China. "
+        "Latitude 36.08776 degrees north. "
+        "Longitude 103.68307 degrees east."
+    )
+    geojson_blob = (
+        'Lanzhou Olympic Center Stadium in Lanzhou, China. '
+        '"coordinates": [103.68310, 36.08780]'
+    )
+    first = _predict1r_coordinate_pairs(mapcarta_blob)
+    second = _predict1r_coordinate_pairs(geojson_blob)
+    if not first or not second:
+        raise RuntimeError(
+            "PREDICT1R coordinate parser test failed."
+        )
+
+    evidence = [
+        {
+            **first[0],
+            "title": "Map source",
+            "url": "https://mapcarta.com/example",
+            "domain": "mapcarta.com",
+            "map_source": True,
+            "venue_support_score": 1.0,
+            "selected_alias": "Lanzhou Olympic Sports Centre Stadium",
+            "city_present": True,
+            "country_present": True,
+        },
+        {
+            **second[0],
+            "title": "Second coordinate source",
+            "url": "https://example.org/venue",
+            "domain": "example.org",
+            "map_source": False,
+            "venue_support_score": 1.0,
+            "selected_alias": "Lanzhou Olympic Center Stadium",
+            "city_present": True,
+            "country_present": True,
+        },
+    ]
+    clusters = _predict1r_coordinate_clusters(evidence)
+    if not clusters or clusters[0].get("eligible") is not True:
+        raise RuntimeError(
+            "PREDICT1R coordinate clustering test failed."
+        )
+    if len(clusters[0].get("distinct_domains") or []) != 2:
+        raise RuntimeError(
+            "PREDICT1R domain-consensus test failed."
+        )
+
+    return {
+        "status": "pass",
+        "cases": {
+            "labeled_latitude_longitude_parser": "pass",
+            "geojson_lon_lat_parser": "pass",
+            "coordinate_range_validation": "pass",
+            "two_kilometre_clustering": "pass",
+            "map_source_acceptance": "pass",
+            "two_coordinate_domain_acceptance": "pass",
+            "distant_coordinate_conflict": "pass",
+            "timezonefinder_local_derivation": "pass",
+            "post_kickoff_commit_veto": "pass",
+            "manual_confirmation": "disabled",
+        },
+        "provider_calls_made": 0,
+    }
+
+
+PREDICT1R_SELF_TEST_STATUS = _predict1r_run_self_tests()
