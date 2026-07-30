@@ -163,26 +163,33 @@ def upsert_matches(rows: list[dict[str, Any]]) -> dict[str, int]:
             updated_at = NOW()
     """
 
+    params = [
+        {
+            **item,
+            "raw_fixture_json": json.dumps(
+                item["raw_fixture_json"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        }
+        for item in normalized
+    ]
+
     with connect() as connection:
-        with connection.cursor() as cursor:
-            for item in normalized:
-                params = {
-                    **item,
-                    "raw_fixture_json": json.dumps(
-                        item["raw_fixture_json"],
-                        ensure_ascii=False,
-                    ),
-                }
-                cursor.execute(sql, params)
-                imported += 1
-        connection.commit()
+        try:
+            with connection.cursor() as cursor:
+                cursor.executemany(sql, params)
+            connection.commit()
+            imported = len(params)
+        except Exception:
+            connection.rollback()
+            raise
 
     return {
         "received": len(rows),
         "imported": imported,
         "skipped": skipped,
     }
-
 
 def _window(window: str) -> tuple[datetime, datetime]:
     now = datetime.now(timezone.utc)
@@ -284,6 +291,7 @@ def list_fixtures(
             fixture_status
         FROM fixtures
         WHERE sport = 'soccer'
+          AND provider = 'football-data.org'
           AND kickoff_utc >= %s
           AND kickoff_utc < %s
           {search_sql}

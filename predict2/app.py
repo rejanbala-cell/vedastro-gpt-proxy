@@ -20,7 +20,11 @@ from .db import ensure_schema
 from .football_data import FootballDataError, client
 from .fixtures import list_fixtures
 from .metadata import get, get_datetime
-from .sync import sync_if_stale_async, sync_now
+from .sync import (
+    get_sync_state,
+    start_sync,
+    sync_if_stale_async,
+)
 from .ui import PRIVATE_HTML
 
 
@@ -68,6 +72,7 @@ def health() -> dict[str, Any]:
                 settings.football_data_sync_interval_seconds
             ),
             "last_sync_at": last_sync,
+            "sync_job": get_sync_state(),
         },
         "database_configured": bool(settings.database_url),
         "private_login_configured": bool(
@@ -168,6 +173,7 @@ def private_fixtures(
     ),
     search: str = Query(default="", max_length=120),
 ) -> dict[str, Any]:
+    sync_if_stale_async()
     fixtures = list_fixtures(
         window=window,
         search=search,
@@ -186,34 +192,39 @@ def private_fixtures(
     dependencies=[Depends(require_session)],
 )
 def private_sync() -> dict[str, Any]:
-    result = sync_now(reason="private_ui_button")
-    if result.get("status") == "error":
-        raise HTTPException(status_code=500, detail=result)
-    if result.get("status") == "provider_error":
-        raise HTTPException(status_code=503, detail=result)
-    return result
-
+    return start_sync(reason="private_ui_button")
 
 @app.get(
     "/private/api/sync-status",
     dependencies=[Depends(require_session)],
 )
 def private_sync_status() -> dict[str, Any]:
-    raw = get("predict2_football_data_last_sync_audit")
-    audit = None
+    raw = None
+    try:
+        raw = get("predict2_football_data_last_sync_audit")
+    except Exception:
+        raw = None
+
+    persisted = None
     if raw:
         try:
-            audit = json.loads(raw)
+            persisted = json.loads(raw)
         except ValueError:
-            audit = {"raw": raw[:1000]}
+            persisted = {"raw": raw[:1000]}
 
-    last = get_datetime(
-        "predict2_football_data_last_sync_at"
-    )
+    last = None
+    try:
+        last = get_datetime(
+            "predict2_football_data_last_sync_at"
+        )
+    except Exception:
+        last = None
+
     return {
         "status": "ok",
+        "current_job": get_sync_state(),
         "last_sync_at": last.isoformat() if last else None,
-        "last_audit": audit,
+        "last_persisted_audit": persisted,
         "checked_at": datetime.now(
             timezone.utc
         ).isoformat(),

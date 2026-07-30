@@ -116,14 +116,34 @@ document.querySelectorAll(".tab").forEach(button=>button.onclick=()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
   button.classList.add("active");currentWindow=button.dataset.window;loadFixtures();
 });
+async function pollSync(){
+  const button=$("#sync");
+  for(let attempt=0;attempt<180;attempt++){
+    const data=await api("/private/api/sync-status");
+    const job=data.current_job||{};
+    const progress=job.chunks_total?` ${job.chunks_completed||0}/${job.chunks_total} chunks · ${job.imported||0} imported.`:"";
+    $("#status").textContent=`Sync ${job.status||"unknown"}.${progress} ${job.message||""}`.trim();
+    if(["ok","error","provider_error","busy"].includes(job.status)){
+      button.disabled=false;
+      if(job.status==="ok")await loadFixtures();
+      if(job.status==="error"||job.status==="provider_error"){
+        const detail=[job.error_type,job.message,job.provider_message,job.provider_http_status?`HTTP ${job.provider_http_status}`:""].filter(Boolean).join(" · ");
+        $("#status").textContent=`Sync failed: ${detail}`;
+      }
+      return;
+    }
+    await new Promise(resolve=>setTimeout(resolve,2000));
+  }
+  button.disabled=false;
+  $("#status").textContent="Sync is still running. Refresh the page to check its status.";
+}
 $("#sync").onclick=async()=>{
-  const button=$("#sync");button.disabled=true;$("#status").textContent="Syncing football-data.org into PostgreSQL…";
+  const button=$("#sync");button.disabled=true;$("#status").textContent="Starting background fixture sync…";
   try{
     const data=await api("/private/api/sync-football-data",{method:"POST"});
-    $("#status").textContent=`Sync ${data.status}: received ${data.received??0}, imported ${data.imported??0}, skipped ${data.skipped??0}.`;
-    await loadFixtures();
-  }catch(err){$("#status").textContent=err.message}
-  finally{button.disabled=false}
+    if(data.status==="busy"){$("#status").textContent="A fixture sync is already running."}
+    await pollSync();
+  }catch(err){button.disabled=false;$("#status").textContent=`Could not start sync: ${err.message}`}
 };
 (async()=>{try{await api("/private/api/session");showApp()}catch{showLogin()}})();
 </script>

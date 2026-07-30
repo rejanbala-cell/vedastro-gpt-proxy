@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from typing import Any
 
 import requests
@@ -16,10 +18,12 @@ class FootballDataError(RuntimeError):
         *,
         status_code: int | None = None,
         provider_message: str | None = None,
+        retry_after_seconds: int | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.provider_message = provider_message
+        self.retry_after_seconds = retry_after_seconds
 
 
 @dataclass(frozen=True)
@@ -35,6 +39,8 @@ class FootballDataClient:
         self.base_url = settings.football_data_base_url
         self.timeout = settings.football_data_timeout_seconds
         self.token = settings.football_data_api_key
+        self._request_lock = threading.Lock()
+        self._last_request_monotonic = 0.0
 
     def _headers(self) -> dict[str, str]:
         if not self.token:
@@ -49,6 +55,26 @@ class FootballDataClient:
             ),
         }
 
+    @staticmethod
+    def _provider_message(payload: Any) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        value = (
+            payload.get("message")
+            or payload.get("error")
+            or payload.get("errorCode")
+        )
+        text = str(value or "").strip()
+        return text or None
+
+    def _wait_for_request_slot(self) -> None:
+        elapsed = time.monotonic() - self._last_request_monotonic
+        delay = (
+            settings.football_data_min_interval_seconds - elapsed
+        )
+        if delay > 0:
+            time.sleep(delay)
+
     def matches(
         self,
         *,
@@ -59,16 +85,30 @@ class FootballDataClient:
             raise FootballDataError(
                 "Football-data.org integration is disabled."
             )
+        if date_to < date_from:
+            raise FootballDataError(
+                "The football-data.org date window is invalid."
+            )
 
-        response = requests.get(
-            f"{self.base_url}/matches",
-            headers=self._headers(),
-            params={
-                "dateFrom": date_from.isoformat(),
-                "dateTo": date_to.isoformat(),
-            },
-            timeout=self.timeout,
-        )
+        with self._request_lock:
+            self._wait_for_request_slot()
+            try:
+                response = requests.get(
+                    f"{self.base_url}/matches",
+                    headers=self._headers(),
+                    params={
+                        "dateFrom": date_from.isoformat(),
+                        "dateTo": date_to.isoformat(),
+                    },
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                self._last_request_monotonic = time.monotonic()
+                raise FootballDataError(
+                    "Football-data.org network request failed.",
+                    provider_message=type(exc).__name__,
+                ) from exc
+            self._last_request_monotonic = time.monotonic()
 
         try:
             payload = response.json()
@@ -79,17 +119,18 @@ class FootballDataClient:
             ) from exc
 
         if response.status_code != 200:
-            provider_message = None
-            if isinstance(payload, dict):
-                provider_message = str(
-                    payload.get("message")
-                    or payload.get("errorCode")
-                    or ""
-                ).strip() or None
+            retry_after = response.headers.get("Retry-After")
+            retry_seconds = None
+            if retry_after:
+                try:
+                    retry_seconds = int(retry_after)
+                except ValueError:
+                    retry_seconds = None
             raise FootballDataError(
                 "Football-data.org rejected the request.",
                 status_code=response.status_code,
-                provider_message=provider_message,
+                provider_message=self._provider_message(payload),
+                retry_after_seconds=retry_seconds,
             )
 
         rows = payload.get("matches")
@@ -118,6 +159,8 @@ class FootballDataClient:
         )
 
     def health(self) -> dict[str, Any]:
+        from datetime import datetime, timezone
+
         today = datetime.now(timezone.utc).date()
         response = self.matches(
             date_from=today,
