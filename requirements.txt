@@ -5,3 +5,4 @@ vedastro>=1.23.26,<2
 pyswisseph>=2.10.3.2,<3
 psycopg[binary]>=3.2,<4
 timezonefinder>=8.2,<9
+requests>=2.32,<3
