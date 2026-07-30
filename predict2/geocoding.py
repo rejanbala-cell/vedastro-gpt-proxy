@@ -6,7 +6,7 @@ import math
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -386,7 +386,10 @@ def _locationiq(
                 "Accept": "application/json",
                 "User-Agent": settings.nominatim_user_agent,
             },
-            timeout=settings.locationiq_timeout_seconds,
+            timeout=(
+                5,
+                settings.locationiq_timeout_seconds,
+            ),
         )
     except requests.RequestException as exc:
         return {
@@ -469,7 +472,10 @@ def _nominatim(
                     "User-Agent": settings.nominatim_user_agent,
                     "Referer": settings.nominatim_referer,
                 },
-                timeout=settings.nominatim_timeout_seconds,
+                timeout=(
+                    5,
+                    settings.nominatim_timeout_seconds,
+                ),
             )
         except requests.RequestException as exc:
             _NOMINATIM_LAST_CALL = time.monotonic()
@@ -523,15 +529,31 @@ def geocode_venue(
     venue_name: str,
     city: str = "",
     country: str = "",
+    progress: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any]:
     query = ", ".join(
         value for value in (venue_name, city, country)
         if str(value or "").strip()
     )
+    if progress:
+        progress(
+            "geocode_cache",
+            "Checking the verified geocode cache.",
+        )
     cached = _cache_get(query)
     if isinstance(cached, dict):
+        if progress:
+            progress(
+                "geocode_cache_hit",
+                "A cached geocode result was found.",
+            )
         return {**cached, "cached": True}
 
+    if progress:
+        progress(
+            "locationiq",
+            "Checking LocationIQ for the exact stadium.",
+        )
     primary = _locationiq(
         query,
         venue_name=venue_name,
@@ -551,6 +573,12 @@ def geocode_venue(
         )
         return result
 
+    if progress:
+        progress(
+            "nominatim",
+            "LocationIQ did not verify the stadium; "
+            "checking the rate-limited OpenStreetMap fallback.",
+        )
     fallback = _nominatim(
         query,
         venue_name=venue_name,

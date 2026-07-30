@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from .config import settings
 from .db import connect
@@ -239,7 +239,13 @@ def resolve_fixture(
     *,
     job_id: str,
     fixture: dict[str, Any],
+    progress: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any]:
+    if progress:
+        progress(
+            "attempt_record",
+            "Creating the immutable venue-attempt audit.",
+        )
     attempt_id = _insert_attempt(
         job_id=job_id,
         fixture_id=int(fixture["id"]),
@@ -287,6 +293,7 @@ def resolve_fixture(
             venue_name=venue_name,
             city=venue_city,
             country=country,
+            progress=progress,
         )
         audit["provider_venue_geocode"] = geocode
         if geocode.get("verified") is True:
@@ -295,6 +302,11 @@ def resolve_fixture(
                 f"{identity_source}+"
                 f"{selected.get('provider')}+timezonefinder"
             )
+            if progress:
+                progress(
+                    "commit_location",
+                    "Saving the verified coordinates and timezone.",
+                )
             committed = _commit_location(
                 fixture_id=int(fixture["id"]),
                 venue_name=venue_name,
@@ -327,9 +339,15 @@ def resolve_fixture(
             return result
 
     try:
+        if progress:
+            progress(
+                "venue_identity",
+                "The provider venue needs independent verification.",
+            )
         tavily_result = tavily_client.resolve_fixture_venue(
             fixture,
             provider_venue=venue_name or None,
+            progress=progress,
         )
     except TavilyError as exc:
         tavily_result = {
@@ -367,6 +385,7 @@ def resolve_fixture(
         venue_name=resolved_venue,
         city=venue_city,
         country=country,
+        progress=progress,
     )
     audit["verified_venue_geocode"] = geocode
 
@@ -398,6 +417,11 @@ def resolve_fixture(
         f"{identity_source}+"
         f"{selected.get('provider')}+timezonefinder"
     )
+    if progress:
+        progress(
+            "commit_location",
+            "Saving the web-verified coordinates and timezone.",
+        )
     committed = _commit_location(
         fixture_id=int(fixture["id"]),
         venue_name=resolved_venue,

@@ -188,13 +188,19 @@ async function pollFixtureSync(){
 
 async function pollVenueJob(){
   const bulk=$("#venues");
-  for(let attempt=0;attempt<240;attempt++){
+  for(let attempt=0;attempt<180;attempt++){
     const data=await api("/private/api/venue-status");
     const job=data.current_job||{};
     const progress=job.fixtures_total
       ? ` ${job.fixtures_completed||0}/${job.fixtures_total} · ${job.verified||0} verified · ${job.unresolved||0} unresolved.`
       : "";
-    $("#status").textContent=`Venue job ${job.status||"unknown"}.${progress} ${job.message||""}`.trim();
+    const stage=job.current_stage
+      ? ` Stage: ${job.current_stage.replaceAll("_"," ")}.`
+      : "";
+    const elapsed=Number.isFinite(job.elapsed_seconds)
+      ? ` Elapsed: ${job.elapsed_seconds}s.`
+      : "";
+    $("#status").textContent=`Venue job ${job.status||"unknown"}.${progress}${stage}${elapsed} ${job.message||""}`.trim();
     if(["ok","error","busy"].includes(job.status)){
       bulk.disabled=false;
       await loadFixtures();

@@ -74,6 +74,8 @@ class Settings:
     venue_enrichment_retry_hours: int
     venue_similarity_minimum: float
     geocode_confidence_minimum: float
+    tavily_timeout_seconds: int
+    venue_stage_warning_seconds: int
 
     @property
     def login_secret(self) -> str:
@@ -92,7 +94,7 @@ class Settings:
             same_site = "lax"
 
         return cls(
-            version="2.1.0-venue",
+            version="2.1.1-venue-observable",
             database_url=os.getenv("DATABASE_URL", "").strip(),
             football_data_api_key=os.getenv(
                 "FOOTBALL_DATA_API_KEY", ""
@@ -205,6 +207,12 @@ class Settings:
             ),
             geocode_confidence_minimum=_float(
                 "GEOCODE_CONFIDENCE_MINIMUM", 72.0, 55.0, 95.0
+            ),
+            tavily_timeout_seconds=_int(
+                "TAVILY_TIMEOUT_SECONDS", 20, 8, 45
+            ),
+            venue_stage_warning_seconds=_int(
+                "VENUE_STAGE_WARNING_SECONDS", 45, 15, 180
             ),
         )
 

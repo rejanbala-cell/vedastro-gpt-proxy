@@ -103,6 +103,12 @@ def health() -> dict[str, Any]:
             "max_per_job": (
                 settings.venue_enrichment_max_per_job
             ),
+            "tavily_timeout_seconds": (
+                settings.tavily_timeout_seconds
+            ),
+            "stage_warning_seconds": (
+                settings.venue_stage_warning_seconds
+            ),
             "job": get_venue_job_state(),
         },
         "database_configured": bool(settings.database_url),

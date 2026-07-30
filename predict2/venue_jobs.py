@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import traceback
 import uuid
 from copy import deepcopy
@@ -21,6 +22,7 @@ from .venue_service import (
 VENUE_LOCK_ID = 220260731
 _THREAD_LOCK = threading.Lock()
 _STATE_LOCK = threading.Lock()
+_ACTIVE_THREAD: threading.Thread | None = None
 
 _STATE: dict[str, Any] = {
     "status": "idle",
@@ -37,6 +39,10 @@ _STATE: dict[str, Any] = {
     "skipped": 0,
     "errors": 0,
     "current_fixture": None,
+    "current_stage": None,
+    "stage_started_at": None,
+    "last_progress_at": None,
+    "elapsed_seconds": 0,
     "message": None,
     "error_type": None,
 }
@@ -53,8 +59,48 @@ def _set(**updates: Any) -> dict[str, Any]:
 
 
 def get_venue_job_state() -> dict[str, Any]:
+    global _ACTIVE_THREAD
+
     with _STATE_LOCK:
-        return deepcopy(_STATE)
+        state = deepcopy(_STATE)
+
+    started_at = state.get("started_at")
+    if started_at:
+        try:
+            started = datetime.fromisoformat(started_at)
+            state["elapsed_seconds"] = max(
+                0,
+                int((_now() - started).total_seconds()),
+            )
+        except (TypeError, ValueError):
+            pass
+
+    if (
+        state.get("status") in {"queued", "running"}
+        and _ACTIVE_THREAD is not None
+        and not _ACTIVE_THREAD.is_alive()
+    ):
+        state = _set(
+            status="error",
+            completed_at=_now().isoformat(),
+            error_type="WorkerStopped",
+            message=(
+                "The venue worker stopped before producing a result. "
+                "A new job may now be started."
+            ),
+            current_fixture=None,
+            current_stage=None,
+        )
+    return state
+
+
+def _progress(stage: str, message: str) -> None:
+    _set(
+        current_stage=stage,
+        stage_started_at=_now().isoformat(),
+        last_progress_at=_now().isoformat(),
+        message=message,
+    )
 
 
 def _persist(state: dict[str, Any]) -> None:
@@ -145,14 +191,18 @@ def _run(
                     "home_team": fixture["home_team"],
                     "away_team": fixture["away_team"],
                 },
+                current_stage="fixture_start",
+                stage_started_at=_now().isoformat(),
+                last_progress_at=_now().isoformat(),
                 message=(
-                    f"Verifying venue {index} of {len(fixtures)}."
+                    f"Starting venue {index} of {len(fixtures)}."
                 ),
             )
             try:
                 result = resolve_fixture(
                     job_id=job_id,
                     fixture=fixture,
+                    progress=_progress,
                 )
             except Exception as exc:
                 result = {
@@ -187,6 +237,8 @@ def _run(
             status="ok",
             completed_at=_now().isoformat(),
             current_fixture=None,
+            current_stage=None,
+            stage_started_at=None,
             message=(
                 "Venue enrichment completed. "
                 f"{counters['verified']} verified, "
@@ -201,6 +253,8 @@ def _run(
             status="error",
             completed_at=_now().isoformat(),
             current_fixture=None,
+            current_stage=None,
+            stage_started_at=None,
             error_type=type(exc).__name__,
             message=str(exc) or repr(exc),
             traceback_tail=traceback.format_exc().splitlines()[-12:],
@@ -208,6 +262,7 @@ def _run(
         _persist(state)
 
     finally:
+        global _ACTIVE_THREAD
         if advisory_locked and advisory_connection is not None:
             try:
                 with advisory_connection.cursor() as cursor:
@@ -223,6 +278,7 @@ def _run(
                 advisory_context.__exit__(None, None, None)
             except Exception:
                 pass
+        _ACTIVE_THREAD = None
         if _THREAD_LOCK.locked():
             try:
                 _THREAD_LOCK.release()
@@ -237,6 +293,8 @@ def start_venue_job(
     limit: int | None = None,
     fixture_id: int | None = None,
 ) -> dict[str, Any]:
+    global _ACTIVE_THREAD
+
     current = get_venue_job_state()
     if current.get("status") in {"queued", "running"}:
         return {"status": "busy", "job": current}
@@ -283,6 +341,10 @@ def start_venue_job(
         skipped=0,
         errors=0,
         current_fixture=None,
+        current_stage="queued",
+        stage_started_at=_now().isoformat(),
+        last_progress_at=_now().isoformat(),
+        elapsed_seconds=0,
         message="Venue enrichment has been queued.",
         error_type=None,
         results=[],
@@ -299,6 +361,7 @@ def start_venue_job(
         name=f"predict2-venue-{job_id[:8]}",
         daemon=True,
     )
+    _ACTIVE_THREAD = thread
     thread.start()
     return {
         "status": "accepted",

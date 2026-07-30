@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -64,7 +64,10 @@ class TavilyClient:
                     f"{settings.tavily_base_url}/{endpoint}",
                     headers=self._headers(),
                     json=payload,
-                    timeout=45,
+                    timeout=(
+                        5,
+                        settings.tavily_timeout_seconds,
+                    ),
                 )
             except requests.RequestException as exc:
                 self._last_request = time.monotonic()
@@ -145,6 +148,7 @@ class TavilyClient:
         fixture: dict[str, Any],
         *,
         provider_venue: str | None = None,
+        progress: Callable[[str, str], None] | None = None,
     ) -> dict[str, Any]:
         kickoff = fixture["kickoff_utc"]
         if not isinstance(kickoff, datetime):
@@ -163,6 +167,11 @@ class TavilyClient:
             f'"{competition}" {country} '
             "official venue stadium ground"
         )
+        if progress:
+            progress(
+                "tavily_search",
+                "Searching fixture-specific venue pages.",
+            )
         search = self.search(query)
         rows = search.get("results")
         rows = rows if isinstance(rows, list) else []
@@ -185,6 +194,99 @@ class TavilyClient:
                 "score": row.get("score"),
             })
 
+        snippet_phrases: list[dict[str, Any]] = []
+        for row in preliminary:
+            snippet_blob = (
+                f"{row['title']}\n{row['content']}\n{row['url']}"
+            )
+            snippet_date = date_support(
+                kickoff,
+                snippet_blob,
+                tolerance_days=1,
+            )
+            if not snippet_date["supported"]:
+                continue
+            snippet_official = official_like(
+                url=row["url"],
+                title=row["title"],
+                content=snippet_blob,
+                home_team=home,
+                away_team=away,
+            )
+            for phrase in extract_venue_phrases(snippet_blob):
+                snippet_phrases.append({
+                    "venue_name": phrase,
+                    "title": row["title"],
+                    "url": row["url"],
+                    "domain": row["domain"],
+                    "official_like": snippet_official,
+                    "date_exact": snippet_date["exact"],
+                    "date_day_delta": snippet_date["day_delta"],
+                })
+
+        snippet_clusters = cluster_venue_phrases(
+            snippet_phrases,
+            similarity_minimum=settings.venue_similarity_minimum,
+        )
+        snippet_selected = None
+        if provider_venue:
+            snippet_matching = [
+                cluster for cluster in snippet_clusters
+                if text_similarity(
+                    provider_venue,
+                    cluster["venue_name"],
+                ) >= settings.venue_similarity_minimum
+            ]
+            if snippet_matching:
+                snippet_selected = {
+                    **snippet_matching[0],
+                    "venue_name": provider_venue,
+                    "provider_venue_confirmed": True,
+                }
+        else:
+            snippet_eligible = [
+                cluster for cluster in snippet_clusters
+                if (
+                    len(cluster["distinct_domains"])
+                    >= settings.tavily_min_distinct_domains
+                    or (
+                        settings.tavily_require_official_source
+                        and len(cluster["official_domains"]) >= 1
+                    )
+                )
+            ]
+            if snippet_eligible:
+                snippet_selected = snippet_eligible[0]
+
+        if snippet_selected is not None:
+            if progress:
+                progress(
+                    "tavily_search_verified",
+                    "Venue was verified from search snippets; "
+                    "full-page extraction was not required.",
+                )
+            return {
+                "status": (
+                    "provider_venue_confirmed"
+                    if provider_venue
+                    else "web_venue_consensus"
+                ),
+                "verified": True,
+                "query": query,
+                "search_request_id": search.get("request_id"),
+                "extract_request_id": None,
+                "extract_skipped": True,
+                "preliminary_pages": preliminary,
+                "fixture_pages": [],
+                "venue_clusters": snippet_clusters,
+                "selected": snippet_selected,
+            }
+
+        if progress:
+            progress(
+                "tavily_extract",
+                "Reading the strongest fixture pages for venue evidence.",
+            )
         extract = self.extract(
             [row["url"] for row in preliminary],
             query=(
