@@ -16,7 +16,7 @@ from .metadata import get_datetime, set_value
 
 
 SYNC_LOCK_ID = 220260730
-SYNC_CHUNK_DAYS = 14
+SYNC_CHUNK_DAYS = 10
 THREAD_LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
 
@@ -46,26 +46,41 @@ def _utc_now() -> datetime:
 
 
 def _provider_window() -> tuple[date, date]:
+    """
+    Return [date_from, date_to) boundaries.
+
+    football-data.org v4 treats dateTo as the exclusive upper bound.
+    A 90-day sync therefore ends exactly 90 days after dateFrom.
+    """
     start = _utc_now().date()
-    end = start + timedelta(
-        days=settings.football_data_sync_days - 1
+    end_exclusive = start + timedelta(
+        days=settings.football_data_sync_days
     )
-    return start, end
+    return start, end_exclusive
 
 
 def _chunks(
     start: date,
-    end: date,
+    end_exclusive: date,
 ) -> list[tuple[date, date]]:
+    """
+    Split [start, end_exclusive) into consecutive provider requests.
+
+    Every returned pair is sent as dateFrom/dateTo. The difference
+    between the two dates never exceeds ten days.
+    """
+    if end_exclusive <= start:
+        return []
+
     output: list[tuple[date, date]] = []
     cursor = start
-    while cursor <= end:
-        chunk_end = min(
-            cursor + timedelta(days=SYNC_CHUNK_DAYS - 1),
-            end,
+    while cursor < end_exclusive:
+        chunk_to = min(
+            cursor + timedelta(days=SYNC_CHUNK_DAYS),
+            end_exclusive,
         )
-        output.append((cursor, chunk_end))
-        cursor = chunk_end + timedelta(days=1)
+        output.append((cursor, chunk_to))
+        cursor = chunk_to
     return output
 
 
@@ -152,8 +167,8 @@ def _run_sync_job(
     advisory_connection = None
     advisory_locked = False
     started = _utc_now()
-    date_from, date_to = _provider_window()
-    windows = _chunks(date_from, date_to)
+    date_from, date_to_exclusive = _provider_window()
+    windows = _chunks(date_from, date_to_exclusive)
     totals = {"received": 0, "imported": 0, "skipped": 0}
     provider_audits: list[dict[str, Any]] = []
 
@@ -184,7 +199,7 @@ def _run_sync_job(
             started_at=started.isoformat(),
             completed_at=None,
             date_from=date_from.isoformat(),
-            date_to=date_to.isoformat(),
+            date_to=date_to_exclusive.isoformat(),
             chunks_total=len(windows),
             chunks_completed=0,
             received=0,
@@ -244,7 +259,7 @@ def _run_sync_job(
             job_id=job_id,
             started=started,
             date_from=date_from,
-            date_to=date_to,
+            date_to=date_to_exclusive,
             chunks_total=len(windows),
             totals=totals,
             provider_audits=provider_audits,

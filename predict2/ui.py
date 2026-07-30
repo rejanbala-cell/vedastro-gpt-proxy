@@ -31,7 +31,7 @@ button{border:0;border-radius:14px;padding:13px 18px;font-weight:800;cursor:poin
 <section id="login" class="card login">
   <div class="brand">R</div>
   <h1>Private Predictor</h1>
-  <p class="muted">Clean PREDICT2 fixture foundation.</p>
+  <p class="muted">Clean PREDICT2 fixture foundation with 10-day provider windows.</p>
   <form id="loginForm">
     <label>Private password
       <input id="password" type="password" autocomplete="current-password" required>
