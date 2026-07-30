@@ -12,7 +12,7 @@ def get(key: str) -> str | None:
             cursor.execute(
                 """
                 SELECT metadata_value
-                FROM app_metadata
+                FROM predict2_metadata
                 WHERE metadata_key = %s
                 """,
                 (key,),
@@ -27,7 +27,7 @@ def set_value(key: str, value: Any) -> None:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO app_metadata (
+                INSERT INTO predict2_metadata (
                     metadata_key, metadata_value, updated_at
                 )
                 VALUES (%s, %s, NOW())

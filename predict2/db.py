@@ -42,7 +42,7 @@ def connect(*, dict_rows: bool = False) -> Iterator:
 def ensure_schema() -> None:
     statements = [
         """
-        CREATE TABLE IF NOT EXISTS app_metadata (
+        CREATE TABLE IF NOT EXISTS predict2_metadata (
             metadata_key TEXT PRIMARY KEY,
             metadata_value TEXT NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

@@ -61,6 +61,7 @@ def health() -> dict[str, Any]:
         "status": "ok",
         "version": settings.version,
         "architecture": "clean_modular_foundation",
+        "metadata_store": "predict2_metadata",
         "football_data": {
             "enabled": settings.football_data_enabled,
             "api_key_configured": bool(
