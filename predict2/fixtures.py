@@ -288,8 +288,18 @@ def list_fixtures(
             longitude,
             location_source,
             location_verified_at,
-            fixture_status
+            fixture_status,
+            latest_attempt.status AS venue_attempt_status,
+            latest_attempt.stage AS venue_attempt_stage,
+            latest_attempt.completed_at AS venue_attempt_at
         FROM fixtures
+        LEFT JOIN LATERAL (
+            SELECT status, stage, completed_at
+            FROM predict2_venue_attempts
+            WHERE fixture_id = fixtures.id
+            ORDER BY id DESC
+            LIMIT 1
+        ) latest_attempt ON TRUE
         WHERE sport = 'soccer'
           AND provider = 'football-data.org'
           AND kickoff_utc >= %s
@@ -313,6 +323,19 @@ def list_fixtures(
             "kickoff_local": _local_kickoff(
                 kickoff,
                 row.get("timezone_name"),
+            ),
+            "venue_ready": bool(
+                row.get("latitude") is not None
+                and row.get("longitude") is not None
+                and row.get("timezone_name")
+                and row.get("location_verified_at")
+            ),
+            "venue_attempt_status": (
+                row.get("venue_attempt_status")
+                or "not_attempted"
+            ),
+            "venue_attempt_stage": (
+                row.get("venue_attempt_stage")
             ),
             "prediction_ready": False,
             "prediction_status": (

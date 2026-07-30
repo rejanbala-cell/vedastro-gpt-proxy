@@ -11,6 +11,20 @@ def _bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _float(
+    name: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number.") from exc
+    return max(minimum, min(value, maximum))
+
+
 def _int(name: str, default: int, minimum: int, maximum: int) -> int:
     raw = os.getenv(name, str(default)).strip()
     try:
@@ -36,6 +50,30 @@ class Settings:
     private_ui_cookie_secure: bool
     private_ui_cookie_samesite: str
     private_ui_session_hours: int
+    tavily_api_key: str
+    tavily_enabled: bool
+    tavily_base_url: str
+    tavily_search_depth: str
+    tavily_max_results: int
+    tavily_extract_enabled: bool
+    tavily_extract_depth: str
+    tavily_extract_max_urls: int
+    tavily_min_distinct_domains: int
+    tavily_require_official_source: bool
+    tavily_min_interval_seconds: float
+    locationiq_key: str
+    locationiq_base_url: str
+    locationiq_timeout_seconds: int
+    nominatim_enabled: bool
+    nominatim_base_url: str
+    nominatim_timeout_seconds: int
+    nominatim_user_agent: str
+    nominatim_referer: str
+    venue_enrichment_window_days: int
+    venue_enrichment_max_per_job: int
+    venue_enrichment_retry_hours: int
+    venue_similarity_minimum: float
+    geocode_confidence_minimum: float
 
     @property
     def login_secret(self) -> str:
@@ -54,7 +92,7 @@ class Settings:
             same_site = "lax"
 
         return cls(
-            version="2.0.3-metadata",
+            version="2.1.0-venue",
             database_url=os.getenv("DATABASE_URL", "").strip(),
             football_data_api_key=os.getenv(
                 "FOOTBALL_DATA_API_KEY", ""
@@ -89,6 +127,84 @@ class Settings:
             private_ui_cookie_samesite=same_site,
             private_ui_session_hours=_int(
                 "PRIVATE_UI_SESSION_HOURS", 12, 1, 168
+            ),
+            tavily_api_key=os.getenv(
+                "TAVILY_API_KEY", ""
+            ).strip(),
+            tavily_enabled=_bool(
+                "TAVILY_SEARCH_ENABLED", True
+            ),
+            tavily_base_url=os.getenv(
+                "TAVILY_BASE_URL",
+                "https://api.tavily.com",
+            ).rstrip("/"),
+            tavily_search_depth=os.getenv(
+                "TAVILY_SEARCH_DEPTH", "basic"
+            ).strip().lower(),
+            tavily_max_results=_int(
+                "TAVILY_MAX_RESULTS", 8, 3, 10
+            ),
+            tavily_extract_enabled=_bool(
+                "TAVILY_EXTRACT_ENABLED", True
+            ),
+            tavily_extract_depth=os.getenv(
+                "TAVILY_EXTRACT_DEPTH", "basic"
+            ).strip().lower(),
+            tavily_extract_max_urls=_int(
+                "TAVILY_EXTRACT_MAX_URLS", 5, 1, 5
+            ),
+            tavily_min_distinct_domains=_int(
+                "TAVILY_MIN_DISTINCT_DOMAINS", 2, 1, 3
+            ),
+            tavily_require_official_source=_bool(
+                "TAVILY_REQUIRE_OFFICIAL_SOURCE", True
+            ),
+            tavily_min_interval_seconds=_float(
+                "TAVILY_MIN_INTERVAL_SECONDS", 1.0, 0.5, 30.0
+            ),
+            locationiq_key=os.getenv(
+                "LOCATIONIQ_KEY", ""
+            ).strip(),
+            locationiq_base_url=os.getenv(
+                "LOCATIONIQ_BASE_URL",
+                "https://us1.locationiq.com/v1",
+            ).rstrip("/"),
+            locationiq_timeout_seconds=_int(
+                "LOCATIONIQ_TIMEOUT_SECONDS", 20, 5, 60
+            ),
+            nominatim_enabled=_bool(
+                "NOMINATIM_FALLBACK_ENABLED", True
+            ),
+            nominatim_base_url=os.getenv(
+                "NOMINATIM_BASE_URL",
+                "https://nominatim.openstreetmap.org",
+            ).rstrip("/"),
+            nominatim_timeout_seconds=_int(
+                "NOMINATIM_TIMEOUT_SECONDS", 20, 5, 60
+            ),
+            nominatim_user_agent=os.getenv(
+                "NOMINATIM_USER_AGENT",
+                "VedAstroPrivatePredictor/2.1 "
+                "(https://vedastro-gpt-proxy.onrender.com)",
+            ).strip(),
+            nominatim_referer=os.getenv(
+                "NOMINATIM_REFERER",
+                "https://vedastro-gpt-proxy.onrender.com/private",
+            ).strip(),
+            venue_enrichment_window_days=_int(
+                "VENUE_ENRICHMENT_WINDOW_DAYS", 3, 1, 14
+            ),
+            venue_enrichment_max_per_job=_int(
+                "VENUE_ENRICHMENT_MAX_PER_JOB", 12, 1, 30
+            ),
+            venue_enrichment_retry_hours=_int(
+                "VENUE_ENRICHMENT_RETRY_HOURS", 24, 1, 168
+            ),
+            venue_similarity_minimum=_float(
+                "VENUE_SIMILARITY_MINIMUM", 0.64, 0.50, 0.95
+            ),
+            geocode_confidence_minimum=_float(
+                "GEOCODE_CONFIDENCE_MINIMUM", 72.0, 55.0, 95.0
             ),
         )
 

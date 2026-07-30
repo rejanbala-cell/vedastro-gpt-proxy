@@ -26,6 +26,12 @@ from .sync import (
     sync_if_stale_async,
 )
 from .ui import PRIVATE_HTML
+from .geocoding import timezone_driver_ready
+from .venue_jobs import (
+    get_venue_job_state,
+    start_venue_job,
+)
+
 
 
 @asynccontextmanager
@@ -44,6 +50,11 @@ app = FastAPI(
 
 class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=500)
+
+
+class VenueJobRequest(BaseModel):
+    window_days: int = Field(default=3, ge=1, le=14)
+    limit: int = Field(default=12, ge=1, le=30)
 
 
 @app.get("/health")
@@ -74,6 +85,25 @@ def health() -> dict[str, Any]:
             ),
             "last_sync_at": last_sync,
             "sync_job": get_sync_state(),
+        },
+        "venue_enrichment": {
+            "status": "available",
+            "tavily_enabled": settings.tavily_enabled,
+            "tavily_api_key_configured": bool(
+                settings.tavily_api_key
+            ),
+            "locationiq_key_configured": bool(
+                settings.locationiq_key
+            ),
+            "nominatim_enabled": settings.nominatim_enabled,
+            "timezonefinder_ready": timezone_driver_ready(),
+            "window_days": (
+                settings.venue_enrichment_window_days
+            ),
+            "max_per_job": (
+                settings.venue_enrichment_max_per_job
+            ),
+            "job": get_venue_job_state(),
         },
         "database_configured": bool(settings.database_url),
         "private_login_configured": bool(
@@ -160,6 +190,77 @@ def private_session() -> dict[str, Any]:
         "status": "ok",
         "authenticated": True,
         "version": settings.version,
+    }
+
+
+
+@app.get("/venue-health")
+def venue_health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "tavily_enabled": settings.tavily_enabled,
+        "tavily_api_key_configured": bool(
+            settings.tavily_api_key
+        ),
+        "locationiq_key_configured": bool(
+            settings.locationiq_key
+        ),
+        "nominatim_enabled": settings.nominatim_enabled,
+        "timezonefinder_ready": timezone_driver_ready(),
+        "ready": bool(
+            timezone_driver_ready()
+            and (
+                settings.locationiq_key
+                or settings.nominatim_enabled
+            )
+            and (
+                settings.tavily_api_key
+                or settings.locationiq_key
+            )
+        ),
+    }
+
+
+@app.post(
+    "/private/api/enrich-venues",
+    dependencies=[Depends(require_session)],
+)
+def enrich_venues(
+    request: VenueJobRequest,
+) -> dict[str, Any]:
+    return start_venue_job(
+        reason="private_ui_bulk",
+        window_days=request.window_days,
+        limit=request.limit,
+    )
+
+
+@app.post(
+    "/private/api/fixtures/{fixture_id}/enrich-venue",
+    dependencies=[Depends(require_session)],
+)
+def enrich_single_venue(
+    fixture_id: int,
+) -> dict[str, Any]:
+    return start_venue_job(
+        reason="private_ui_single_fixture",
+        fixture_id=fixture_id,
+        window_days=14,
+        limit=1,
+    )
+
+
+@app.get(
+    "/private/api/venue-status",
+    dependencies=[Depends(require_session)],
+)
+def venue_status() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "current_job": get_venue_job_state(),
+        "checked_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
     }
 
 

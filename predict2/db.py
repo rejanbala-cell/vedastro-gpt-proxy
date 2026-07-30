@@ -93,6 +93,42 @@ def ensure_schema() -> None:
         CREATE INDEX IF NOT EXISTS idx_fixtures_provider_kickoff
         ON fixtures (provider, kickoff_utc)
         """,
+        """
+        CREATE TABLE IF NOT EXISTS predict2_venue_attempts (
+            id BIGSERIAL PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            fixture_id BIGINT NOT NULL
+                REFERENCES fixtures(id) ON DELETE CASCADE,
+            status TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            venue_name TEXT,
+            venue_city TEXT,
+            country TEXT,
+            latitude DOUBLE PRECISION,
+            longitude DOUBLE PRECISION,
+            timezone_name TEXT,
+            confidence NUMERIC(6,3),
+            source TEXT,
+            audit_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            completed_at TIMESTAMPTZ,
+            UNIQUE (job_id, fixture_id)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_predict2_venue_attempts_fixture
+        ON predict2_venue_attempts (fixture_id, completed_at DESC)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS predict2_geocode_cache (
+            cache_key TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            query_text TEXT NOT NULL,
+            result_json JSONB NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
     ]
 
     with connect() as connection:
