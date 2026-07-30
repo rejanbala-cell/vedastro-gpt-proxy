@@ -74,6 +74,7 @@ button{border:0;border-radius:14px;padding:13px 18px;font-weight:800;cursor:poin
 <script>
 const $=selector=>document.querySelector(selector);
 let currentWindow="today";
+let activeVenueJobId=null;
 
 async function api(url,options={}){
   const response=await fetch(url,{
@@ -186,10 +187,10 @@ async function pollFixtureSync(){
   button.disabled=false;
 }
 
-async function pollVenueJob(){
+async function pollVenueJob(jobId){
   const bulk=$("#venues");
   for(let attempt=0;attempt<180;attempt++){
-    const data=await api("/private/api/venue-status");
+    const data=await api(`/private/api/venue-status?job_id=${encodeURIComponent(jobId)}`);
     const job=data.current_job||{};
     const progress=job.fixtures_total
       ? ` ${job.fixtures_completed||0}/${job.fixtures_total} · ${job.verified||0} verified · ${job.unresolved||0} unresolved.`
@@ -219,10 +220,16 @@ async function verifyOne(fixtureId){
   $("#status").textContent="Starting venue verification…";
   try{
     const data=await api(`/private/api/fixtures/${fixtureId}/enrich-venue`,{method:"POST"});
+    const job=data.job||{};
+    activeVenueJobId=data.job_id||job.job_id;
     if(data.status==="busy"){
-      $("#status").textContent="Another venue job is already running.";
+      activeVenueJobId=job.job_id;
+      $("#status").textContent="Another venue job is already running; showing its progress.";
     }
-    await pollVenueJob();
+    if(!activeVenueJobId){
+      throw new Error("The server did not return a venue job id.");
+    }
+    await pollVenueJob(activeVenueJobId);
   }catch(error){
     $("#status").textContent=`Could not start venue verification: ${error.message}`;
   }
@@ -281,11 +288,16 @@ $("#venues").onclick=async()=>{
   button.disabled=true;
   $("#status").textContent="Starting controlled venue verification…";
   try{
-    await api("/private/api/enrich-venues",{
+    const data=await api("/private/api/enrich-venues",{
       method:"POST",
       body:JSON.stringify({window_days:3,limit:12})
     });
-    await pollVenueJob();
+    const job=data.job||{};
+    activeVenueJobId=data.job_id||job.job_id;
+    if(!activeVenueJobId){
+      throw new Error("The server did not return a venue job id.");
+    }
+    await pollVenueJob(activeVenueJobId);
   }catch(error){
     button.disabled=false;
     $("#status").textContent=`Could not start venue job: ${error.message}`;
@@ -296,6 +308,12 @@ $("#venues").onclick=async()=>{
   try{
     await api("/private/api/session");
     showApp();
+    const data=await api("/private/api/venue-status");
+    const job=data.current_job||{};
+    if(["queued","running"].includes(job.status)&&job.job_id){
+      activeVenueJobId=job.job_id;
+      pollVenueJob(activeVenueJobId);
+    }
   }catch{
     showLogin();
   }

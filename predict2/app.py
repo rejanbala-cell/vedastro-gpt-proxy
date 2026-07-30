@@ -29,6 +29,7 @@ from .ui import PRIVATE_HTML
 from .geocoding import timezone_driver_ready
 from .venue_jobs import (
     get_venue_job_state,
+    recover_stale_venue_jobs,
     start_venue_job,
 )
 
@@ -37,6 +38,7 @@ from .venue_jobs import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_schema()
+    recover_stale_venue_jobs()
     sync_if_stale_async()
     yield
 
@@ -108,6 +110,10 @@ def health() -> dict[str, Any]:
             ),
             "stage_warning_seconds": (
                 settings.venue_stage_warning_seconds
+            ),
+            "job_state_store": "postgresql",
+            "job_stale_minutes": (
+                settings.venue_job_stale_minutes
             ),
             "job": get_venue_job_state(),
         },
@@ -260,10 +266,13 @@ def enrich_single_venue(
     "/private/api/venue-status",
     dependencies=[Depends(require_session)],
 )
-def venue_status() -> dict[str, Any]:
+def venue_status(
+    job_id: str | None = Query(default=None, max_length=80),
+) -> dict[str, Any]:
     return {
         "status": "ok",
-        "current_job": get_venue_job_state(),
+        "requested_job_id": job_id,
+        "current_job": get_venue_job_state(job_id),
         "checked_at": datetime.now(
             timezone.utc
         ).isoformat(),

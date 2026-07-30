@@ -76,6 +76,7 @@ class Settings:
     geocode_confidence_minimum: float
     tavily_timeout_seconds: int
     venue_stage_warning_seconds: int
+    venue_job_stale_minutes: int
 
     @property
     def login_secret(self) -> str:
@@ -94,7 +95,7 @@ class Settings:
             same_site = "lax"
 
         return cls(
-            version="2.1.1-venue-observable",
+            version="2.1.2-db-jobs",
             database_url=os.getenv("DATABASE_URL", "").strip(),
             football_data_api_key=os.getenv(
                 "FOOTBALL_DATA_API_KEY", ""
@@ -213,6 +214,9 @@ class Settings:
             ),
             venue_stage_warning_seconds=_int(
                 "VENUE_STAGE_WARNING_SECONDS", 45, 15, 180
+            ),
+            venue_job_stale_minutes=_int(
+                "VENUE_JOB_STALE_MINUTES", 5, 2, 60
             ),
         )
 

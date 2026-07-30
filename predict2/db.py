@@ -129,6 +129,45 @@ def ensure_schema() -> None:
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS predict2_venue_jobs (
+            job_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            fixture_id BIGINT
+                REFERENCES fixtures(id) ON DELETE SET NULL,
+            window_days INTEGER NOT NULL,
+            limit_count INTEGER NOT NULL,
+            fixtures_total INTEGER NOT NULL DEFAULT 0,
+            fixtures_completed INTEGER NOT NULL DEFAULT 0,
+            verified INTEGER NOT NULL DEFAULT 0,
+            unresolved INTEGER NOT NULL DEFAULT 0,
+            skipped INTEGER NOT NULL DEFAULT 0,
+            errors INTEGER NOT NULL DEFAULT 0,
+            current_fixture JSONB,
+            current_stage TEXT,
+            stage_started_at TIMESTAMPTZ,
+            last_progress_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            message TEXT,
+            error_type TEXT,
+            traceback_json JSONB,
+            results_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            started_at TIMESTAMPTZ,
+            completed_at TIMESTAMPTZ
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_predict2_venue_jobs_one_active
+        ON predict2_venue_jobs ((1))
+        WHERE status IN ('queued', 'running')
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_predict2_venue_jobs_created
+        ON predict2_venue_jobs (created_at DESC)
+        """,
     ]
 
     with connect() as connection:
