@@ -168,6 +168,68 @@ def ensure_schema() -> None:
             idx_predict2_venue_jobs_created
         ON predict2_venue_jobs (created_at DESC)
         """,
+        """
+        CREATE TABLE IF NOT EXISTS predict2_prediction_runs (
+            id BIGSERIAL PRIMARY KEY,
+            event_id TEXT NOT NULL UNIQUE,
+            fixture_id BIGINT NOT NULL
+                REFERENCES fixtures(id) ON DELETE CASCADE,
+            model_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            completed_at TIMESTAMPTZ,
+            outcome TEXT,
+            outcome_label TEXT,
+            confidence TEXT,
+            eligibility TEXT,
+            method TEXT,
+            favourite_side TEXT,
+            favourite_team TEXT,
+            underdog_team TEXT,
+            market_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            performance_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            venue_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            chart_json JSONB,
+            decision_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            diagnostic_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            error_type TEXT,
+            error_message TEXT,
+            UNIQUE (fixture_id, model_version)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_predict2_prediction_runs_fixture
+        ON predict2_prediction_runs (fixture_id, requested_at DESC)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS predict2_official_results (
+            fixture_id BIGINT PRIMARY KEY
+                REFERENCES fixtures(id) ON DELETE CASCADE,
+            home_score INTEGER,
+            away_score INTEGER,
+            outcome TEXT,
+            source TEXT NOT NULL,
+            raw_result_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            imported_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS predict2_prediction_audits (
+            id BIGSERIAL PRIMARY KEY,
+            prediction_id BIGINT NOT NULL
+                REFERENCES predict2_prediction_runs(id) ON DELETE CASCADE,
+            fixture_id BIGINT NOT NULL
+                REFERENCES fixtures(id) ON DELETE CASCADE,
+            predicted_outcome TEXT NOT NULL,
+            actual_outcome TEXT,
+            correct BOOLEAN,
+            market_baseline_outcome TEXT,
+            market_baseline_correct BOOLEAN,
+            audited_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (prediction_id)
+        )
+        """,
     ]
 
     with connect() as connection:

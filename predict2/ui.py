@@ -45,13 +45,13 @@ button{border:0;border-radius:14px;padding:13px 18px;font-weight:800;cursor:poin
 <section id="app" class="hidden">
   <div class="top">
     <div>
-      <div class="small" style="color:var(--teal);font-weight:900;letter-spacing:2px">PREDICT2 · VENUE PHASE</div>
+      <div class="small" style="color:var(--teal);font-weight:900;letter-spacing:2px">PREDICT2 · FINAL ONE-CLICK</div>
       <h1>Upcoming matches</h1>
-      <p class="muted">Fixtures load from PostgreSQL. Verified stadium coordinates are converted to each venue’s local civil time.</p>
+      <p class="muted">Fixtures load from PostgreSQL. Predict automatically verifies evidence, attempts one valid chart, and freezes one exact 90-minute outcome.</p>
     </div>
     <div class="actions">
       <button id="sync" class="secondary">Sync fixtures</button>
-      <button id="venues" class="primary">Verify next 3 days</button>
+      
       <button id="logout" class="secondary">Log out</button>
     </div>
   </div>
@@ -68,6 +68,16 @@ button{border:0;border-radius:14px;padding:13px 18px;font-weight:800;cursor:poin
   </div>
   <div id="status" class="status">Loading stored fixtures…</div>
   <div id="grid" class="grid"></div>
+
+  <div id="predictionModal" class="hidden" style="position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:20;padding:20px;overflow:auto">
+    <div class="card" style="max-width:900px;margin:5vh auto">
+      <div style="display:flex;justify-content:space-between;gap:12px">
+        <div><div class="small" style="color:var(--teal);font-weight:900;letter-spacing:2px">PREDICTION WORKFLOW</div><h1 id="predictionTitle">Preparing prediction</h1></div>
+        <button id="closePrediction" class="secondary">×</button>
+      </div>
+      <div id="predictionBody" class="status">Verifying fixture, market, performance and venue…</div>
+    </div>
+  </div>
 </section>
 </div>
 
@@ -142,16 +152,15 @@ function render(rows){
       ${venueBadge(row)}
       <span class="badge">${escapeHtml(row.provider)}</span>
       <div class="cardactions">
-        ${row.venue_ready
-          ? ""
-          : `<button class="verify" data-fixture-id="${row.id}">Verify venue</button>`}
-        <button class="disabled" disabled>Prediction engine migration pending</button>
+        ${row.prediction_exists
+          ? `<button class="primary predict" data-fixture-id="${row.id}">${escapeHtml(row.prediction_outcome_label||"View prediction")}</button>`
+          : `<button class="primary predict" data-fixture-id="${row.id}">Predict</button>`}
       </div>
     </article>
   `).join("");
 
-  document.querySelectorAll(".verify").forEach(button=>{
-    button.onclick=()=>verifyOne(Number(button.dataset.fixtureId));
+  document.querySelectorAll(".predict").forEach(button=>{
+    button.onclick=()=>predictOne(Number(button.dataset.fixtureId));
   });
 }
 
@@ -204,10 +213,11 @@ async function pollVenueJob(jobId){
     $("#status").textContent=`Venue job ${job.status||"unknown"}.${progress}${stage}${elapsed} ${job.message||""}`.trim();
     if(["ok","error","busy"].includes(job.status)){
       bulk.disabled=false;
+      const finalText=job.status==="error"
+        ? `Venue job failed: ${job.error_type||""} · ${job.message||""}`
+        : `Venue job ${job.status}. ${job.fixtures_completed||0}/${job.fixtures_total||0} processed · ${job.verified||0} verified · ${job.unresolved||0} unresolved · ${job.skipped||0} skipped · ${job.errors||0} errors. ${job.message||""}`;
       await loadFixtures();
-      if(job.status==="error"){
-        $("#status").textContent=`Venue job failed: ${job.error_type||""} · ${job.message||""}`;
-      }
+      $("#status").textContent=finalText.trim();
       return;
     }
     await new Promise(resolve=>setTimeout(resolve,2000));
@@ -234,6 +244,49 @@ async function verifyOne(fixtureId){
     $("#status").textContent=`Could not start venue verification: ${error.message}`;
   }
 }
+
+
+function formatPrediction(prediction){
+  if(!prediction)return "No stored prediction.";
+  const market=prediction.market_json||{};
+  const performance=prediction.performance_json||{};
+  const decision=prediction.decision_json||{};
+  const diagnostic=prediction.diagnostic_json||{};
+  return `
+    <div style="font-size:28px;font-weight:900;color:var(--teal);margin-bottom:14px">${escapeHtml(prediction.outcome_label)}</div>
+    <div><strong>Confidence:</strong> ${escapeHtml(prediction.confidence)} · <strong>Eligibility:</strong> ${escapeHtml(prediction.eligibility)}</div>
+    <div><strong>Method:</strong> ${escapeHtml(prediction.method)}</div>
+    <div><strong>Reason:</strong> ${escapeHtml(decision.reason||"")}</div>
+    <hr style="border-color:#294652;margin:18px 0">
+    <div><strong>Market favourite:</strong> ${escapeHtml(prediction.favourite_team||"Not verified")}</div>
+    <div><strong>Market domains:</strong> ${escapeHtml(market.distinct_domains??0)}</div>
+    <div><strong>Performance baseline:</strong> ${escapeHtml(performance.baseline_outcome||"")}</div>
+    <div><strong>Astrology call made:</strong> ${decision.chart_call_made?"Yes — exactly one":"No — performance-only fallback"}</div>
+    <div><strong>Immutable event ID:</strong> ${escapeHtml(prediction.event_id)}</div>
+    <p class="muted">Astrology is not scientifically validated and sports outcomes remain uncertain.</p>
+  `;
+}
+
+async function predictOne(fixtureId){
+  $("#predictionModal").classList.remove("hidden");
+  $("#predictionTitle").textContent="Preparing deep prediction";
+  $("#predictionBody").textContent="Automatically verifying venue, market, performance and chart eligibility…";
+  try{
+    const existing=await api(`/private/api/fixtures/${fixtureId}/prediction`);
+    let prediction=existing.prediction;
+    if(!prediction){
+      const result=await api(`/private/api/fixtures/${fixtureId}/predict`,{method:"POST"});
+      prediction=result.prediction;
+    }
+    $("#predictionTitle").textContent="Prediction frozen";
+    $("#predictionBody").innerHTML=formatPrediction(prediction);
+    await loadFixtures();
+  }catch(error){
+    $("#predictionTitle").textContent="Prediction workflow stopped";
+    $("#predictionBody").textContent=error.message;
+  }
+}
+$("#closePrediction").onclick=()=>$("#predictionModal").classList.add("hidden");
 
 $("#loginForm").onsubmit=async event=>{
   event.preventDefault();
@@ -283,26 +336,7 @@ $("#sync").onclick=async()=>{
   }
 };
 
-$("#venues").onclick=async()=>{
-  const button=$("#venues");
-  button.disabled=true;
-  $("#status").textContent="Starting controlled venue verification…";
-  try{
-    const data=await api("/private/api/enrich-venues",{
-      method:"POST",
-      body:JSON.stringify({window_days:3,limit:12})
-    });
-    const job=data.job||{};
-    activeVenueJobId=data.job_id||job.job_id;
-    if(!activeVenueJobId){
-      throw new Error("The server did not return a venue job id.");
-    }
-    await pollVenueJob(activeVenueJobId);
-  }catch(error){
-    button.disabled=false;
-    $("#status").textContent=`Could not start venue job: ${error.message}`;
-  }
-};
+
 
 (async()=>{
   try{

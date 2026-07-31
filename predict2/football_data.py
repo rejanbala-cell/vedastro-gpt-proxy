@@ -175,4 +175,74 @@ class FootballDataClient:
         }
 
 
+    def match(self, match_id: str) -> dict[str, Any]:
+        if not settings.football_data_enabled:
+            raise FootballDataError(
+                "Football-data.org integration is disabled."
+            )
+        with self._request_lock:
+            self._wait_for_request_slot()
+            try:
+                response = requests.get(
+                    f"{self.base_url}/matches/{match_id}",
+                    headers=self._headers(),
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                self._last_request_monotonic = time.monotonic()
+                raise FootballDataError(
+                    "Football-data.org match request failed.",
+                    provider_message=type(exc).__name__,
+                ) from exc
+            self._last_request_monotonic = time.monotonic()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise FootballDataError(
+                "Football-data.org returned invalid match JSON.",
+                status_code=response.status_code,
+            ) from exc
+        if response.status_code != 200:
+            raise FootballDataError(
+                "Football-data.org rejected the match request.",
+                status_code=response.status_code,
+                provider_message=self._provider_message(payload),
+            )
+        return payload if isinstance(payload, dict) else {}
+
+    def standings(self, competition_code: str) -> dict[str, Any]:
+        code = str(competition_code or "").strip()
+        if not code:
+            raise FootballDataError("Competition code is unavailable.")
+        with self._request_lock:
+            self._wait_for_request_slot()
+            try:
+                response = requests.get(
+                    f"{self.base_url}/competitions/{code}/standings",
+                    headers=self._headers(),
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                self._last_request_monotonic = time.monotonic()
+                raise FootballDataError(
+                    "Football-data.org standings request failed.",
+                    provider_message=type(exc).__name__,
+                ) from exc
+            self._last_request_monotonic = time.monotonic()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise FootballDataError(
+                "Football-data.org returned invalid standings JSON.",
+                status_code=response.status_code,
+            ) from exc
+        if response.status_code != 200:
+            raise FootballDataError(
+                "Football-data.org rejected the standings request.",
+                status_code=response.status_code,
+                provider_message=self._provider_message(payload),
+            )
+        return payload if isinstance(payload, dict) else {}
+
+
 client = FootballDataClient()

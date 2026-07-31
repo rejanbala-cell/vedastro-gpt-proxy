@@ -1,0 +1,32 @@
+{
+  "upload_destination": "GitHub repository / predict2 /",
+  "version": "3.0.0-final",
+  "file_count": 19,
+  "files": [
+    "__init__.py",
+    "app.py",
+    "auth.py",
+    "chart_adapter.py",
+    "config.py",
+    "db.py",
+    "fixtures.py",
+    "football_data.py",
+    "gambler_dharma_chart_engine.py",
+    "geocoding.py",
+    "metadata.py",
+    "prediction_evidence.py",
+    "prediction_service.py",
+    "sync.py",
+    "tavily.py",
+    "text_utils.py",
+    "ui.py",
+    "venue_jobs.py",
+    "venue_service.py"
+  ],
+  "required_checks": {
+    "config.py": "version=\"3.0.0-final\"",
+    "ui.py": "PREDICT2 \u00b7 FINAL ONE-CLICK",
+    "app.py": "run_prediction",
+    "prediction_service.py": "run_prediction"
+  }
+}

@@ -27,6 +27,7 @@ from .sync import (
 )
 from .ui import PRIVATE_HTML
 from .geocoding import timezone_driver_ready
+from .prediction_service import get_prediction, run_prediction
 from .venue_jobs import (
     get_venue_job_state,
     recover_stale_venue_jobs,
@@ -55,7 +56,7 @@ class LoginRequest(BaseModel):
 
 
 class VenueJobRequest(BaseModel):
-    window_days: int = Field(default=3, ge=1, le=14)
+    window_days: int = Field(default=90, ge=1, le=90)
     limit: int = Field(default=12, ge=1, le=30)
 
 
@@ -122,11 +123,15 @@ def health() -> dict[str, Any]:
             settings.login_secret
         ),
         "prediction_engine": {
-            "status": "not_migrated",
-            "reason": (
-                "Foundation release validates the new fixture "
-                "catalogue before chart orchestration is migrated."
-            ),
+            "status": "active",
+            "model_version": settings.prediction_model_version,
+            "one_click": True,
+            "immutable": True,
+            "duplicate_click_returns_existing": True,
+            "automatic_venue_resolution": True,
+            "performance_fallback": True,
+            "exact_soccer_market": "Home win / Draw / Away win over 90 minutes plus stoppage",
+            "deep_chart_engine": "Gambler's Dharma chapters 1-8",
         },
     }
 
@@ -301,6 +306,46 @@ def private_fixtures(
         "count": len(fixtures),
         "fixtures": fixtures,
         "provider_call_made": False,
+    }
+
+
+
+@app.post(
+    "/private/api/fixtures/{fixture_id}/predict",
+    dependencies=[Depends(require_session)],
+)
+def predict_fixture(fixture_id: int) -> dict[str, Any]:
+    try:
+        prediction = run_prediction(fixture_id)
+        return {
+            "status": "ok",
+            "prediction": prediction,
+        }
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Prediction workflow stopped safely.",
+                "error_type": type(exc).__name__,
+                "safe_detail": str(exc)[:500],
+            },
+        ) from exc
+
+
+@app.get(
+    "/private/api/fixtures/{fixture_id}/prediction",
+    dependencies=[Depends(require_session)],
+)
+def fixture_prediction(fixture_id: int) -> dict[str, Any]:
+    prediction = get_prediction(fixture_id)
+    return {
+        "status": "ok",
+        "prediction": prediction,
     }
 
 

@@ -77,6 +77,12 @@ class Settings:
     tavily_timeout_seconds: int
     venue_stage_warning_seconds: int
     venue_job_stale_minutes: int
+    prediction_model_version: str
+    prediction_tavily_timeout_seconds: int
+    prediction_evidence_max_results: int
+    prediction_market_min_domains: int
+    prediction_draw_margin: float
+    prediction_home_advantage: float
 
     @property
     def login_secret(self) -> str:
@@ -95,7 +101,7 @@ class Settings:
             same_site = "lax"
 
         return cls(
-            version="2.1.2-db-jobs",
+            version="3.0.0-final",
             database_url=os.getenv("DATABASE_URL", "").strip(),
             football_data_api_key=os.getenv(
                 "FOOTBALL_DATA_API_KEY", ""
@@ -195,7 +201,7 @@ class Settings:
                 "https://vedastro-gpt-proxy.onrender.com/private",
             ).strip(),
             venue_enrichment_window_days=_int(
-                "VENUE_ENRICHMENT_WINDOW_DAYS", 3, 1, 14
+                "VENUE_ENRICHMENT_WINDOW_DAYS", 90, 1, 90
             ),
             venue_enrichment_max_per_job=_int(
                 "VENUE_ENRICHMENT_MAX_PER_JOB", 12, 1, 30
@@ -217,6 +223,25 @@ class Settings:
             ),
             venue_job_stale_minutes=_int(
                 "VENUE_JOB_STALE_MINUTES", 5, 2, 60
+            ),
+            prediction_model_version=os.getenv(
+                "PREDICTION_MODEL_VERSION",
+                "gambler-dharma-final-v1",
+            ).strip(),
+            prediction_tavily_timeout_seconds=_int(
+                "PREDICTION_TAVILY_TIMEOUT_SECONDS", 20, 8, 45
+            ),
+            prediction_evidence_max_results=_int(
+                "PREDICTION_EVIDENCE_MAX_RESULTS", 8, 3, 10
+            ),
+            prediction_market_min_domains=_int(
+                "PREDICTION_MARKET_MIN_DOMAINS", 2, 1, 4
+            ),
+            prediction_draw_margin=_float(
+                "PREDICTION_DRAW_MARGIN", 0.08, 0.03, 0.20
+            ),
+            prediction_home_advantage=_float(
+                "PREDICTION_HOME_ADVANTAGE", 0.10, 0.00, 0.25
             ),
         )
 

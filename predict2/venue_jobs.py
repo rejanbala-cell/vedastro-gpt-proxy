@@ -93,11 +93,17 @@ def _row_to_state(row: dict[str, Any] | None) -> dict[str, Any]:
         return _idle_state()
 
     started_at = row.get("started_at")
+    completed_at = row.get("completed_at")
     elapsed = 0
     if isinstance(started_at, datetime):
+        elapsed_end = (
+            completed_at
+            if isinstance(completed_at, datetime)
+            else _now()
+        )
         elapsed = max(
             0,
-            int((_now() - started_at).total_seconds()),
+            int((elapsed_end - started_at).total_seconds()),
         )
 
     traceback_value = row.get("traceback_json")
@@ -515,6 +521,25 @@ def _run(
         }
         results: list[dict[str, Any]] = []
 
+        if not fixtures:
+            completed = _now()
+            _update_job(
+                job_id,
+                status="ok",
+                completed_at=completed,
+                current_fixture=None,
+                current_stage=None,
+                stage_started_at=None,
+                last_progress_at=completed,
+                message=(
+                    "No eligible unverified future fixtures were "
+                    "found in the selected catalogue window."
+                ),
+                results_json=[],
+            )
+            _persist_summary(get_venue_job_state(job_id))
+            return
+
         for index, fixture in enumerate(fixtures, start=1):
             if not fixture:
                 counters["errors"] += 1
@@ -658,7 +683,7 @@ def start_venue_job(
                 window_days
                 or settings.venue_enrichment_window_days
             ),
-            14,
+            90,
         ),
     )
     resolved_limit = max(

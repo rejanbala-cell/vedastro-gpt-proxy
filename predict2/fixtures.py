@@ -289,10 +289,27 @@ def list_fixtures(
             location_source,
             location_verified_at,
             fixture_status,
+            raw_fixture_json,
+            latest_prediction.outcome AS prediction_outcome,
+            latest_prediction.outcome_label AS prediction_outcome_label,
+            latest_prediction.confidence AS prediction_confidence,
+            latest_prediction.eligibility AS prediction_eligibility,
             latest_attempt.status AS venue_attempt_status,
             latest_attempt.stage AS venue_attempt_stage,
             latest_attempt.completed_at AS venue_attempt_at
         FROM fixtures
+        LEFT JOIN LATERAL (
+            SELECT
+                outcome,
+                outcome_label,
+                confidence,
+                eligibility
+            FROM predict2_prediction_runs
+            WHERE fixture_id = fixtures.id
+              AND status = 'completed'
+            ORDER BY id DESC
+            LIMIT 1
+        ) latest_prediction ON TRUE
         LEFT JOIN LATERAL (
             SELECT status, stage, completed_at
             FROM predict2_venue_attempts
@@ -337,9 +354,24 @@ def list_fixtures(
             "venue_attempt_stage": (
                 row.get("venue_attempt_stage")
             ),
-            "prediction_ready": False,
+            "prediction_ready": True,
+            "prediction_exists": bool(
+                row.get("prediction_outcome")
+            ),
+            "prediction_outcome": row.get("prediction_outcome"),
+            "prediction_outcome_label": (
+                row.get("prediction_outcome_label")
+            ),
+            "prediction_confidence": (
+                row.get("prediction_confidence")
+            ),
+            "prediction_eligibility": (
+                row.get("prediction_eligibility")
+            ),
             "prediction_status": (
-                "PREDICT2 prediction engine not migrated yet"
+                "Prediction frozen"
+                if row.get("prediction_outcome")
+                else "Ready for one-click prediction"
             ),
         })
     return output
