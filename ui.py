@@ -1,385 +1,304 @@
 from __future__ import annotations
 
-import json
-import threading
-import traceback
-import uuid
-from copy import deepcopy
-from datetime import date, datetime, timedelta, timezone
+import re
+import unicodedata
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 from typing import Any
-
-from .config import settings
-from .db import connect
-from .football_data import FootballDataError, client
-from .fixtures import upsert_matches
-from .metadata import get_datetime, set_value
+from urllib.parse import urlparse
 
 
-SYNC_LOCK_ID = 220260730
-SYNC_CHUNK_DAYS = 10
-THREAD_LOCK = threading.Lock()
-STATE_LOCK = threading.Lock()
+TEAM_STOPWORDS = {
+    "fc", "cf", "sc", "ac", "afc", "club", "football",
+    "futebol", "de", "the", "women", "w", "u19", "u20", "u21",
+    "u23", "reserves", "ii",
+}
 
-_SYNC_STATE: dict[str, Any] = {
-    "status": "idle",
-    "job_id": None,
-    "reason": None,
-    "started_at": None,
-    "completed_at": None,
-    "date_from": None,
-    "date_to": None,
-    "chunks_total": 0,
-    "chunks_completed": 0,
-    "received": 0,
-    "imported": 0,
-    "skipped": 0,
-    "current_chunk": None,
-    "error_type": None,
-    "message": None,
-    "provider_http_status": None,
-    "provider_message": None,
+VENUE_WORDS = (
+    "stadium", "arena", "stade", "stadion", "stadio",
+    "estadio", "estádio", "campo", "parque", "ground",
+    "sports centre", "sports center", "sport centre",
+    "sport center", "complexo desportivo", "centro desportivo",
+    "olympic centre", "olympic center",
+)
+
+AGGREGATOR_DOMAINS = {
+    "forebet.com", "365scores.com", "soccerway.com",
+    "flashscore.com", "livescore.com", "espn.com",
+    "sportsmole.co.uk", "worldfootball.net",
 }
 
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def normalize_text(value: Any) -> str:
+    text = unicodedata.normalize(
+        "NFKD", str(value or "")
+    ).encode("ascii", "ignore").decode("ascii")
+    text = text.lower().replace("&", " and ")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
 
 
-def _provider_window() -> tuple[date, date]:
-    """
-    Return [date_from, date_to) boundaries.
-
-    football-data.org v4 treats dateTo as the exclusive upper bound.
-    A 90-day sync therefore ends exactly 90 days after dateFrom.
-    """
-    start = _utc_now().date()
-    end_exclusive = start + timedelta(
-        days=settings.football_data_sync_days
-    )
-    return start, end_exclusive
-
-
-def _chunks(
-    start: date,
-    end_exclusive: date,
-) -> list[tuple[date, date]]:
-    """
-    Split [start, end_exclusive) into consecutive provider requests.
-
-    Every returned pair is sent as dateFrom/dateTo. The difference
-    between the two dates never exceeds ten days.
-    """
-    if end_exclusive <= start:
-        return []
-
-    output: list[tuple[date, date]] = []
-    cursor = start
-    while cursor < end_exclusive:
-        chunk_to = min(
-            cursor + timedelta(days=SYNC_CHUNK_DAYS),
-            end_exclusive,
-        )
-        output.append((cursor, chunk_to))
-        cursor = chunk_to
-    return output
-
-
-def _set_state(**updates: Any) -> dict[str, Any]:
-    with STATE_LOCK:
-        _SYNC_STATE.update(updates)
-        return deepcopy(_SYNC_STATE)
-
-
-def get_sync_state() -> dict[str, Any]:
-    with STATE_LOCK:
-        return deepcopy(_SYNC_STATE)
-
-
-def _safe_persist_audit(audit: dict[str, Any]) -> None:
-    try:
-        set_value(
-            "predict2_football_data_last_sync_audit",
-            json.dumps(
-                audit,
-                ensure_ascii=False,
-                default=str,
-            ),
-        )
-    except Exception:
-        # An audit-write failure must never hide the original sync error.
-        pass
-
-
-def _complete_success(
-    *,
-    job_id: str,
-    started: datetime,
-    date_from: date,
-    date_to: date,
-    chunks_total: int,
-    totals: dict[str, int],
-    provider_audits: list[dict[str, Any]],
-) -> dict[str, Any]:
-    completed = _utc_now()
-    audit = _set_state(
-        status="ok",
-        job_id=job_id,
-        completed_at=completed.isoformat(),
-        current_chunk=None,
-        chunks_completed=chunks_total,
-        received=totals["received"],
-        imported=totals["imported"],
-        skipped=totals["skipped"],
-        error_type=None,
-        message=None,
-        provider_http_status=None,
-        provider_message=None,
-    )
-    audit.update({
-        "started_at": started.isoformat(),
-        "date_from": date_from.isoformat(),
-        "date_to": date_to.isoformat(),
-        "provider_chunks": provider_audits,
-    })
-    try:
-        set_value(
-            "predict2_football_data_last_sync_at",
-            completed.isoformat(),
-        )
-    except Exception as exc:
-        audit = _set_state(
-            status="error",
-            error_type=type(exc).__name__,
-            message=(
-                "Fixtures were imported, but the final sync timestamp "
-                f"could not be saved: {exc}"
-            ),
-        )
-    _safe_persist_audit(audit)
-    return audit
-
-
-def _run_sync_job(
-    *,
-    job_id: str,
-    reason: str,
-) -> None:
-    advisory_connection = None
-    advisory_locked = False
-    started = _utc_now()
-    date_from, date_to_exclusive = _provider_window()
-    windows = _chunks(date_from, date_to_exclusive)
-    totals = {"received": 0, "imported": 0, "skipped": 0}
-    provider_audits: list[dict[str, Any]] = []
-
-    try:
-        advisory_context = connect()
-        advisory_connection = advisory_context.__enter__()
-        with advisory_connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT pg_try_advisory_lock(%s)",
-                (SYNC_LOCK_ID,),
-            )
-            advisory_locked = bool(cursor.fetchone()[0])
-
-        if not advisory_locked:
-            _set_state(
-                status="busy",
-                message=(
-                    "Another Render worker is already syncing fixtures."
-                ),
-                completed_at=_utc_now().isoformat(),
-            )
-            return
-
-        _set_state(
-            status="running",
-            job_id=job_id,
-            reason=reason,
-            started_at=started.isoformat(),
-            completed_at=None,
-            date_from=date_from.isoformat(),
-            date_to=date_to_exclusive.isoformat(),
-            chunks_total=len(windows),
-            chunks_completed=0,
-            received=0,
-            imported=0,
-            skipped=0,
-            error_type=None,
-            message=None,
-            provider_http_status=None,
-            provider_message=None,
-        )
-
-        for index, (chunk_from, chunk_to) in enumerate(
-            windows,
-            start=1,
-        ):
-            _set_state(
-                current_chunk={
-                    "index": index,
-                    "date_from": chunk_from.isoformat(),
-                    "date_to": chunk_to.isoformat(),
-                },
-                message=(
-                    f"Downloading fixture chunk {index} "
-                    f"of {len(windows)}."
-                ),
-            )
-
-            response = client.matches(
-                date_from=chunk_from,
-                date_to=chunk_to,
-            )
-            imported = upsert_matches(response.matches)
-
-            totals["received"] += imported["received"]
-            totals["imported"] += imported["imported"]
-            totals["skipped"] += imported["skipped"]
-
-            provider_audits.append({
-                "index": index,
-                "date_from": chunk_from.isoformat(),
-                "date_to": chunk_to.isoformat(),
-                "result_set": response.result_set,
-                "response_headers": response.response_headers,
-                **imported,
-            })
-            _set_state(
-                chunks_completed=index,
-                received=totals["received"],
-                imported=totals["imported"],
-                skipped=totals["skipped"],
-                message=(
-                    f"Imported chunk {index} of {len(windows)}."
-                ),
-            )
-
-        _complete_success(
-            job_id=job_id,
-            started=started,
-            date_from=date_from,
-            date_to=date_to_exclusive,
-            chunks_total=len(windows),
-            totals=totals,
-            provider_audits=provider_audits,
-        )
-
-    except FootballDataError as exc:
-        audit = _set_state(
-            status="provider_error",
-            completed_at=_utc_now().isoformat(),
-            error_type=type(exc).__name__,
-            message=str(exc),
-            provider_http_status=exc.status_code,
-            provider_message=exc.provider_message,
-            current_chunk=get_sync_state().get("current_chunk"),
-        )
-        audit["retry_after_seconds"] = exc.retry_after_seconds
-        audit["provider_chunks"] = provider_audits
-        _safe_persist_audit(audit)
-
-    except Exception as exc:
-        audit = _set_state(
-            status="error",
-            completed_at=_utc_now().isoformat(),
-            error_type=type(exc).__name__,
-            message=str(exc) or repr(exc),
-            traceback_tail=traceback.format_exc().splitlines()[-12:],
-            current_chunk=get_sync_state().get("current_chunk"),
-        )
-        audit["provider_chunks"] = provider_audits
-        _safe_persist_audit(audit)
-
-    finally:
-        if advisory_locked and advisory_connection is not None:
-            try:
-                with advisory_connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT pg_advisory_unlock(%s)",
-                        (SYNC_LOCK_ID,),
-                    )
-                advisory_connection.commit()
-            except Exception:
-                pass
-
-        if advisory_connection is not None:
-            try:
-                advisory_context.__exit__(None, None, None)
-            except Exception:
-                pass
-
-        if THREAD_LOCK.locked():
-            try:
-                THREAD_LOCK.release()
-            except RuntimeError:
-                pass
-
-
-def start_sync(*, reason: str) -> dict[str, Any]:
-    current = get_sync_state()
-    if current.get("status") == "running":
-        return {
-            "status": "busy",
-            "job": current,
-        }
-
-    if not THREAD_LOCK.acquire(blocking=False):
-        return {
-            "status": "busy",
-            "job": get_sync_state(),
-        }
-
-    job_id = uuid.uuid4().hex
-    _set_state(
-        status="queued",
-        job_id=job_id,
-        reason=reason,
-        started_at=None,
-        completed_at=None,
-        message="Fixture sync has been queued.",
-        error_type=None,
-        provider_http_status=None,
-        provider_message=None,
-    )
-    thread = threading.Thread(
-        target=_run_sync_job,
-        kwargs={
-            "job_id": job_id,
-            "reason": reason,
-        },
-        name=f"predict2-sync-{job_id[:8]}",
-        daemon=True,
-    )
-    thread.start()
+def meaningful_tokens(value: Any) -> set[str]:
     return {
-        "status": "accepted",
-        "job_id": job_id,
-        "job": get_sync_state(),
+        token
+        for token in normalize_text(value).split()
+        if len(token) >= 2 and token not in TEAM_STOPWORDS
     }
 
 
-def sync_if_stale_async() -> dict[str, Any]:
-    if not settings.football_data_enabled:
-        return {"status": "disabled"}
+def text_similarity(left: Any, right: Any) -> float:
+    a = normalize_text(left)
+    b = normalize_text(right)
+    if not a or not b:
+        return 0.0
 
-    last = None
-    try:
-        last = get_datetime(
-            "predict2_football_data_last_sync_at"
+    seq = SequenceMatcher(None, a, b).ratio()
+    a_tokens = meaningful_tokens(a)
+    b_tokens = meaningful_tokens(b)
+    union = a_tokens | b_tokens
+    overlap = (
+        len(a_tokens & b_tokens) / len(union)
+        if union else 0.0
+    )
+    containment = (
+        min(
+            len(a_tokens & b_tokens) / max(1, len(a_tokens)),
+            len(a_tokens & b_tokens) / max(1, len(b_tokens)),
         )
-    except Exception:
-        pass
+        if a_tokens and b_tokens else 0.0
+    )
+    return max(seq, overlap, containment)
 
-    now = _utc_now()
-    if (
-        last is not None
-        and (now - last).total_seconds()
-        < settings.football_data_sync_interval_seconds
-    ):
-        return {
-            "status": "fresh",
-            "last_sync_at": last.isoformat(),
+
+def team_supported(team_name: str, blob: str) -> bool:
+    team_tokens = meaningful_tokens(team_name)
+    blob_tokens = meaningful_tokens(blob)
+    if not team_tokens:
+        return False
+    required = 1 if len(team_tokens) == 1 else max(
+        1, len(team_tokens) - 1
+    )
+    return len(team_tokens & blob_tokens) >= required
+
+
+def fixture_supported(
+    home_team: str,
+    away_team: str,
+    blob: str,
+) -> bool:
+    return (
+        team_supported(home_team, blob)
+        and team_supported(away_team, blob)
+    )
+
+
+def date_support(
+    kickoff: datetime,
+    blob: str,
+    *,
+    tolerance_days: int = 1,
+) -> dict[str, Any]:
+    normalized_blob = normalize_text(blob)
+    for delta in range(-tolerance_days, tolerance_days + 1):
+        candidate = kickoff + timedelta(days=delta)
+        values = {
+            candidate.strftime("%Y-%m-%d"),
+            candidate.strftime("%d/%m/%Y"),
+            candidate.strftime("%d-%m-%Y"),
+            candidate.strftime("%d %B %Y"),
+            candidate.strftime("%B %d %Y"),
+            candidate.strftime("%d %b %Y"),
         }
+        if any(
+            normalize_text(value) in normalized_blob
+            for value in values
+        ):
+            return {
+                "supported": True,
+                "exact": delta == 0,
+                "day_delta": delta,
+            }
+    return {
+        "supported": False,
+        "exact": False,
+        "day_delta": None,
+    }
 
-    return start_sync(reason="stale_check")
+
+def domain_from_url(url: Any) -> str:
+    try:
+        host = urlparse(str(url or "")).hostname or ""
+    except ValueError:
+        return ""
+    host = host.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def official_like(
+    *,
+    url: str,
+    title: str,
+    content: str,
+    home_team: str,
+    away_team: str,
+) -> bool:
+    domain = domain_from_url(url)
+    if not domain or any(
+        domain == item or domain.endswith("." + item)
+        for item in AGGREGATOR_DOMAINS
+    ):
+        return False
+
+    blob = normalize_text(f"{title}\n{content}")
+    if "official" in blob:
+        return True
+
+    domain_text = normalize_text(domain)
+    home_tokens = sorted(
+        meaningful_tokens(home_team),
+        key=len,
+        reverse=True,
+    )
+    away_tokens = sorted(
+        meaningful_tokens(away_team),
+        key=len,
+        reverse=True,
+    )
+    return any(
+        len(token) >= 4 and token in domain_text
+        for token in [*home_tokens[:2], *away_tokens[:2]]
+    )
+
+
+def _clean_venue(value: str) -> str:
+    value = " ".join(value.split()).strip(" ,.;:|-–—")
+    value = re.sub(
+        r"\s+(?:capacity|attendance|referee|kickoff|weather)\b.*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return value.strip(" ,.;:|-–—")
+
+
+def extract_venue_phrases(blob: Any) -> list[str]:
+    text = str(blob or "")
+    patterns = [
+        re.compile(
+            r"(?:venue|stadium|ground|local)\s*[:\-–—]\s*"
+            r"([A-ZÀ-ÖØ-Ý0-9][^\n|;]{4,110})",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\bat\s+([A-ZÀ-ÖØ-Ý0-9][A-Za-zÀ-ÖØ-öø-ÿ0-9'’.\- ]{3,100}"
+            r"(?:Stadium|Arena|Ground|Stade|Stadion|Stadio|"
+            r"Estádio|Estadio|Campo|Parque|Sports Centre|Sports Center|"
+            r"Complexo Desportivo|Centro Desportivo))\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b((?:Stade|Stadion|Stadio|Estádio|Estadio|Campo|Parque|"
+            r"Complexo Desportivo|Centro Desportivo)\s+"
+            r"[A-ZÀ-ÖØ-Ý0-9][A-Za-zÀ-ÖØ-öø-ÿ0-9'’.\- ]{2,100})",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b([A-ZÀ-ÖØ-Ý0-9][A-Za-zÀ-ÖØ-öø-ÿ0-9'’.\- ]{2,90}\s+"
+            r"(?:Stadium|Arena|Ground|Sports Centre|Sports Center|"
+            r"Olympic Centre|Olympic Center))\b",
+            re.IGNORECASE,
+        ),
+    ]
+
+    blocked = (
+        "venue pending", "venue unknown", "venue not",
+        "stadium not", "to be confirmed", "tbd", "prediction",
+        "odds", "h2h", "match preview",
+    )
+    output: list[str] = []
+    seen: set[str] = set()
+
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            value = _clean_venue(match.group(1))
+            normalized = normalize_text(value)
+            if (
+                not normalized
+                or normalized in seen
+                or len(value) < 5
+                or len(value) > 120
+                or any(item in normalized for item in blocked)
+            ):
+                continue
+            if not any(
+                normalize_text(word) in normalized
+                for word in VENUE_WORDS
+            ):
+                continue
+            seen.add(normalized)
+            output.append(value)
+    return output[:20]
+
+
+def cluster_venue_phrases(
+    rows: list[dict[str, Any]],
+    *,
+    similarity_minimum: float,
+) -> list[dict[str, Any]]:
+    clusters: list[dict[str, Any]] = []
+
+    for row in rows:
+        phrase = str(row.get("venue_name") or "").strip()
+        domain = str(row.get("domain") or "").strip()
+        if not phrase or not domain:
+            continue
+
+        selected = None
+        for cluster in clusters:
+            if text_similarity(
+                phrase,
+                cluster["venue_name"],
+            ) >= similarity_minimum:
+                selected = cluster
+                break
+
+        if selected is None:
+            selected = {
+                "venue_name": phrase,
+                "aliases": [],
+                "domains": set(),
+                "official_domains": set(),
+                "sources": [],
+            }
+            clusters.append(selected)
+
+        if len(phrase) > len(selected["venue_name"]):
+            selected["venue_name"] = phrase
+        if phrase not in selected["aliases"]:
+            selected["aliases"].append(phrase)
+        selected["domains"].add(domain)
+        if row.get("official_like"):
+            selected["official_domains"].add(domain)
+        selected["sources"].append(row)
+
+    safe: list[dict[str, Any]] = []
+    for cluster in clusters:
+        safe.append({
+            "venue_name": cluster["venue_name"],
+            "aliases": cluster["aliases"],
+            "distinct_domains": sorted(cluster["domains"]),
+            "official_domains": sorted(
+                cluster["official_domains"]
+            ),
+            "sources": cluster["sources"],
+        })
+
+    safe.sort(
+        key=lambda item: (
+            len(item["official_domains"]),
+            len(item["distinct_domains"]),
+            len(item["sources"]),
+        ),
+        reverse=True,
+    )
+    return safe

@@ -1,178 +1,51 @@
 from __future__ import annotations
 
-import threading
-import time
-from dataclasses import dataclass
-from datetime import date
+from datetime import datetime
 from typing import Any
 
-import requests
-
-from .config import settings
+from .db import connect
 
 
-class FootballDataError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int | None = None,
-        provider_message: str | None = None,
-        retry_after_seconds: int | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.provider_message = provider_message
-        self.retry_after_seconds = retry_after_seconds
-
-
-@dataclass(frozen=True)
-class FootballDataResponse:
-    matches: list[dict[str, Any]]
-    result_set: dict[str, Any]
-    filters: dict[str, Any]
-    response_headers: dict[str, str]
-
-
-class FootballDataClient:
-    def __init__(self) -> None:
-        self.base_url = settings.football_data_base_url
-        self.timeout = settings.football_data_timeout_seconds
-        self.token = settings.football_data_api_key
-        self._request_lock = threading.Lock()
-        self._last_request_monotonic = 0.0
-
-    def _headers(self) -> dict[str, str]:
-        if not self.token:
-            raise FootballDataError(
-                "FOOTBALL_DATA_API_KEY is not configured."
+def get(key: str) -> str | None:
+    with connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT metadata_value
+                FROM predict2_metadata
+                WHERE metadata_key = %s
+                """,
+                (key,),
             )
-        return {
-            "X-Auth-Token": self.token,
-            "Accept": "application/json",
-            "User-Agent": (
-                f"VedAstro-Private-Predictor/{settings.version}"
-            ),
-        }
+            row = cursor.fetchone()
+    return str(row[0]) if row else None
 
-    @staticmethod
-    def _provider_message(payload: Any) -> str | None:
-        if not isinstance(payload, dict):
-            return None
-        value = (
-            payload.get("message")
-            or payload.get("error")
-            or payload.get("errorCode")
-        )
-        text = str(value or "").strip()
-        return text or None
 
-    def _wait_for_request_slot(self) -> None:
-        elapsed = time.monotonic() - self._last_request_monotonic
-        delay = (
-            settings.football_data_min_interval_seconds - elapsed
-        )
-        if delay > 0:
-            time.sleep(delay)
-
-    def matches(
-        self,
-        *,
-        date_from: date,
-        date_to: date,
-    ) -> FootballDataResponse:
-        if not settings.football_data_enabled:
-            raise FootballDataError(
-                "Football-data.org integration is disabled."
-            )
-        if date_to < date_from:
-            raise FootballDataError(
-                "The football-data.org date window is invalid."
-            )
-
-        with self._request_lock:
-            self._wait_for_request_slot()
-            try:
-                response = requests.get(
-                    f"{self.base_url}/matches",
-                    headers=self._headers(),
-                    params={
-                        "dateFrom": date_from.isoformat(),
-                        "dateTo": date_to.isoformat(),
-                    },
-                    timeout=self.timeout,
+def set_value(key: str, value: Any) -> None:
+    text = str(value)
+    with connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO predict2_metadata (
+                    metadata_key, metadata_value, updated_at
                 )
-            except requests.RequestException as exc:
-                self._last_request_monotonic = time.monotonic()
-                raise FootballDataError(
-                    "Football-data.org network request failed.",
-                    provider_message=type(exc).__name__,
-                ) from exc
-            self._last_request_monotonic = time.monotonic()
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise FootballDataError(
-                "Football-data.org returned invalid JSON.",
-                status_code=response.status_code,
-            ) from exc
-
-        if response.status_code != 200:
-            retry_after = response.headers.get("Retry-After")
-            retry_seconds = None
-            if retry_after:
-                try:
-                    retry_seconds = int(retry_after)
-                except ValueError:
-                    retry_seconds = None
-            raise FootballDataError(
-                "Football-data.org rejected the request.",
-                status_code=response.status_code,
-                provider_message=self._provider_message(payload),
-                retry_after_seconds=retry_seconds,
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (metadata_key)
+                DO UPDATE SET
+                    metadata_value = EXCLUDED.metadata_value,
+                    updated_at = NOW()
+                """,
+                (key, text),
             )
-
-        rows = payload.get("matches")
-        if not isinstance(rows, list):
-            rows = []
-
-        return FootballDataResponse(
-            matches=[
-                row for row in rows if isinstance(row, dict)
-            ],
-            result_set=(
-                payload.get("resultSet")
-                if isinstance(payload.get("resultSet"), dict)
-                else {}
-            ),
-            filters=(
-                payload.get("filters")
-                if isinstance(payload.get("filters"), dict)
-                else {}
-            ),
-            response_headers={
-                key: value
-                for key, value in response.headers.items()
-                if key.lower().startswith("x-request")
-            },
-        )
-
-    def health(self) -> dict[str, Any]:
-        from datetime import datetime, timezone
-
-        today = datetime.now(timezone.utc).date()
-        response = self.matches(
-            date_from=today,
-            date_to=today,
-        )
-        return {
-            "status": "ok",
-            "connected": True,
-            "matches_returned": len(response.matches),
-            "result_set": response.result_set,
-            "request_headers": response.response_headers,
-        }
+        connection.commit()
 
 
-client = FootballDataClient()
+def get_datetime(key: str) -> datetime | None:
+    raw = get(key)
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None

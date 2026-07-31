@@ -1,454 +1,396 @@
 from __future__ import annotations
 
-import json
-from datetime import datetime, timezone
-from typing import Any, Callable
+import math
+import re
+from datetime import datetime
+from typing import Any
+
+import requests
 
 from .config import settings
-from .db import connect
-from .geocoding import geocode_venue
-from .tavily import TavilyError, client as tavily_client
+from .football_data import FootballDataError, client as football_client
+from .text_utils import domain_from_url, normalize_text, team_supported
 
 
-def get_fixture(fixture_id: int) -> dict[str, Any] | None:
-    with connect(dict_rows=True) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                    id,
-                    provider,
-                    provider_fixture_id,
-                    competition_name,
-                    competition_country,
-                    home_team,
-                    away_team,
-                    kickoff_utc,
-                    venue_name,
-                    venue_city,
-                    latitude,
-                    longitude,
-                    timezone_name,
-                    location_source,
-                    location_confidence,
-                    location_verified_at
-                FROM fixtures
-                WHERE id = %s
-                  AND sport = 'soccer'
-                  AND provider = 'football-data.org'
-                """,
-                (fixture_id,),
-            )
-            row = cursor.fetchone()
-    return dict(row) if row else None
+_ODDS = re.compile(r"(?<!\d)(1\.\d{1,2}|[2-9]\.\d{1,2})(?!\d)")
+_DRAW_WORDS = ("draw", "tie", "x")
+_HOME_WORDS = ("home win", "1", "hosts")
+_AWAY_WORDS = ("away win", "2", "visitors")
 
 
-def fixtures_needing_venue(
-    *,
-    window_days: int,
-    limit: int,
-) -> list[dict[str, Any]]:
-    with connect(dict_rows=True) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                    f.id,
-                    f.provider,
-                    f.provider_fixture_id,
-                    f.competition_name,
-                    f.competition_country,
-                    f.home_team,
-                    f.away_team,
-                    f.kickoff_utc,
-                    f.venue_name,
-                    f.venue_city,
-                    f.latitude,
-                    f.longitude,
-                    f.timezone_name,
-                    latest.status AS latest_attempt_status,
-                    latest.completed_at AS latest_attempt_at
-                FROM fixtures f
-                LEFT JOIN LATERAL (
-                    SELECT status, completed_at
-                    FROM predict2_venue_attempts
-                    WHERE fixture_id = f.id
-                    ORDER BY id DESC
-                    LIMIT 1
-                ) latest ON TRUE
-                WHERE f.sport = 'soccer'
-                  AND f.provider = 'football-data.org'
-                  AND f.kickoff_utc > NOW()
-                  AND f.kickoff_utc <= (
-                      NOW() + (%s * INTERVAL '1 day')
-                  )
-                  AND (
-                      f.latitude IS NULL
-                      OR f.longitude IS NULL
-                      OR f.timezone_name IS NULL
-                      OR f.location_verified_at IS NULL
-                  )
-                  AND (
-                      latest.completed_at IS NULL
-                      OR latest.completed_at < (
-                          NOW() - (%s * INTERVAL '1 hour')
-                      )
-                  )
-                ORDER BY
-                    CASE WHEN f.venue_name IS NOT NULL THEN 0 ELSE 1 END,
-                    f.kickoff_utc ASC
-                LIMIT %s
-                """,
-                (window_days, settings.venue_enrichment_retry_hours, limit),
-            )
-            rows = cursor.fetchall()
-    return [dict(row) for row in rows]
-
-
-def _insert_attempt(
-    *,
-    job_id: str,
-    fixture_id: int,
-) -> int:
-    with connect() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO predict2_venue_attempts (
-                    job_id,
-                    fixture_id,
-                    status,
-                    stage,
-                    audit_json,
-                    started_at
-                )
-                VALUES (%s, %s, 'running', 'start', '{}'::jsonb, NOW())
-                RETURNING id
-                """,
-                (job_id, fixture_id),
-            )
-            attempt_id = int(cursor.fetchone()[0])
-        connection.commit()
-    return attempt_id
-
-
-def _finish_attempt(
-    *,
-    attempt_id: int,
-    status: str,
-    stage: str,
-    audit: dict[str, Any],
-    venue_name: str | None = None,
-    venue_city: str | None = None,
-    country: str | None = None,
-    latitude: float | None = None,
-    longitude: float | None = None,
-    timezone_name: str | None = None,
-    confidence: float | None = None,
-    source: str | None = None,
-) -> None:
-    with connect() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE predict2_venue_attempts
-                SET
-                    status = %s,
-                    stage = %s,
-                    venue_name = %s,
-                    venue_city = %s,
-                    country = %s,
-                    latitude = %s,
-                    longitude = %s,
-                    timezone_name = %s,
-                    confidence = %s,
-                    source = %s,
-                    audit_json = %s::jsonb,
-                    completed_at = NOW()
-                WHERE id = %s
-                """,
-                (
-                    status,
-                    stage,
-                    venue_name,
-                    venue_city,
-                    country,
-                    latitude,
-                    longitude,
-                    timezone_name,
-                    confidence,
-                    source,
-                    json.dumps(
-                        audit,
-                        ensure_ascii=False,
-                        default=str,
-                    ),
-                    attempt_id,
-                ),
-            )
-        connection.commit()
-
-
-def _commit_location(
-    *,
-    fixture_id: int,
-    venue_name: str,
-    selected: dict[str, Any],
-    source: str,
-) -> bool:
-    with connect() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE fixtures
-                SET
-                    venue_name = %s,
-                    venue_city = %s,
-                    competition_country = COALESCE(
-                        %s,
-                        competition_country
-                    ),
-                    latitude = %s,
-                    longitude = %s,
-                    timezone_name = %s,
-                    location_source = %s,
-                    location_confidence = %s,
-                    location_verified_at = NOW(),
-                    updated_at = NOW()
-                WHERE id = %s
-                  AND kickoff_utc > NOW()
-                """,
-                (
-                    venue_name,
-                    selected.get("venue_city"),
-                    selected.get("country"),
-                    selected.get("latitude"),
-                    selected.get("longitude"),
-                    selected.get("timezone_name"),
-                    source,
-                    selected.get("confidence"),
-                    fixture_id,
-                ),
-            )
-            updated = int(cursor.rowcount or 0)
-        connection.commit()
-    return updated == 1
-
-
-def resolve_fixture(
-    *,
-    job_id: str,
-    fixture: dict[str, Any],
-    progress: Callable[[str, str], None] | None = None,
-) -> dict[str, Any]:
-    if progress:
-        progress(
-            "attempt_record",
-            "Creating the immutable venue-attempt audit.",
-        )
-    attempt_id = _insert_attempt(
-        job_id=job_id,
-        fixture_id=int(fixture["id"]),
-    )
-    audit: dict[str, Any] = {
-        "fixture": {
-            key: (
-                value.isoformat()
-                if isinstance(value, datetime)
-                else value
-            )
-            for key, value in fixture.items()
+def _tavily_search(query: str) -> dict[str, Any]:
+    if not settings.tavily_api_key or not settings.tavily_enabled:
+        return {
+            "status": "unavailable",
+            "results": [],
+            "reason": "tavily_not_configured",
         }
-    }
-
-    kickoff = fixture["kickoff_utc"]
-    if kickoff <= datetime.now(timezone.utc):
-        result = {
-            "status": "skipped",
-            "stage": "post_kickoff",
-            "fixture_id": fixture["id"],
-        }
-        _finish_attempt(
-            attempt_id=attempt_id,
-            status="skipped",
-            stage="post_kickoff",
-            audit={**audit, "result": result},
-        )
-        return result
-
-    venue_name = str(
-        fixture.get("venue_name") or ""
-    ).strip()
-    venue_city = str(
-        fixture.get("venue_city") or ""
-    ).strip()
-    country = str(
-        fixture.get("competition_country") or ""
-    ).strip()
-    identity_source = "football-data.org exact fixture venue"
-    tavily_result = None
-
-    if venue_name:
-        geocode = geocode_venue(
-            venue_name=venue_name,
-            city=venue_city,
-            country=country,
-            progress=progress,
-        )
-        audit["provider_venue_geocode"] = geocode
-        if geocode.get("verified") is True:
-            selected = geocode["selected"]
-            source = (
-                f"{identity_source}+"
-                f"{selected.get('provider')}+timezonefinder"
-            )
-            if progress:
-                progress(
-                    "commit_location",
-                    "Saving the verified coordinates and timezone.",
-                )
-            committed = _commit_location(
-                fixture_id=int(fixture["id"]),
-                venue_name=venue_name,
-                selected=selected,
-                source=source,
-            )
-            status = "verified" if committed else "not_committed"
-            result = {
-                "status": status,
-                "stage": "provider_venue_geocode",
-                "fixture_id": fixture["id"],
-                "venue_name": venue_name,
-                "selected": selected,
-                "source": source,
-            }
-            _finish_attempt(
-                attempt_id=attempt_id,
-                status=status,
-                stage="provider_venue_geocode",
-                audit={**audit, "result": result},
-                venue_name=venue_name,
-                venue_city=selected.get("venue_city"),
-                country=selected.get("country"),
-                latitude=selected.get("latitude"),
-                longitude=selected.get("longitude"),
-                timezone_name=selected.get("timezone_name"),
-                confidence=selected.get("confidence"),
-                source=source,
-            )
-            return result
-
     try:
-        if progress:
-            progress(
-                "venue_identity",
-                "The provider venue needs independent verification.",
-            )
-        tavily_result = tavily_client.resolve_fixture_venue(
-            fixture,
-            provider_venue=venue_name or None,
-            progress=progress,
+        response = requests.post(
+            f"{settings.tavily_base_url}/search",
+            headers={
+                "Authorization": f"Bearer {settings.tavily_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "query": query,
+                "topic": "general",
+                "search_depth": settings.tavily_search_depth,
+                "max_results": settings.prediction_evidence_max_results,
+                "include_answer": "basic",
+                "include_images": False,
+            },
+            timeout=(5, settings.prediction_tavily_timeout_seconds),
         )
-    except TavilyError as exc:
-        tavily_result = {
-            "status": "provider_error",
-            "verified": False,
+    except requests.RequestException as exc:
+        return {
+            "status": "transport_error",
+            "results": [],
             "error_type": type(exc).__name__,
-            "message": str(exc),
-            "http_status": exc.status_code,
-            "provider_message": exc.provider_message,
         }
-    audit["tavily"] = tavily_result
-
-    if not tavily_result.get("verified"):
-        result = {
-            "status": "unresolved",
-            "stage": "venue_identity",
-            "fixture_id": fixture["id"],
-            "reason": tavily_result.get("status"),
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    if response.status_code != 200:
+        return {
+            "status": "http_error",
+            "http_status": response.status_code,
+            "results": [],
+            "provider_message": (
+                payload.get("detail")
+                if isinstance(payload, dict)
+                else None
+            ),
         }
-        _finish_attempt(
-            attempt_id=attempt_id,
-            status="unresolved",
-            stage="venue_identity",
-            audit={**audit, "result": result},
-            venue_name=venue_name or None,
-            source="tavily",
-        )
-        return result
-
-    selected_identity = tavily_result["selected"]
-    resolved_venue = str(
-        selected_identity.get("venue_name") or venue_name
-    ).strip()
-    geocode = geocode_venue(
-        venue_name=resolved_venue,
-        city=venue_city,
-        country=country,
-        progress=progress,
-    )
-    audit["verified_venue_geocode"] = geocode
-
-    if not geocode.get("verified"):
-        result = {
-            "status": "unresolved",
-            "stage": "geocoding",
-            "fixture_id": fixture["id"],
-            "venue_name": resolved_venue,
-            "reason": geocode.get("status"),
-        }
-        _finish_attempt(
-            attempt_id=attempt_id,
-            status="unresolved",
-            stage="geocoding",
-            audit={**audit, "result": result},
-            venue_name=resolved_venue,
-            source="tavily+geocoder",
-        )
-        return result
-
-    selected = geocode["selected"]
-    identity_source = (
-        "football-data.org+tavily confirmation"
-        if venue_name
-        else "tavily fixture-page consensus"
-    )
-    source = (
-        f"{identity_source}+"
-        f"{selected.get('provider')}+timezonefinder"
-    )
-    if progress:
-        progress(
-            "commit_location",
-            "Saving the web-verified coordinates and timezone.",
-        )
-    committed = _commit_location(
-        fixture_id=int(fixture["id"]),
-        venue_name=resolved_venue,
-        selected=selected,
-        source=source,
-    )
-    status = "verified" if committed else "not_committed"
-    result = {
-        "status": status,
-        "stage": "web_verified_geocode",
-        "fixture_id": fixture["id"],
-        "venue_name": resolved_venue,
-        "selected": selected,
-        "source": source,
+    return {
+        "status": "ok",
+        "answer": payload.get("answer"),
+        "results": (
+            payload.get("results")
+            if isinstance(payload.get("results"), list)
+            else []
+        ),
+        "request_id": payload.get("request_id"),
     }
-    _finish_attempt(
-        attempt_id=attempt_id,
-        status=status,
-        stage="web_verified_geocode",
-        audit={**audit, "result": result},
-        venue_name=resolved_venue,
-        venue_city=selected.get("venue_city"),
-        country=selected.get("country"),
-        latitude=selected.get("latitude"),
-        longitude=selected.get("longitude"),
-        timezone_name=selected.get("timezone_name"),
-        confidence=selected.get("confidence"),
-        source=source,
+
+
+def _find_team_odd(blob: str, team_name: str) -> list[float]:
+    normalized = normalize_text(blob)
+    tokens = [
+        token for token in normalize_text(team_name).split()
+        if len(token) >= 3
+    ]
+    if not tokens:
+        return []
+    matches: list[float] = []
+    for match in _ODDS.finditer(blob):
+        left = normalize_text(blob[max(0, match.start()-90):match.start()])
+        right = normalize_text(blob[match.end():match.end()+90])
+        neighbourhood = left + " " + right
+        if any(token in neighbourhood for token in tokens):
+            value = float(match.group(1))
+            if 1.01 <= value <= 20:
+                matches.append(value)
+    return matches
+
+
+def _find_draw_odds(blob: str) -> list[float]:
+    values: list[float] = []
+    lowered = normalize_text(blob)
+    for match in _ODDS.finditer(blob):
+        neighbourhood = normalize_text(
+            blob[max(0, match.start()-70):match.end()+70]
+        )
+        if any(word in neighbourhood for word in _DRAW_WORDS):
+            value = float(match.group(1))
+            if 1.01 <= value <= 20:
+                values.append(value)
+    return values
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def market_consensus(fixture: dict[str, Any]) -> dict[str, Any]:
+    home = fixture["home_team"]
+    away = fixture["away_team"]
+    kickoff = fixture["kickoff_utc"]
+    date_text = (
+        kickoff.date().isoformat()
+        if isinstance(kickoff, datetime)
+        else str(kickoff)[:10]
     )
-    return result
+    query = (
+        f'"{home}" vs "{away}" {date_text} '
+        "1X2 decimal odds bookmaker home draw away"
+    )
+    search = _tavily_search(query)
+    home_by_domain: dict[str, list[float]] = {}
+    away_by_domain: dict[str, list[float]] = {}
+    draw_by_domain: dict[str, list[float]] = {}
+    sources: list[dict[str, Any]] = []
+
+    for row in search.get("results", []):
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title") or "")
+        content = str(row.get("content") or "")
+        url = str(row.get("url") or "")
+        blob = f"{title}\n{content}"
+        if not (
+            team_supported(home, blob)
+            and team_supported(away, blob)
+        ):
+            continue
+        domain = domain_from_url(url)
+        if not domain:
+            continue
+        h = _find_team_odd(blob, home)
+        a = _find_team_odd(blob, away)
+        d = _find_draw_odds(blob)
+        if h:
+            home_by_domain.setdefault(domain, []).extend(h)
+        if a:
+            away_by_domain.setdefault(domain, []).extend(a)
+        if d:
+            draw_by_domain.setdefault(domain, []).extend(d)
+        sources.append({
+            "title": title[:250],
+            "url": url[:1000],
+            "domain": domain,
+            "home_odds": h,
+            "draw_odds": d,
+            "away_odds": a,
+        })
+
+    home_values = [
+        _median(values) for values in home_by_domain.values()
+        if _median(values) is not None
+    ]
+    away_values = [
+        _median(values) for values in away_by_domain.values()
+        if _median(values) is not None
+    ]
+    draw_values = [
+        _median(values) for values in draw_by_domain.values()
+        if _median(values) is not None
+    ]
+    home_median = _median([v for v in home_values if v])
+    away_median = _median([v for v in away_values if v])
+    draw_median = _median([v for v in draw_values if v])
+
+    distinct = len(
+        set(home_by_domain) | set(away_by_domain) | set(draw_by_domain)
+    )
+    verified = bool(
+        home_median
+        and away_median
+        and distinct >= settings.prediction_market_min_domains
+    )
+
+    favourite_side = None
+    favourite_team = None
+    near_pickem = False
+    if verified:
+        if abs(home_median - away_median) <= 0.08:
+            near_pickem = True
+        elif home_median < away_median:
+            favourite_side = "home"
+            favourite_team = home
+        else:
+            favourite_side = "away"
+            favourite_team = away
+
+    return {
+        "status": "verified" if verified else "unverified",
+        "query": query,
+        "distinct_domains": distinct,
+        "required_domains": settings.prediction_market_min_domains,
+        "home_median_odds": home_median,
+        "draw_median_odds": draw_median,
+        "away_median_odds": away_median,
+        "favourite_side": favourite_side,
+        "favourite_team": favourite_team,
+        "near_pickem": near_pickem,
+        "sources": sources,
+        "search_status": search.get("status"),
+        "search_answer": search.get("answer"),
+    }
+
+
+def _competition_code(raw: dict[str, Any]) -> str:
+    competition = raw.get("competition")
+    if isinstance(competition, dict):
+        return str(
+            competition.get("code")
+            or competition.get("id")
+            or ""
+        ).strip()
+    return ""
+
+
+def _team_id(raw: dict[str, Any], side: str) -> int | None:
+    team = raw.get(f"{side}Team")
+    if not isinstance(team, dict):
+        return None
+    value = team.get("id")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _standing_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    standings = payload.get("standings")
+    if not isinstance(standings, list):
+        return []
+    preferred = None
+    for item in standings:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "").upper() == "TOTAL":
+            preferred = item
+            break
+    preferred = preferred or next(
+        (item for item in standings if isinstance(item, dict)),
+        {},
+    )
+    table = preferred.get("table") if isinstance(preferred, dict) else []
+    return [row for row in table if isinstance(row, dict)] if isinstance(table, list) else []
+
+
+def performance_snapshot(fixture: dict[str, Any]) -> dict[str, Any]:
+    raw = fixture.get("raw_fixture_json")
+    raw = raw if isinstance(raw, dict) else {}
+    code = _competition_code(raw)
+    home_id = _team_id(raw, "home")
+    away_id = _team_id(raw, "away")
+    standings_payload = {}
+    provider_status = "unavailable"
+    if code:
+        try:
+            standings_payload = football_client.standings(code)
+            provider_status = "ok"
+        except FootballDataError as exc:
+            provider_status = f"error:{exc.status_code or 'transport'}"
+
+    rows = _standing_rows(standings_payload)
+    by_id: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        team = row.get("team")
+        if not isinstance(team, dict):
+            continue
+        try:
+            by_id[int(team.get("id"))] = row
+        except (TypeError, ValueError):
+            continue
+
+    home_row = by_id.get(home_id or -1)
+    away_row = by_id.get(away_id or -1)
+
+    def metrics(row: dict[str, Any] | None) -> dict[str, float | int | None]:
+        if not row:
+            return {
+                "position": None,
+                "played": 0,
+                "points": 0,
+                "ppg": None,
+                "goal_difference": 0,
+                "draw_rate": None,
+            }
+        played = int(row.get("playedGames") or 0)
+        points = int(row.get("points") or 0)
+        draws = int(row.get("draw") or 0)
+        return {
+            "position": row.get("position"),
+            "played": played,
+            "points": points,
+            "ppg": round(points / played, 4) if played else None,
+            "goal_difference": int(row.get("goalDifference") or 0),
+            "draw_rate": round(draws / played, 4) if played else None,
+        }
+
+    home = metrics(home_row)
+    away = metrics(away_row)
+    home_ppg = home["ppg"]
+    away_ppg = away["ppg"]
+
+    if home_ppg is None or away_ppg is None:
+        # Search-based preview fallback. It is used as current evidence only,
+        # not as a market assignment.
+        kickoff = fixture["kickoff_utc"]
+        date_text = (
+            kickoff.date().isoformat()
+            if isinstance(kickoff, datetime)
+            else str(kickoff)[:10]
+        )
+        query = (
+            f'"{fixture["home_team"]}" vs "{fixture["away_team"]}" '
+            f"{date_text} form injuries preview prediction"
+        )
+        search = _tavily_search(query)
+        answer = normalize_text(search.get("answer"))
+        home_mentions = sum(
+            answer.count(token)
+            for token in normalize_text(fixture["home_team"]).split()
+            if len(token) >= 4
+        )
+        away_mentions = sum(
+            answer.count(token)
+            for token in normalize_text(fixture["away_team"]).split()
+            if len(token) >= 4
+        )
+        score_home = settings.prediction_home_advantage
+        score_away = 0.0
+        if home_mentions > away_mentions:
+            score_home += 0.08
+        elif away_mentions > home_mentions:
+            score_away += 0.08
+        draw_score = 0.12 if "draw" in answer else 0.0
+        source = "tavily_preview_fallback"
+        evidence_complete = bool(search.get("results"))
+    else:
+        score_home = float(home_ppg) + settings.prediction_home_advantage
+        score_away = float(away_ppg)
+        average_draw_rate = (
+            float(home["draw_rate"] or 0)
+            + float(away["draw_rate"] or 0)
+        ) / 2
+        draw_score = average_draw_rate
+        source = "football-data.org_standings"
+        evidence_complete = True
+
+    margin = score_home - score_away
+    close = abs(margin) <= settings.prediction_draw_margin
+    high_draw = draw_score >= 0.28
+
+    if close and high_draw:
+        baseline = "draw"
+    elif margin >= 0:
+        baseline = "home"
+    else:
+        baseline = "away"
+
+    return {
+        "status": "complete" if evidence_complete else "limited",
+        "source": source,
+        "provider_status": provider_status,
+        "competition_code": code or None,
+        "home": home,
+        "away": away,
+        "home_score": round(score_home, 4),
+        "away_score": round(score_away, 4),
+        "draw_score": round(draw_score, 4),
+        "score_margin": round(margin, 4),
+        "close_match": close,
+        "high_draw_evidence": high_draw,
+        "baseline_outcome": baseline,
+    }
