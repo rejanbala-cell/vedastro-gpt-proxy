@@ -51,7 +51,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "3.0.0-final-chart-core"
+PROXY_VERSION = "3.0.2-chart-validation-fix"
 
 
 # ============================================================
@@ -2174,6 +2174,7 @@ def extract_nakshatra_name(result: dict[str, Any]) -> str | None:
         "uttara phalguni": "Uttara Phalguni",
         "hasta": "Hasta",
         "chitra": "Chitra",
+        "chitta": "Chitra",
         "swati": "Swati",
         "swathi": "Swati",
         "vishakha": "Vishakha",
@@ -15536,6 +15537,22 @@ def calculate_stationary_audit(
         for row in station_rows
         if row.get("same_local_calendar_date")
     ]
+    # In practical_verified mode, a same-date station is a hard veto only
+    # for the requested/classical decision planets. A standalone outer-body
+    # station (for example Chiron) remains a LOW-confidence warning unless
+    # another returned decision-grade rule independently makes it active.
+    # strict_book remains conservative and still treats every same-date
+    # station in the Swiss search as a hard veto.
+    same_date_practical_planets = [
+        name
+        for name in same_date_planets
+        if name in PLANETS
+    ]
+    same_date_outer_body_planets = [
+        name
+        for name in same_date_planets
+        if name in OUTER_BODY_ORDER
+    ]
     seven_day_planets = [
         row["body"]
         for row in station_rows
@@ -15554,7 +15571,10 @@ def calculate_stationary_audit(
         ),
     )
     practical_hard_veto_planets = sorted(
-        set(practical_label_vetoes + same_date_planets),
+        set(
+            practical_label_vetoes
+            + same_date_practical_planets
+        ),
         key=lambda name: (
             PLANET_ORDER.get(
                 name,
@@ -15611,6 +15631,12 @@ def calculate_stationary_audit(
         "vedastro_motion_labels": source_labels,
         "swiss_station_search": station_rows,
         "same_local_date_station_planets": same_date_planets,
+        "practical_same_local_date_station_planets": (
+            same_date_practical_planets
+        ),
+        "outer_body_same_date_warning_planets": (
+            same_date_outer_body_planets
+        ),
         "strict_book_hard_veto_planets": strict_hard_veto_planets,
         "practical_hard_veto_planets": practical_hard_veto_planets,
         "practical_warning_planets": practical_warning_planets,
@@ -15636,9 +15662,11 @@ def calculate_stationary_audit(
             "strict_book treats an upstream Vikala label as a hard veto."
             if RELIABILITY_POLICY_MODE == "strict_book"
             else (
-                "practical_verified keeps same-local-date or explicit "
-                "Kutila/stationary conditions as hard vetoes; a non-same-date "
-                "Vikala/near-station condition is a LOW-confidence warning."
+                "practical_verified keeps same-local-date stations of "
+                "requested/classical decision planets and explicit "
+                "Kutila/stationary labels as hard vetoes; standalone outer-"
+                "body stations and non-same-date Vikala/near-station "
+                "conditions are LOW-confidence warnings."
             )
         ),
         "one_to_seven_day_window_note": (
