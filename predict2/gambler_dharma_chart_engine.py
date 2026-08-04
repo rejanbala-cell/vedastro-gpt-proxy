@@ -51,7 +51,7 @@ from vedastro import (
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "3.0.2-chart-validation-fix"
+PROXY_VERSION = "3.1.0-draw-audit-fix"
 
 
 # ============================================================
@@ -22318,12 +22318,10 @@ def _build_market_consensus(
 
     home_probability = consensus_probability["home"]
     away_probability = consensus_probability["away"]
-    if math.isclose(
-        home_probability,
-        away_probability,
-        rel_tol=0.0,
-        abs_tol=1e-12,
-    ):
+    # A real betting market rarely produces mathematically identical
+    # home/away probabilities. Treat a gap of 2.5 percentage points or less
+    # as a practical pick'em, so House 1 is not assigned arbitrarily.
+    if abs(home_probability - away_probability) <= 0.025:
         team_favourite = "PICKEM"
         team_favourite_name = None
     elif home_probability > away_probability:
@@ -23899,6 +23897,18 @@ def _predict1_performance_audit(
     market: dict[str, Any],
     performance: dict[str, Any],
 ) -> dict[str, Any]:
+    """Deterministic football 1X2 draw audit.
+
+    Draw is evaluated independently before the team-favourite baseline.
+    Thresholds intentionally match the Custom GPT policy:
+      * no-margin draw probability >= 24%
+      * home/away gap <= 15 percentage points OR draw within 7 points of
+        the leading team outcome
+      * at least two independent draw-evidence families
+
+    Correlated measures are grouped into one family so low goals plus low xG,
+    or PPG plus xG parity, cannot be double-counted.
+    """
     probabilities = market.get("consensus_no_margin_probability")
     probabilities = probabilities if isinstance(probabilities, dict) else {}
     home_probability = _predict1_safe_number(probabilities.get("home"))
@@ -23916,6 +23926,7 @@ def _predict1_performance_audit(
     away_ppg = _predict1_safe_number(away.get("points_per_game"))
     home_gd = _predict1_safe_number(home.get("goal_difference_average"))
     away_gd = _predict1_safe_number(away.get("goal_difference_average"))
+
     combined_draw_rate = _predict1_safe_number(
         draw.get("combined_recent_draw_rate")
     )
@@ -23924,26 +23935,145 @@ def _predict1_performance_audit(
     combined_goals = _predict1_safe_number(
         draw.get("combined_average_total_goals")
     )
-    ppg_gap = _predict1_safe_number(draw.get("points_per_game_gap"))
-
-    parity = bool(
-        home_probability is not None
-        and away_probability is not None
-        and abs(home_probability - away_probability) <= 0.18
+    combined_xg = _predict1_safe_number(
+        draw.get("combined_expected_goals")
+        if draw.get("combined_expected_goals") is not None
+        else draw.get("combined_xg_total")
     )
-    draw_signals: list[str] = []
-    if draw_probability is not None and draw_probability >= 0.26:
-        draw_signals.append("market_draw_probability")
-    if parity:
-        draw_signals.append("market_team_parity")
+    ppg_gap = _predict1_safe_number(draw.get("points_per_game_gap"))
+    xg_gap = _predict1_safe_number(draw.get("expected_goals_gap"))
+    xga_gap = _predict1_safe_number(draw.get("expected_goals_against_gap"))
+
+    strong_defence_goalkeeping = bool(
+        draw.get("strong_defence_or_goalkeeping")
+        or draw.get("strong_defence_goalkeeping")
+    )
+    attacking_absences = bool(draw.get("attacking_absences"))
+    rotation_or_fatigue = bool(
+        draw.get("rotation_or_fatigue")
+        or draw.get("rotation_fatigue")
+    )
+
+    home_away_gap = (
+        abs(home_probability - away_probability)
+        if home_probability is not None and away_probability is not None
+        else None
+    )
+    team_leader_probability = (
+        max(home_probability, away_probability)
+        if home_probability is not None and away_probability is not None
+        else None
+    )
+    draw_to_team_leader_gap = (
+        team_leader_probability - draw_probability
+        if team_leader_probability is not None and draw_probability is not None
+        else None
+    )
+    draw_is_market_leader = bool(
+        market.get("draw_is_market_leader")
+        or (
+            draw_probability is not None
+            and home_probability is not None
+            and away_probability is not None
+            and draw_probability >= max(home_probability, away_probability)
+        )
+    )
+
+    probability_gate = bool(
+        draw_probability is not None and draw_probability >= 0.24
+    )
+    parity_gate = bool(
+        home_away_gap is not None and home_away_gap <= 0.15
+    )
+    near_leader_gate = bool(
+        draw_to_team_leader_gap is not None
+        and draw_to_team_leader_gap <= 0.07
+    )
+
+    # One testimony per independent family.
+    draw_signal_families: dict[str, list[str]] = {}
+
     if combined_draw_rate is not None and combined_draw_rate >= 0.28:
-        draw_signals.append("recent_draw_rate")
+        draw_signal_families["recent_draw_rate"] = [
+            "combined_recent_draw_rate"
+        ]
+
     if h2h_sample >= 3 and h2h_draw_rate is not None and h2h_draw_rate >= 0.30:
-        draw_signals.append("head_to_head_draw_rate")
+        draw_signal_families["head_to_head_draw_rate"] = [
+            "h2h_draw_rate"
+        ]
+
+    low_scoring_sources: list[str] = []
     if combined_goals is not None and combined_goals <= 2.50:
-        draw_signals.append("low_recent_goal_environment")
+        low_scoring_sources.append("combined_average_total_goals")
+    if combined_xg is not None and combined_xg <= 2.50:
+        low_scoring_sources.append("combined_expected_goals")
+    if low_scoring_sources:
+        draw_signal_families["low_scoring_environment"] = low_scoring_sources
+
+    parity_sources: list[str] = []
     if ppg_gap is not None and ppg_gap <= 0.35:
-        draw_signals.append("performance_parity")
+        parity_sources.append("points_per_game_gap")
+    if xg_gap is not None and xg_gap <= 0.35:
+        parity_sources.append("expected_goals_gap")
+    if xga_gap is not None and xga_gap <= 0.35:
+        parity_sources.append("expected_goals_against_gap")
+    if parity_sources:
+        draw_signal_families["performance_parity"] = parity_sources
+
+    if strong_defence_goalkeeping:
+        draw_signal_families["defence_goalkeeping"] = [
+            "strong_defence_or_goalkeeping"
+        ]
+    if attacking_absences:
+        draw_signal_families["attacking_absences"] = [
+            "attacking_absences"
+        ]
+    if rotation_or_fatigue:
+        draw_signal_families["rotation_fatigue"] = [
+            "rotation_or_fatigue"
+        ]
+    if draw_is_market_leader:
+        draw_signal_families["market_draw_leader"] = [
+            "draw_is_market_leader"
+        ]
+
+    draw_signals = list(draw_signal_families)
+    independent_signal_count = len(draw_signals)
+    draw_candidate = bool(
+        probability_gate
+        and (parity_gate or near_leader_gate)
+        and independent_signal_count >= 2
+    )
+
+    rejection_reasons: list[str] = []
+    if not probability_gate:
+        rejection_reasons.append(
+            "No-margin draw probability is below 24%."
+        )
+    if not (parity_gate or near_leader_gate):
+        rejection_reasons.append(
+            "Neither the 15-point home/away parity gate nor the "
+            "7-point draw-to-team-leader gate passed."
+        )
+    if independent_signal_count < 2:
+        rejection_reasons.append(
+            "Fewer than two independent football draw-evidence families passed."
+        )
+
+    missing_evidence: list[str] = []
+    optional_fields = {
+        "combined_recent_draw_rate": combined_draw_rate,
+        "h2h_draw_rate": h2h_draw_rate if h2h_sample else None,
+        "combined_average_total_goals": combined_goals,
+        "combined_expected_goals": combined_xg,
+        "points_per_game_gap": ppg_gap,
+        "expected_goals_gap": xg_gap,
+        "expected_goals_against_gap": xga_gap,
+    }
+    for field_name, value in optional_fields.items():
+        if value is None:
+            missing_evidence.append(field_name)
 
     favourite = market.get("team_favourite")
     if favourite == "HOME":
@@ -23967,24 +24097,28 @@ def _predict1_performance_audit(
         and favourite_ppg - opponent_ppg >= 0.35
     )
 
-    draw_strongest = bool(
-        draw_probability is not None
-        and draw_probability >= 0.26
-        and parity
-        and len(draw_signals) >= 4
-    )
-
     return {
         "home_probability": home_probability,
         "draw_probability": draw_probability,
         "away_probability": away_probability,
+        "home_away_probability_gap": home_away_gap,
+        "draw_to_team_leader_gap": draw_to_team_leader_gap,
+        "draw_is_market_leader": draw_is_market_leader,
         "home_points_per_game": home_ppg,
         "away_points_per_game": away_ppg,
         "home_goal_difference_average": home_gd,
         "away_goal_difference_average": away_gd,
+        "draw_signal_families": draw_signal_families,
         "draw_signals": draw_signals,
-        "draw_signal_count": len(draw_signals),
-        "draw_strongest": draw_strongest,
+        "draw_signal_count": independent_signal_count,
+        "draw_probability_gate": probability_gate,
+        "draw_parity_gate": parity_gate,
+        "draw_near_leader_gate": near_leader_gate,
+        "draw_candidate": draw_candidate,
+        # Compatibility alias for callers from previous engine versions.
+        "draw_strongest": draw_candidate,
+        "draw_rejection_reasons": rejection_reasons,
+        "draw_missing_evidence": missing_evidence,
         "strong_underdog_performance": strong_underdog_performance,
         "strong_favourite_performance": strong_favourite_performance,
         "starting_xi_confirmed": bool(
@@ -23994,7 +24128,6 @@ def _predict1_performance_audit(
             performance.get("injuries_confirmed")
         ),
     }
-
 
 def _predict1_reliability(
     chart: dict[str, Any],
@@ -24109,13 +24242,21 @@ def _predict1_decision(
         hierarchy_direction not in {"Favourite", "Underdog"}
         or d9_direction in {"Mixed", "Balanced", "None", None}
     )
+    clean_tier3_team_direction = bool(
+        d9_tier == 3
+        and d9_direction in {"Favourite", "Underdog"}
+    )
+    overwhelming_team_performance = bool(
+        performance_audit["strong_favourite_performance"]
+        or performance_audit["strong_underdog_performance"]
+    )
 
     if not reliability["chart_valid"]:
         forecast_status = "PERFORMANCE_ONLY"
         astrology_reliability = "Invalid chart; performance-only"
         predicted = (
             "DRAW"
-            if performance_audit["draw_strongest"]
+            if performance_audit["draw_candidate"]
             else opponent_outcome
             if performance_audit["strong_underdog_performance"]
             else favourite_outcome
@@ -24130,7 +24271,7 @@ def _predict1_decision(
         astrology_reliability = "Astrology research-only due to practical hard veto"
         predicted = (
             "DRAW"
-            if performance_audit["draw_strongest"]
+            if performance_audit["draw_candidate"]
             else opponent_outcome
             if performance_audit["strong_underdog_performance"]
             else favourite_outcome
@@ -24141,9 +24282,9 @@ def _predict1_decision(
         strongest_opposition = "Active reliability veto set astrology weight to zero."
         main_uncertainty = "Reliability veto prevents decision use of the chart."
     elif (
-        performance_audit["draw_strongest"]
-        and chart_direction_neutral
-        and not major_conflict
+        performance_audit["draw_candidate"]
+        and not clean_tier3_team_direction
+        and not overwhelming_team_performance
     ):
         predicted = "DRAW"
         confidence = "LOW"
@@ -24153,8 +24294,8 @@ def _predict1_decision(
             f"Independent draw evidence: "
             f"{', '.join(performance_audit['draw_signals'])}."
         )
-        strongest_opposition = "The market still assigns a team favourite."
-        main_uncertainty = "Draw selection depends on low-scoring parity holding."
+        strongest_opposition = "No clean Tier 3 team direction was present; ordinary team-win risk remains."
+        main_uncertainty = "The independent draw conditions may not persist through kickoff and lineups."
         deviation_reason = "Independent football draw evidence was strongest."
     elif (
         d9_direction == "Underdog"
