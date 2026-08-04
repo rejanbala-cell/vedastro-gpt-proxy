@@ -11,6 +11,7 @@ from .gambler_dharma_chart_engine import (
     EventChartInput,
     calculate_event_chart,
 )
+from .name_sound_resolver import name_sound_resolver_health
 
 
 router = APIRouter(tags=["Custom GPT Action"])
@@ -289,6 +290,7 @@ def event_chart_health() -> dict[str, Any]:
         "operation_id": "calculateVerifiedVedAstroEventChart",
         "draw_audit_path": "/draw-audit",
         "draw_audit_operation_id": "calculateFootballDrawAudit",
+        "name_sound_resolver": name_sound_resolver_health(),
         "proxy_key_configured": bool(settings.proxy_api_key),
     }
 

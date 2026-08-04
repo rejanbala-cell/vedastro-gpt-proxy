@@ -46,12 +46,21 @@ from vedastro import (
     Time,
 )
 
+try:
+    from .name_sound_resolver import (
+        resolve_verified_team_opening_sounds,
+    )
+except ImportError:
+    from name_sound_resolver import (
+        resolve_verified_team_opening_sounds,
+    )
+
 
 # ============================================================
 # VERSION
 # ============================================================
 
-PROXY_VERSION = "3.1.0-draw-audit-fix"
+PROXY_VERSION = "3.2.0-optional-name-sound-resolver"
 
 
 # ============================================================
@@ -1707,9 +1716,10 @@ class ParticipantNameInput(BaseModel):
         default_factory=list,
         max_length=20,
         description=(
-            "Caller-reviewed opening sounds for the initial syllables of "
-            "the participant's compound name, already expressed in a "
-            "book-compatible approximation, for example ['sa', 'di', 'pa']."
+            "Optional caller-verified book-compatible opening sounds. "
+            "When empty, the engine may use an exact manual-registry or "
+            "CMUdict pronunciation match. Missing sounds never invalidate "
+            "the chart."
         ),
     )
 
@@ -5716,51 +5726,87 @@ def participant_sound_record(
     side: str,
     participant: ParticipantNameInput | None,
 ) -> dict[str, Any]:
-    """Prepare one participant's explicit sound evidence."""
+    """Prepare optional verified sound evidence without guessing spelling."""
 
     if participant is None:
         return {
-            "status": "Unavailable",
+            "status": "OptionalUnavailable",
             "side": side,
             "name": None,
             "raw_name_words": [],
+            "caller_confirmed_opening_sounds": [],
             "confirmed_opening_sounds": [],
             "normalized_confirmed_sounds": [],
-            "error": "Participant input was not supplied.",
+            "automatic_resolution_used": False,
+            "sound_source": None,
+            "sound_resolution": {
+                "status": "Unverified",
+                "decision_eligible": False,
+                "reason": "Participant input was not supplied.",
+            },
+            "raw_name_used_for_matching": False,
+            "name_sound_required_for_chart_validity": False,
+            "error": None,
         }
+
+    caller_sounds = list(participant.confirmed_opening_sounds)
+    automatic_resolution = {
+        "status": "NotNeeded",
+        "opening_sounds": [],
+        "decision_eligible": False,
+        "automatic": False,
+    }
+
+    if caller_sounds:
+        resolved_sounds = caller_sounds
+        sound_source = "caller_confirmed"
+        automatic_used = False
+    else:
+        automatic_resolution = resolve_verified_team_opening_sounds(
+            participant.name
+        )
+        if automatic_resolution.get("decision_eligible"):
+            resolved_sounds = list(
+                automatic_resolution.get("opening_sounds", [])
+            )
+            sound_source = automatic_resolution.get("source_type")
+            automatic_used = True
+        else:
+            resolved_sounds = []
+            sound_source = None
+            automatic_used = False
 
     confirmed = [
         {
             "index": index,
             "supplied_sound": sound,
-            "normalized_sound": normalize_confirmed_name_sound(
-                sound
-            ),
+            "normalized_sound": normalize_confirmed_name_sound(sound),
+            "source": sound_source,
         }
-        for index, sound in enumerate(
-            participant.confirmed_opening_sounds
-        )
+        for index, sound in enumerate(resolved_sounds)
         if normalize_confirmed_name_sound(sound)
     ]
 
     return {
-        "status": "Pass" if confirmed else "NeedsSoundReview",
+        "status": "Pass" if confirmed else "OptionalUnavailable",
         "side": side,
         "name": participant.name,
-        "raw_name_words": raw_name_word_audit(
-            participant.name
-        ),
-        "confirmed_opening_sounds": list(
-            participant.confirmed_opening_sounds
-        ),
+        "raw_name_words": raw_name_word_audit(participant.name),
+        "caller_confirmed_opening_sounds": caller_sounds,
+        "confirmed_opening_sounds": resolved_sounds,
         "normalized_confirmed_sounds": confirmed,
+        "automatic_resolution_used": automatic_used,
+        "sound_source": sound_source,
+        "sound_resolution": automatic_resolution,
         "raw_name_used_for_matching": False,
-        "error": (
+        "name_sound_required_for_chart_validity": False,
+        "error": None,
+        "note": (
             None
             if confirmed
             else (
-                "No caller-confirmed opening sounds were supplied. "
-                "Raw spelling is retained for review but is not scored."
+                "Optional name-sound evidence was unavailable. "
+                "The chart and prediction remain valid without it."
             )
         ),
     }
@@ -5816,8 +5862,7 @@ def calculate_navamsha_name_sounds(
     Calculate Chapter 7 nama-pada syllables and participant-name matches.
 
     The principal sports rule uses the exact D1 House 10 cusp. Planetary
-    syllables are returned as secondary resonance evidence. Raw participant
-    spelling is never silently treated as a confirmed pronunciation.
+    syllables are returned as secondary resonance evidence. Raw participant spelling is never used as pronunciation evidence. Exact caller, manual-registry or dictionary evidence may be used.
     """
 
     if rashi_placidus.get("status") != "Pass":
@@ -5865,6 +5910,14 @@ def calculate_navamsha_name_sounds(
             underdog_input,
         ),
     }
+    participant_readiness = {
+        side: record["status"]
+        for side, record in participant_records.items()
+    }
+    both_sides_confirmed = all(
+        status == "Pass"
+        for status in participant_readiness.values()
+    )
 
     house10_pada = nama_pada_for_longitude(
         float(house10_longitude)
@@ -5883,7 +5936,17 @@ def calculate_navamsha_name_sounds(
         if result["decision_grade"]
     ]
 
-    if matched_sides == ["Favourite"]:
+    if not both_sides_confirmed:
+        for result in house10_matches.values():
+            result["research_match_only"] = result["matched"]
+            result["decision_grade"] = False
+        matched_sides = []
+        main_indication = "Optional / not scored"
+        main_note = (
+            "Both participants require verified opening sounds before "
+            "the optional House 10 name comparison can be scored."
+        )
+    elif matched_sides == ["Favourite"]:
         main_indication = "Favourite"
         main_note = (
             "The exact House 10 nama-pada matches the favourite's "
@@ -5953,7 +6016,10 @@ def calculate_navamsha_name_sounds(
         }
 
         for side, match_result in side_matches.items():
-            if not match_result["decision_grade"]:
+            if (
+                not both_sides_confirmed
+                or not match_result["decision_grade"]
+            ):
                 continue
 
             planet_matches.append({
@@ -5978,24 +6044,16 @@ def calculate_navamsha_name_sounds(
                 "points_applied": False,
             })
 
-    participant_readiness = {
-        side: record["status"]
-        for side, record in participant_records.items()
-    }
-    both_sides_confirmed = all(
-        status == "Pass"
-        for status in participant_readiness.values()
-    )
-
     if both_sides_confirmed:
         status = "Pass"
-        error = None
+        optional_note = None
     else:
-        status = "Partial"
-        error = (
-            "Exact Table 7.1 syllables were calculated, but both "
-            "participants do not yet have caller-confirmed opening sounds."
+        status = "OptionalNotUsed"
+        optional_note = (
+            "Name-sound comparison is optional and was not scored because "
+            "both sides did not have verified sounds."
         )
+    error = None
 
     return {
         "status": status,
@@ -6005,9 +6063,15 @@ def calculate_navamsha_name_sounds(
         "ayanamsa": "Lahiri",
         "source_chart": "Exact D1 rashi longitude divided into 3°20' sections",
         "interpretation_applied": (
-            "Only caller-confirmed sounds are used for participant matching."
+            "Only caller-confirmed or exact verified registry/dictionary "
+            "sounds are used for participant matching."
         ),
         "raw_name_pronunciation_inferred": False,
+        "name_comparison_required_for_chart_validity": False,
+        "automated_pronunciation_resolution_used": any(
+            record.get("automatic_resolution_used")
+            for record in participant_records.values()
+        ),
         "table_7_1": {
             "section_width_degrees": round(
                 NAMA_PADA_SECTION_DEGREES,
@@ -6054,6 +6118,8 @@ def calculate_navamsha_name_sounds(
         "planet_resonance_matches": planet_matches,
         "participant_readiness": participant_readiness,
         "name_comparison_allowed": both_sides_confirmed,
+        "name_comparison_required_for_chart_validity": False,
+        "optional_note": optional_note,
         "points_applied": False,
         "error": error,
     }
@@ -7709,6 +7775,15 @@ def compact_name_sounds_layer(
             "raw_name_used_for_matching": record.get(
                 "raw_name_used_for_matching"
             ),
+            "automatic_resolution_used": record.get(
+                "automatic_resolution_used"
+            ),
+            "sound_source": record.get("sound_source"),
+            "sound_resolution": record.get("sound_resolution"),
+            "name_sound_required_for_chart_validity": record.get(
+                "name_sound_required_for_chart_validity"
+            ),
+            "note": record.get("note"),
             "error": record.get("error"),
         })
 
@@ -7759,6 +7834,13 @@ def compact_name_sounds_layer(
         "raw_name_pronunciation_inferred": layer.get(
             "raw_name_pronunciation_inferred"
         ),
+        "name_comparison_required_for_chart_validity": layer.get(
+            "name_comparison_required_for_chart_validity"
+        ),
+        "automated_pronunciation_resolution_used": layer.get(
+            "automated_pronunciation_resolution_used"
+        ),
+        "optional_note": layer.get("optional_note"),
         "table_7_1": layer.get("table_7_1"),
         "participants": participants,
         "house10_main_test": {
@@ -27011,8 +27093,8 @@ def calculate_event_chart(request: EventChartInput) -> dict[str, Any]:
         planets,
     )
 
-    # Chapter 7 exact nama-pada syllables. Participant matching is enabled
-    # only when caller-confirmed opening sounds are supplied.
+    # Chapter 7 exact nama-pada syllables. Optional participant matching
+    # uses caller-confirmed or exact verified registry/dictionary sounds.
     navamsha_name_sounds = calculate_navamsha_name_sounds(
         request.participants,
         rashi_placidus,

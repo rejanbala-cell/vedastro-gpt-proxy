@@ -1,0 +1,10 @@
+{
+  "version": "1.0.0",
+  "policy": {
+    "exact_name_or_alias_match_only": true,
+    "raw_spelling_is_not_pronunciation_evidence": true,
+    "decision_eligible_requires_review": true
+  },
+  "instructions": "Add only manually verified team pronunciations. Use a book-compatible opening sound and keep decision_eligible false until reviewed.",
+  "teams": []
+}
