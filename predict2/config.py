@@ -101,7 +101,7 @@ class Settings:
             same_site = "lax"
 
         return cls(
-            version="3.0.0-final",
+            version="3.2.4-action-fix",
             database_url=os.getenv("DATABASE_URL", "").strip(),
             football_data_api_key=os.getenv(
                 "FOOTBALL_DATA_API_KEY", ""
