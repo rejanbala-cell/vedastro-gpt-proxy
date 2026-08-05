@@ -6175,6 +6175,20 @@ def compact_recursive(
 
     if isinstance(value, (list, tuple)):
         items = list(value)
+
+        # Preserve semantic two-number ranges such as signed_interval.
+        # Generic list truncation must never turn [low, high] into a mixed
+        # number/metadata array.
+        if (
+            len(items) == 2
+            and all(
+                isinstance(item, (int, float))
+                and not isinstance(item, bool)
+                for item in items
+            )
+        ):
+            return [json_safe(items[0]), json_safe(items[1])]
+
         compacted = [
             compact_recursive(
                 item,
@@ -10341,8 +10355,8 @@ def final_action_response_ceiling(
 
     return compact_recursive(
         kernel,
-        list_limit=1,
-        string_limit=45,
+        list_limit=2,
+        string_limit=180,
     )
 
 

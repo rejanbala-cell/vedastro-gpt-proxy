@@ -247,11 +247,14 @@ class TavilyClient:
             snippet_eligible = [
                 cluster for cluster in snippet_clusters
                 if (
-                    len(cluster["distinct_domains"])
-                    >= settings.tavily_min_distinct_domains
-                    or (
+                    (
                         settings.tavily_require_official_source
                         and len(cluster["official_domains"]) >= 1
+                    )
+                    or (
+                        not settings.tavily_require_official_source
+                        and len(cluster["distinct_domains"])
+                        >= settings.tavily_min_distinct_domains
                     )
                 )
             ]
@@ -381,11 +384,14 @@ class TavilyClient:
             eligible = [
                 cluster for cluster in clusters
                 if (
-                    len(cluster["distinct_domains"])
-                    >= settings.tavily_min_distinct_domains
-                    or (
+                    (
                         settings.tavily_require_official_source
                         and len(cluster["official_domains"]) >= 1
+                    )
+                    or (
+                        not settings.tavily_require_official_source
+                        and len(cluster["distinct_domains"])
+                        >= settings.tavily_min_distinct_domains
                     )
                 )
             ]

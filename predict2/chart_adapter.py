@@ -18,29 +18,44 @@ def _validation(result: dict[str, Any]) -> dict[str, Any]:
     status = str(result.get("status") or "")
     failures = result.get("essential_failures")
     failures = failures if isinstance(failures, list) else []
+    event = result.get("event")
+    event = event if isinstance(event, dict) else {}
+    rashi = result.get("rashi_placidus")
+    rashi = rashi if isinstance(rashi, dict) else {}
+    kp_layer = result.get("kp_sublords")
+    kp_layer = kp_layer if isinstance(kp_layer, dict) else {}
+
     standard = str(
         result.get("standard_chart_ayanamsha")
         or result.get("standard_ayanamsha")
         or result.get("ayanamsha")
+        or event.get("ayanamsa")
+        or rashi.get("ayanamsa")
         or ""
     ).lower()
     kp = str(
         result.get("kp_ayanamsha")
         or result.get("chapter_6_ayanamsha")
+        or kp_layer.get("ayanamsa")
         or ""
     ).lower()
+
+    lahiri_ok = "lahiri" in standard
+    kp_ok = "krishnamurti" in kp
+    valid = (
+        status.lower() == "pass"
+        and not failures
+        and lahiri_ok
+        and kp_ok
+    )
     return {
         "status_pass": status.lower() == "pass",
         "essential_failures_empty": not failures,
-        "lahiri_standard": "lahiri" in standard or not standard,
-        "krishnamurti_kp": "krishnamurti" in kp or not kp,
-        "valid": (
-            status.lower() == "pass"
-            and not failures
-            and ("lahiri" in standard or not standard)
-            and ("krishnamurti" in kp or not kp)
-        ),
+        "lahiri_standard": lahiri_ok,
+        "krishnamurti_kp": kp_ok,
+        "valid": valid,
         "essential_failures": failures,
+        "validation_mode": "fail_closed",
     }
 
 
@@ -58,7 +73,7 @@ def calculate_chart(
         from .gambler_dharma_chart_engine import (
             EventChartInput,
             LocationInput,
-            ParticipantInput,
+            ParticipantNameInput,
             ParticipantsInput,
             calculate_event_chart,
         )
@@ -73,11 +88,11 @@ def calculate_chart(
             houses=REQUIRED_HOUSES,
             planets=REQUIRED_PLANETS,
             participants=ParticipantsInput(
-                favourite=ParticipantInput(
+                favourite=ParticipantNameInput(
                     name=favourite_team,
                     confirmed_opening_sounds=[],
                 ),
-                underdog=ParticipantInput(
+                underdog=ParticipantNameInput(
                     name=underdog_team,
                     confirmed_opening_sounds=[],
                 ),
@@ -105,30 +120,48 @@ def calculate_chart(
 
 
 def practical_reliability(chart: dict[str, Any]) -> dict[str, Any]:
+    """Interpret returned reliability flags without permissive defaults."""
     audit = chart.get("reliability_audit")
     audit = audit if isinstance(audit, dict) else {}
-    mode = str(audit.get("policy_mode") or "practical_verified")
-    practical_hard = bool(
-        chart.get("practical_hard_veto")
-        or audit.get("practical_hard_veto")
-        or audit.get("hard_veto")
+    mode = str(audit.get("policy_mode") or "").strip()
+
+    practical_hard = (
+        chart.get("practical_hard_veto") is True
+        or audit.get("practical_hard_veto") is True
+        or audit.get("hard_veto") is True
     )
-    practical_allowed = bool(
-        chart.get("practical_prediction_allowed", True)
-        and audit.get("practical_prediction_allowed", True)
+    practical_allowed = (
+        chart.get("practical_prediction_allowed") is True
+        or audit.get("practical_prediction_allowed") is True
     )
-    strict_allowed = bool(
-        chart.get("strict_prediction_allowed", True)
-        and chart.get("strict_prediction_allowed_by_reliability", True)
+    reliability_strict_allowed = (
+        audit.get("strict_prediction_allowed_by_reliability") is True
+    )
+    top_level_strict_allowed = (
+        chart.get("strict_prediction_allowed") is True
+    )
+
+    required_flags_present = bool(
+        mode
+        and (
+            "practical_prediction_allowed" in chart
+            or "practical_prediction_allowed" in audit
+        )
+        and "strict_prediction_allowed_by_reliability" in audit
+        and "strict_prediction_allowed" in chart
+    )
+    prediction_allowed = bool(
+        required_flags_present
+        and not practical_hard
+        and practical_allowed
+        and reliability_strict_allowed
+        and top_level_strict_allowed
     )
     return {
-        "policy_mode": mode,
+        "policy_mode": mode or "missing",
         "hard_veto": practical_hard,
-        "prediction_allowed": (
-            not practical_hard
-            and practical_allowed
-            and strict_allowed
-        ),
+        "prediction_allowed": prediction_allowed,
+        "required_flags_present": required_flags_present,
         "confidence_cap": (
             chart.get("confidence_cap")
             or audit.get("confidence_cap")
@@ -136,6 +169,11 @@ def practical_reliability(chart: dict[str, Any]) -> dict[str, Any]:
         "strict_book_hard_veto": bool(
             chart.get("strict_book_hard_veto")
             or audit.get("strict_book_hard_veto")
+        ),
+        "strict_book_hard_veto_reasons": (
+            chart.get("strict_book_hard_veto_reasons")
+            or audit.get("strict_book_hard_veto_reasons")
+            or []
         ),
     }
 

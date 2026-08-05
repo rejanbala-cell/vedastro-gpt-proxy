@@ -145,9 +145,22 @@ def _city(address: dict[str, Any]) -> str:
     return ""
 
 
+
+
+NON_COUNTRY_AREAS = {
+    "europe",
+    "world",
+    "international",
+    "africa",
+    "asia",
+    "south america",
+    "north america",
+    "oceania",
+}
+
 def _country_values(expected: str) -> set[str]:
     normalized = normalize_text(expected)
-    if not normalized:
+    if not normalized or normalized in NON_COUNTRY_AREAS:
         return set()
     return {
         normalize_text(value)

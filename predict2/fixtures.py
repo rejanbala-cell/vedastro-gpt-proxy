@@ -153,6 +153,68 @@ def upsert_matches(rows: list[dict[str, Any]]) -> dict[str, int]:
             season = EXCLUDED.season,
             home_team = EXCLUDED.home_team,
             away_team = EXCLUDED.away_team,
+            latitude = CASE
+                WHEN (
+                    EXCLUDED.venue_name IS NOT NULL
+                    AND EXCLUDED.venue_name IS DISTINCT FROM fixtures.venue_name
+                )
+                OR EXCLUDED.kickoff_utc IS DISTINCT FROM fixtures.kickoff_utc
+                THEN NULL
+                ELSE fixtures.latitude
+            END,
+            longitude = CASE
+                WHEN (
+                    EXCLUDED.venue_name IS NOT NULL
+                    AND EXCLUDED.venue_name IS DISTINCT FROM fixtures.venue_name
+                )
+                OR EXCLUDED.kickoff_utc IS DISTINCT FROM fixtures.kickoff_utc
+                THEN NULL
+                ELSE fixtures.longitude
+            END,
+            timezone_name = CASE
+                WHEN (
+                    EXCLUDED.venue_name IS NOT NULL
+                    AND EXCLUDED.venue_name IS DISTINCT FROM fixtures.venue_name
+                )
+                OR EXCLUDED.kickoff_utc IS DISTINCT FROM fixtures.kickoff_utc
+                THEN NULL
+                ELSE fixtures.timezone_name
+            END,
+            venue_city = CASE
+                WHEN (
+                    EXCLUDED.venue_name IS NOT NULL
+                    AND EXCLUDED.venue_name IS DISTINCT FROM fixtures.venue_name
+                )
+                THEN NULL
+                ELSE fixtures.venue_city
+            END,
+            location_source = CASE
+                WHEN (
+                    EXCLUDED.venue_name IS NOT NULL
+                    AND EXCLUDED.venue_name IS DISTINCT FROM fixtures.venue_name
+                )
+                OR EXCLUDED.kickoff_utc IS DISTINCT FROM fixtures.kickoff_utc
+                THEN NULL
+                ELSE fixtures.location_source
+            END,
+            location_confidence = CASE
+                WHEN (
+                    EXCLUDED.venue_name IS NOT NULL
+                    AND EXCLUDED.venue_name IS DISTINCT FROM fixtures.venue_name
+                )
+                OR EXCLUDED.kickoff_utc IS DISTINCT FROM fixtures.kickoff_utc
+                THEN NULL
+                ELSE fixtures.location_confidence
+            END,
+            location_verified_at = CASE
+                WHEN (
+                    EXCLUDED.venue_name IS NOT NULL
+                    AND EXCLUDED.venue_name IS DISTINCT FROM fixtures.venue_name
+                )
+                OR EXCLUDED.kickoff_utc IS DISTINCT FROM fixtures.kickoff_utc
+                THEN NULL
+                ELSE fixtures.location_verified_at
+            END,
             kickoff_utc = EXCLUDED.kickoff_utc,
             venue_name = COALESCE(
                 EXCLUDED.venue_name,
